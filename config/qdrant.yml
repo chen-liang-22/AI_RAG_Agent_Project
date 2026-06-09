@@ -1,0 +1,15 @@
+collection_name: agent
+url: http://localhost:6333
+grpc_port: 6334
+prefer_grpc: false
+distance: COSINE
+force_recreate: false
+
+k: 3
+data_path: data
+md5_hex_store: qdrant_md5.text
+allow_knowledge_file_type: ["txt", "pdf"]
+
+chunk_size: 200
+chunk_overlap: 20
+separators: ["\n\n", "\n", ".", "!", "?", "。", "！", "？", " ", ""]
