@@ -7,6 +7,7 @@ Deployable FastAPI service for a LangChain ReAct agent with Qdrant-backed RAG.
 - `api.main:app`: FastAPI backend.
 - `app.py`: Streamlit demo UI.
 - `qdrant`: Vector database.
+- `../AI_RAG_Agent_Frontend`: Vue 3 frontend.
 
 ## Environment
 
@@ -66,4 +67,32 @@ API docs:
 
 ```text
 http://localhost:8000/docs
+```
+
+Vue frontend:
+
+```text
+http://localhost:8080
+```
+
+## Vue Frontend
+
+The frontend project is created next to this backend project:
+
+```text
+D:\PycharmProjects\AI_RAG_Agent_Frontend
+```
+
+Local frontend development:
+
+```powershell
+cd D:\PycharmProjects\AI_RAG_Agent_Frontend
+npm install
+npm run dev
+```
+
+Vite serves the frontend at:
+
+```text
+http://127.0.0.1:5173
 ```

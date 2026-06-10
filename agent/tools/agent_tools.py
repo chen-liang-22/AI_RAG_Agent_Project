@@ -1,5 +1,6 @@
 import os
 from utils.logger_handler import logger
+from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 from rag.rag_service import RagSummarizeService
 import random
@@ -30,9 +31,10 @@ def get_user_location() -> str:
     return random.choice(["深圳", "合肥", "杭州"])
 
 
-@tool(description="获取用户的ID，以纯字符串形式返回")
-def get_user_id() -> str:
-    return random.choice(user_ids)
+@tool(description="获取当前请求中的用户ID，以纯字符串形式返回")
+def get_user_id(runtime: ToolRuntime) -> str:
+    context_user_id = runtime.context.get("user_id") if runtime.context else None
+    return str(context_user_id) if context_user_id else random.choice(user_ids)
 
 
 @tool(description="获取当前月份，以纯字符串形式返回")
