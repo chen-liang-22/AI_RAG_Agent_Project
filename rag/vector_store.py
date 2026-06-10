@@ -285,13 +285,11 @@ class VectorStoreService:
             documents: list[Document],
             document_type: str,
             split_strategy: str,
-    ) -> tuple[list[Document], list[dict], list[dict]]:
-        """把原始 Document 切分成 Qdrant 文档、segments 和 FAQ。
+    ) -> list[Document]:
+        """把原始 Document 切分成可写入 Qdrant 的文档。
 
-        返回：
-        - index_documents：写入 Qdrant 的 Document 列表。
-        - segments：写入 SQLite document_segments 的通用片段。
-        - faq_items：写入 SQLite faq_items 的结构化问答。
+        segments / faq_items 只在内存中用于构造 Qdrant payload。
+        SQLite 不再保存知识正文或 FAQ 答案。
         """
 
         segments, faq_items = self.document_parser.build_segments_and_faqs(
@@ -329,33 +327,7 @@ class VectorStoreService:
 
             index_documents.append(Document(page_content=segment.content, metadata=metadata))
 
-        segment_dicts = [
-            {
-                "segment_id": segment.segment_id,
-                "segment_index": segment.segment_index,
-                "content": segment.content,
-                "content_hash": segment.content_hash,
-                "page_no": segment.page_no,
-                "heading_path": segment.heading_path,
-                "metadata": segment.metadata,
-            }
-            for segment in segments
-        ]
-        faq_dicts = [
-            {
-                "faq_id": item.faq_id,
-                "segment_id": item.segment_id,
-                "question_no": item.question_no,
-                "question": item.question,
-                "answer": item.answer,
-                "category": item.category,
-                "tags": item.tags,
-                "metadata": item.metadata,
-            }
-            for item in faq_items
-        ]
-
-        return index_documents, segment_dicts, faq_dicts
+        return index_documents
 
     @staticmethod
     def delete_document_vectors(document_id: str) -> None:
@@ -383,7 +355,7 @@ class VectorStoreService:
             *,
             document_type: str | None = None,
             split_strategy: str | None = None,
-    ) -> tuple[int, list[dict], list[dict]]:
+    ) -> int:
         """把 documents 表中的单个文件重新写入 Qdrant。
 
         这个方法用于上传、重新索引等新流程。
@@ -405,7 +377,7 @@ class VectorStoreService:
             document_type = document_type or preview["document_type"]
             split_strategy = split_strategy or preview["split_strategy"]
 
-        index_documents, segments, faq_items = self.build_index_documents(
+        index_documents = self.build_index_documents(
             document_id=document_id,
             filename=filename,
             file_md5=file_md5,
@@ -421,7 +393,7 @@ class VectorStoreService:
         self.delete_document_vectors(document_id)
         self.vector_store.add_documents(index_documents)
 
-        return len(index_documents), segments, faq_items
+        return len(index_documents)
 
     def load_document(self):
         """

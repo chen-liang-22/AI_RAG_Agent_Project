@@ -41,6 +41,7 @@ class ChatRequest(BaseModel):
 
     message: str = Field(..., min_length=1)  # 用户输入的问题；不能为空字符串
     user_id: str | None = None  # 当前会话用户 ID；可为空，工具层会兜底随机用户
+    conversation_id: str | None = None  # 当前会话 ID；为空时后端创建新会话
 
 
 class ChatResponse(BaseModel):
@@ -51,6 +52,7 @@ class ChatResponse(BaseModel):
     """
 
     answer: str  # 一次性接口返回的完整最终回答
+    conversation_id: str  # 当前会话 ID；前端后续请求需要继续携带
 
 
 class DebugRetrieveRequest(BaseModel):
@@ -330,8 +332,7 @@ def _index_document(
     2. VectorStoreService 读取原始文件并切分成知识单元。
     3. 按 document_id 删除旧 Qdrant points。
     4. 写入新的 Qdrant points。
-    5. knowledge_units 表替换成新的知识单元。
-    6. documents.status 改成 indexed。
+    5. documents.status 改成 indexed。
     """
 
     document_id = document["document_id"]
@@ -352,12 +353,11 @@ def _index_document(
 
             vector_store = VectorStoreService()
 
-        chunk_count, segments, faq_items = vector_store.index_file(
+        chunk_count = vector_store.index_file(
             indexing_document,
             document_type=document_type,
             split_strategy=split_strategy,
         )
-        store.replace_segments_and_faqs(document_id, segments, faq_items)
         store.update_document_status(document_id, "indexed", chunk_count=chunk_count, error_message=None)
     except HTTPException:
         raise
@@ -377,7 +377,7 @@ def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
     """把 data/ 目录中的内置知识文件同步到 documents 表。
 
     用户手动上传的文件会保存在 uploads/ 目录，而项目自带的示例/基础知识文件
-    通常放在 data/ 目录。为了让这两类文件都能生成 document_segments/faq_items，
+    通常放在 data/ 目录。为了让这两类文件都能进入 documents 管理，
     reload 时先把 data/ 文件注册成 documents 记录，再统一走 _index_document。
 
     同一个文件内容按 MD5 去重：如果 active documents 中已有相同 MD5，就复用
@@ -449,7 +449,50 @@ def _get_agent():
     return _agent  # 返回初始化好的 Agent
 
 
-def _stream_agent(message: str, user_id: str | None = None) -> Iterator[str]:
+def _build_conversation_title(message: str) -> str:
+    """用首条用户问题生成一个简短会话标题。"""
+
+    return message.strip().replace("\n", " ")[:40] or "新会话"
+
+
+def _prepare_chat_conversation(request: ChatRequest) -> tuple[str, list[dict]]:
+    """创建或读取会话，并返回 conversation_id 和最近历史。"""
+
+    store = _get_knowledge_store()
+    conversation = store.ensure_conversation(
+        conversation_id=request.conversation_id,
+        user_id=request.user_id,
+        title=_build_conversation_title(request.message),
+    )
+    conversation_id = conversation["conversation_id"]
+    history = store.list_recent_messages(conversation_id, limit=20)
+    return conversation_id, history
+
+
+def _save_chat_exchange(
+        *,
+        conversation_id: str,
+        message: str,
+        answer: str,
+        metadata: dict | None = None,
+) -> None:
+    """把一轮用户问题和助手回答保存到 SQLite 会话历史。"""
+
+    store = _get_knowledge_store()
+    store.save_chat_exchange(
+        conversation_id=conversation_id,
+        user_message=message,
+        assistant_message=answer,
+        metadata=metadata,
+    )
+
+
+def _stream_agent(
+        message: str,
+        user_id: str | None = None,
+        conversation_id: str | None = None,
+        history: list[dict] | None = None,
+) -> Iterator[str]:
     """把 Agent 的 token 流转换成浏览器能识别的 SSE 文本流。
 
     SSE(Server-Sent Events) 的基础格式是：
@@ -470,15 +513,38 @@ def _stream_agent(message: str, user_id: str | None = None) -> Iterator[str]:
     """
 
     try:  # 流式生成期间任何异常都会转成 SSE error 事件
-        logger.info(f"[api] /chat/stream start user_id={user_id} message={message}")
-        for chunk in _get_agent().execute_stream(message, user_id=user_id):
+        logger.info(
+            f"[api] /chat/stream start user_id={user_id} "
+            f"conversation_id={conversation_id} message={message}"
+        )
+        meta_payload = json.dumps({"conversation_id": conversation_id}, ensure_ascii=False)
+        yield f"event: meta\ndata: {meta_payload}\n\n"
+
+        chunks: list[str] = []
+        for chunk in _get_agent().execute_stream(
+                message,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                history=history or [],
+        ):
             # ensure_ascii=False 可以让中文直接以 UTF-8 传给前端，
             # 避免浏览器端看到 \u4f60\u597d 这种转义内容。
+            chunks.append(chunk)
             payload = json.dumps({"content": chunk}, ensure_ascii=False)  # 把文本片段包装成 JSON
             yield f"event: chunk\ndata: {payload}\n\n"  # yield 一次，浏览器就有机会收到一个 SSE chunk
 
-        logger.info(f"[api] /chat/stream done user_id={user_id}")
-        yield f"event: done\ndata: {json.dumps({'done': True})}\n\n"  # 告诉前端流式回答已经结束
+        answer = "".join(chunks).strip()
+        if conversation_id and answer:
+            _save_chat_exchange(
+                conversation_id=conversation_id,
+                message=message,
+                answer=answer,
+                metadata={"mode": "stream"},
+            )
+
+        logger.info(f"[api] /chat/stream done user_id={user_id} conversation_id={conversation_id}")
+        done_payload = json.dumps({"done": True, "conversation_id": conversation_id}, ensure_ascii=False)
+        yield f"event: done\ndata: {done_payload}\n\n"  # 告诉前端流式回答已经结束
     except Exception as exc:
         logger.error(f"[api] /chat/stream failed user_id={user_id}: {exc}", exc_info=True)
         # 流式响应已经开始后，HTTP 状态码通常不能再改成 500。
@@ -523,9 +589,24 @@ def chat(request: ChatRequest) -> ChatResponse:
     这个接口适合“不关心首 token 速度，只想一次拿到完整结果”的场景。
     """
 
-    logger.info(f"[api] /chat user_id={request.user_id} message={request.message}")  # 标记本次调用的是一次性接口
-    answer = _get_agent().execute(request.message, user_id=request.user_id)  # 阻塞等待 Agent 完整生成最终回答
-    return ChatResponse(answer=answer)  # 按 response_model 返回 {"answer": "..."}
+    conversation_id, history = _prepare_chat_conversation(request)
+    logger.info(
+        f"[api] /chat user_id={request.user_id} "
+        f"conversation_id={conversation_id} message={request.message}"
+    )  # 标记本次调用的是一次性接口
+    answer = _get_agent().execute(
+        request.message,
+        user_id=request.user_id,
+        conversation_id=conversation_id,
+        history=history,
+    )  # 阻塞等待 Agent 完整生成最终回答
+    _save_chat_exchange(
+        conversation_id=conversation_id,
+        message=request.message,
+        answer=answer,
+        metadata={"mode": "once"},
+    )
+    return ChatResponse(answer=answer, conversation_id=conversation_id)
 
 
 @app.post("/chat/stream")
@@ -552,10 +633,19 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
       Nginx 场景下关闭响应缓冲；本地开发也保留，便于以后部署。
     """
 
-    logger.info(f"[api] /chat/stream requested user_id={request.user_id} message={request.message}")  # 标记本次调用的是流式接口
+    conversation_id, history = _prepare_chat_conversation(request)
+    logger.info(
+        f"[api] /chat/stream requested user_id={request.user_id} "
+        f"conversation_id={conversation_id} message={request.message}"
+    )  # 标记本次调用的是流式接口
     _get_agent()  # 提前初始化 Agent；初始化失败时可以在返回流之前直接报错
     return StreamingResponse(
-        _stream_agent(request.message, user_id=request.user_id),  # 把生成器交给 FastAPI 持续输出
+        _stream_agent(
+            request.message,
+            user_id=request.user_id,
+            conversation_id=conversation_id,
+            history=history,
+        ),  # 把生成器交给 FastAPI 持续输出
         media_type="text/event-stream",  # 告诉浏览器这是 SSE 文本流
         headers={
             "Cache-Control": "no-cache, no-transform",  # 不缓存、不转换内容，减少代理缓冲风险
@@ -583,7 +673,7 @@ def upload_knowledge_file(file: UploadFile = File(...)) -> KnowledgeUploadRespon
     5. 如果重复，删除本次刚保存的文件，返回已有文件记录。
     6. 如果不重复，写入 documents 表。
     7. 解析文件、切分知识单元、写入 Qdrant。
-    8. 写入 knowledge_units 表，并更新 documents.status。
+    8. 写入 Qdrant，并更新 documents.status。
     """
 
     filename = _sanitize_upload_filename(file.filename)
@@ -818,7 +908,6 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
 
     这里的“删除”是知识库层面的删除：
     - Qdrant 中该 document_id 的 points 会被删除。
-    - SQLite knowledge_units 中该文件的知识单元会被删除。
     - SQLite documents 中该文件会标记为 deleted。
 
     原始上传文件暂时保留在 uploads/ 目录中，方便排查和审计。
@@ -836,7 +925,6 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
         from rag.vector_store import VectorStoreService  # 延迟导入，只在删除 Qdrant points 时加载
 
         VectorStoreService.delete_document_vectors(document_id)
-        store.delete_units(document_id)
         store.mark_document_deleted(document_id)
     except Exception as exc:
         logger.error(f"[knowledge] delete failed document_id={document_id}: {exc}", exc_info=True)
@@ -877,7 +965,6 @@ def reindex_all_knowledge_files() -> KnowledgeBulkReindexResponse:
         filename = document["filename"]
 
         try:
-            store.delete_units(document_id)
             indexed_document = _index_document(
                 store,
                 document,
@@ -921,7 +1008,7 @@ def reindex_knowledge_file(document_id: str) -> KnowledgeFileResponse:
 
     使用场景：
     - 调整了 chunk_size/chunk_overlap 后，希望重新切分。
-    - 后续升级了结构化切分规则，希望重新生成 knowledge_units。
+    - 后续升级了结构化切分规则，希望重新生成 Qdrant payload。
     - Qdrant 中某个文件的向量异常，需要按 document_id 重建。
 
     reindex 会递增 documents.version。
@@ -944,7 +1031,7 @@ def reload_knowledge() -> dict:
     """扫描 data/ 目录并按新结构重建知识库。
 
     旧版 reload 只把 data/ 文件切块写进 Qdrant，不会写 documents、
-    document_segments、faq_items。现在这个接口会把 data/ 文件也同步到
+    旧知识表。现在这个接口会把 data/ 文件也同步到
     documents 表，然后复用 reindex-all 的新流程，保证结构化 FAQ 查询可用。
     """
 
@@ -963,7 +1050,6 @@ def reload_knowledge() -> dict:
         failed = 0
         for document in documents:
             try:
-                store.delete_units(document["document_id"])
                 indexed_document = _index_document(
                     store,
                     document,

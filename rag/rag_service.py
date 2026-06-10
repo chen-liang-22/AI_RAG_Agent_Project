@@ -19,6 +19,7 @@ import re
 
 from langchain_core.documents import Document
 
+from rag.query_planner import QueryPlannerService
 from rag.query_pipeline import QueryAnalysis, RuleBasedIntentAnalyzer
 from rag.reranker import RuleBasedReranker
 from rag.vector_store import VectorStoreService
@@ -31,6 +32,7 @@ class RagSummarizeService(object):
 
     def __init__(self):
         self.vector_store: VectorStoreService | None = None  # Qdrant 向量库服务，懒加载，避免 Qdrant 不可用时整个 RAG 初始化失败
+        self.query_planner = QueryPlannerService()  # LLM Query Planner，负责把复杂问题拆成多个 search_query
         self.intent_analyzer = RuleBasedIntentAnalyzer()  # 规则版多意图分析器
         self.reranker = RuleBasedReranker()  # 规则版精排器
 
@@ -41,8 +43,8 @@ class RagSummarizeService(object):
         - “扫拖一体机器人100问第95问是什么？”
         - “扫拖一体机器人100问都有哪些？”
 
-        FAQ 文档入库后已经抽取到 SQLite 的 faq_items 表，因此这里直接做
-        结构化查询，能避免向量召回只召到片段导致“明明有第95问却答不上来”。
+        FAQ 文档入库后已经写入 Qdrant payload，因此这里直接做
+        Qdrant 结构化查询，能避免向量召回只召到片段导致“明明有第95问却答不上来”。
         返回 None 表示当前问题不是 FAQ 精确查询，继续走普通 Agent/RAG。
         """
 
@@ -136,7 +138,7 @@ class RagSummarizeService(object):
         如果在 __init__ 里强行初始化，整个 RAG 工具会直接不可用。
         改成懒加载后：
         - Qdrant 可用时，正常做向量召回。
-        - Qdrant 不可用时，异常会被 _multi_retrieve 捕获，继续走 SQLite 关键词召回。
+        - Qdrant 不可用时，异常会被检索流程捕获并返回空候选。
         """
 
         if self.vector_store is None:
@@ -144,32 +146,38 @@ class RagSummarizeService(object):
 
         return self.vector_store
 
-    def retriever_docs(self, query: str) -> list[Document]:
+    def retriever_docs(
+            self,
+            query: str,
+            *,
+            history: list[dict] | None = None,
+    ) -> list[Document]:
         """检索并精排用户问题相关资料。
 
         这个方法是新版 RAG 的核心：
-        - 先分析用户问题属于选购、故障、维护等哪类意图。
-        - 再用原问题和子查询做多路召回。
-        - 有意图过滤条件时，优先查更匹配的 unit_type/category。
-        - 额外补一次无过滤召回，避免规则过滤过窄导致漏召回。
-        - 最后用规则 rerank 排序并截断到 qdrant_conf["k"]。
+        - LLM Query Planner 先把复杂问题拆成多个 search_query。
+        - 每个 search_query 单独查 Qdrant top5。
+        - 每个 search_query 精排后保留 top2。
+        - 最终按用户问题顺序组装上下文，并做去重和数量截断。
         """
 
         analysis = self.intent_analyzer.analyze(query)
-        candidate_docs = self._multi_retrieve(analysis)
-        reranked_docs = self.reranker.rerank(
-            query=query,
-            documents=candidate_docs,
+        search_queries = self.query_planner.plan(query, history=history)
+        candidate_groups = self.retrieve_for_queries(search_queries, analysis)
+        reranked_docs = self.reranker.rerank_by_query(
+            original_query=query,
+            grouped_documents=candidate_groups,
             analysis=analysis,
-            limit=qdrant_conf["k"],
+            per_query_keep=int(qdrant_conf.get("per_query_keep", 2) or 2),
+            final_context_limit=int(qdrant_conf.get("final_context_limit", 12) or 12),
         )
 
         logger.info(
-            "[rag] query=%s intents=%s sub_queries=%s candidates=%s final=%s",
+            "[rag] query=%s intents=%s search_queries=%s candidates=%s final=%s",
             query,
             analysis.intents,
-            analysis.sub_queries,
-            len(candidate_docs),
+            search_queries,
+            sum(len(documents) for _, documents in candidate_groups),
             len(reranked_docs),
         )
 
@@ -187,20 +195,29 @@ class RagSummarizeService(object):
         """
 
         analysis = self.intent_analyzer.analyze(query)
-        candidate_docs = self._multi_retrieve(analysis)
-        reranked_docs = self.reranker.rerank(
-            query=query,
-            documents=candidate_docs,
+        search_queries = self.query_planner.plan(query)
+        candidate_groups = self.retrieve_for_queries(search_queries, analysis)
+        reranked_docs = self.reranker.rerank_by_query(
+            original_query=query,
+            grouped_documents=candidate_groups,
             analysis=analysis,
-            limit=qdrant_conf["k"],
+            per_query_keep=int(qdrant_conf.get("per_query_keep", 2) or 2),
+            final_context_limit=int(qdrant_conf.get("final_context_limit", 12) or 12),
         )
 
         return {
             "query": query,
             "intents": analysis.intents,
-            "sub_queries": analysis.sub_queries,
+            "sub_queries": search_queries,
             "filters": analysis.filters,
-            "candidate_count": len(candidate_docs),
+            "candidate_count": sum(len(documents) for _, documents in candidate_groups),
+            "groups": [
+                {
+                    "search_query": search_query,
+                    "candidate_count": len(documents),
+                }
+                for search_query, documents in candidate_groups
+            ],
             "reranked": [
                 {
                     "content": doc.page_content,
@@ -212,41 +229,66 @@ class RagSummarizeService(object):
             ],
         }
 
-    def _multi_retrieve(self, analysis: QueryAnalysis) -> list[Document]:
-        """根据 QueryAnalysis 做多路召回。"""
+    def retrieve_for_queries(
+            self,
+            queries: list[str],
+            analysis: QueryAnalysis,
+    ) -> list[tuple[str, list[Document]]]:
+        """每个 search_query 单独召回 Qdrant top5。"""
 
-        candidate_docs: list[Document] = []
-        candidate_k = max(qdrant_conf["k"] * 4, 8)
+        candidate_groups: list[tuple[str, list[Document]]] = []
+        per_query_top_k = int(qdrant_conf.get("per_query_top_k", 5) or 5)
 
-        for sub_query in analysis.sub_queries:
+        for query_index, search_query in enumerate(queries):
+            documents: list[Document] = []
             if analysis.filters:
-                # 第一轮：带 metadata filter 的定向召回。
-                # 例如用户问“迷路怎么办”，优先查 troubleshooting/faq。
                 try:
-                    candidate_docs.extend(
-                        self._get_vector_store().search_documents(
-                            sub_query,
-                            k=candidate_k,
-                            filters=analysis.filters,
-                        )
+                    documents = self._get_vector_store().search_documents(
+                        search_query,
+                        k=per_query_top_k,
+                        filters=analysis.filters,
                     )
                 except Exception as exc:
-                    logger.warning(f"[rag] vector retrieve with filters failed: {exc}")
+                    logger.warning(f"[rag] vector retrieve with filters failed query={search_query}: {exc}")
 
-            # 第二轮：无过滤召回。
-            # 这是兜底召回，避免规则意图判断不准时漏掉相关资料。
-            try:
-                candidate_docs.extend(
-                    self._get_vector_store().search_documents(
-                        sub_query,
-                        k=candidate_k,
+            if not documents:
+                try:
+                    documents = self._get_vector_store().search_documents(
+                        search_query,
+                        k=per_query_top_k,
                         filters=None,
                     )
-                )
-            except Exception as exc:
-                logger.warning(f"[rag] vector retrieve without filters failed: {exc}")
+                except Exception as exc:
+                    logger.warning(f"[rag] vector retrieve failed query={search_query}: {exc}")
+                    documents = []
 
-        return candidate_docs
+            candidate_groups.append(
+                (
+                    search_query,
+                    self._annotate_search_query(
+                        documents,
+                        search_query=search_query,
+                        query_index=query_index,
+                    ),
+                )
+            )
+
+        return candidate_groups
+
+    @staticmethod
+    def _annotate_search_query(
+            documents: list[Document],
+            *,
+            search_query: str,
+            query_index: int,
+    ) -> list[Document]:
+        annotated_documents: list[Document] = []
+        for document in documents:
+            metadata = dict(document.metadata)
+            metadata["_search_query"] = search_query
+            metadata["_search_query_index"] = query_index
+            annotated_documents.append(Document(page_content=document.page_content, metadata=metadata))
+        return annotated_documents
 
     def _keyword_retrieve(self, analysis: QueryAnalysis, limit: int) -> list[Document]:
         """从 SQLite 做关键词补充召回。
@@ -403,14 +445,14 @@ class RagSummarizeService(object):
                 answer_lines.append(stripped)
         return "\n".join(line for line in answer_lines if line).strip()
 
-    def rag_summarize(self, query: str) -> str:
+    def rag_summarize(self, query: str, *, history: list[dict] | None = None) -> str:
         """返回给 Agent 的 RAG 参考资料文本。
 
         注意这里不是最终回答。
         它只是把检索到的资料整理成上下文，交给 Agent 再生成自然语言答案。
         """
 
-        context_docs = self.retriever_docs(query)
+        context_docs = self.retriever_docs(query, history=history)
 
         context = ""
         for counter, doc in enumerate(context_docs, start=1):

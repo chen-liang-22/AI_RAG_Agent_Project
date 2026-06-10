@@ -36,18 +36,18 @@ LLM 负责 query planning 和自然回答。
 | FastAPI 基础接口 | 已完成 | 已有 `/chat`、`/chat/stream`、`/knowledge/*`、`/health` 等接口 |
 | Vue 3 前端 | 已完成 | 已有聊天页面、知识库上传、流式/非流式切换 |
 | Qdrant 服务 | 已完成 | 已支持 Docker / Docker Compose 启动 |
-| Qdrant 入库 | 部分完成 | 已能写入 Qdrant points，但代码中仍保留写 SQLite 知识表的旧逻辑 |
+| Qdrant 入库 | 已完成 | 已能写入 Qdrant points，入库流程不再写 SQLite 知识表 |
 | FAQ 一问一答切分 | 已完成 | FAQ / 100问 文档按一问一答写入 Qdrant |
 | 普通文档切分 | 已完成 | 普通文档按 RecursiveCharacterTextSplitter 切分 |
-| 用户答案检索只走 Qdrant | 部分完成 | 当前回答链路已切到 Qdrant，但旧 SQLite 查询方法仍需清理 |
-| LLM Query Planner | 未完成 | 需要新增，用于把用户复杂问题拆成多个 `search_query` |
-| 多 query 召回 | 未完成 | 需要实现每个 `search_query` 单独查 Qdrant top5 |
-| 精排每 query 保留 top2 | 未完成 | 需要实现按子问题分组精排，每个 query 保留 2 条 |
-| LLM 最终润色回答 | 部分完成 | FAQ 命中后已开始模型润色，普通多 query 回答还需统一改造 |
-| SQLite 知识表清理 | 待清理 | `document_segments`、`faq_items`、`knowledge_units` 应删除/停用 |
+| 用户答案检索只走 Qdrant | 已完成 | 回答链路和 FAQ 精确查询均以 Qdrant 为知识来源，SQLite 只保留业务元数据 |
+| LLM Query Planner | 已完成 | 已新增 `QueryPlannerService`，用于把用户复杂问题拆成多个 `search_query` |
+| 多 query 召回 | 已完成 | 已实现每个 `search_query` 单独查 Qdrant top5 |
+| 精排每 query 保留 top2 | 已完成 | 已实现按子问题分组精排，每个 query 保留 2 条 |
+| LLM 最终润色回答 | 已完成 | FAQ 精确命中和普通 RAG 工具链路都交由 LLM 生成自然回答 |
+| SQLite 知识表清理 | 已完成 | `document_segments`、`faq_items`、`knowledge_units` 已停用，并在启动初始化时清理 |
 | `documents` 文件管理表 | 已完成 | 用于文件记录、状态、版本、chunk_count |
-| 会话历史 SQLite 持久化 | 未完成 | 需要新增 `conversations`、`conversation_messages` |
-| 前端 conversation_id 支持 | 未完成 | 前端请求需要携带并维护 `conversation_id` |
+| 会话历史 SQLite 持久化 | 已完成 | 已新增 `conversations`、`conversation_messages` 并保存 user / assistant 消息 |
+| 前端 conversation_id 支持 | 已完成 | 前端会保存后端返回的 `conversation_id` 并在后续请求中携带 |
 
 ## 0. 项目整体架构
 
@@ -338,16 +338,6 @@ ON conversation_messages(conversation_id, created_at);
 metadata_json 可以记录“召回了哪些 Qdrant point”，方便调试。
 但它不是知识答案来源。
 真正的知识答案仍然以 Qdrant 为准。
-```
-
-CREATE TABLE conversation_messages (
-    message_id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
-);
 ```
 
 ## 4. Qdrant Point 设计

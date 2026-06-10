@@ -8,7 +8,6 @@ from langchain_core.messages import (  # LangChain 标准消息类型
     SystemMessage,  # 系统提示词消息类型
     ToolMessage,  # 工具返回消息类型；用于判断是否触发报告模式
 )
-from langgraph.checkpoint.memory import InMemorySaver  # 内存 checkpointer，用于按 thread_id 保存图状态
 from langgraph.graph import END, StateGraph  # END 表示图结束；StateGraph 用于显式搭建工作流
 from langgraph.graph.message import add_messages  # 消息 reducer，负责把新消息追加进 state["messages"]
 from langgraph.prebuilt import ToolNode, tools_condition  # ToolNode 执行工具；tools_condition 判断是否需要走工具节点
@@ -68,11 +67,6 @@ class ReactAgent:
         # bind_tools 把工具 schema 绑定到模型，让模型可以在回答过程中发起 tool_calls。
         self.model = chat_model.bind_tools(self.tools)
 
-        # InMemorySaver 会把同一个 thread_id 的 graph state 保存在进程内存中。
-        # 当前我们用 user_id 作为 thread_id，因此同一个 user_id 的多轮请求会共享后端历史。
-        # 注意：这是内存存储，服务重启后会丢失；生产环境可以换成 Redis/Postgres checkpointer。
-        self.checkpointer = InMemorySaver()
-
         # 编译后的 LangGraph 图对象。
         self.graph = self._build_graph()
 
@@ -109,7 +103,7 @@ class ReactAgent:
         graph.add_edge("tools", "update_report_state")  # 工具执行完后先更新业务状态
         graph.add_edge("update_report_state", "agent")  # 更新完状态后回到模型，让模型生成最终回答
 
-        return graph.compile(checkpointer=self.checkpointer)  # 编译图，并启用内存状态保存
+        return graph.compile()  # 编译图；会话历史由 SQLite 在每次请求前注入
 
     @staticmethod
     def _message_content_to_text(content) -> str:
@@ -129,28 +123,46 @@ class ReactAgent:
 
         return str(content or "")  # 兜底转换
 
-    @staticmethod
-    def _input_state(query: str) -> AgentState:
+    @classmethod
+    def _input_state(cls, query: str, history: list[dict] | None = None) -> AgentState:
         """把用户输入转换成 LangGraph 的初始 state。
 
-        这里每次只传入当前用户的新消息。
-        如果 checkpointer 中已有同 thread_id 的历史，LangGraph 会自动把新消息追加到历史后面。
+        这里会把 SQLite 中最近的历史消息和当前用户新消息一起传入。
+        这样服务重启后也能恢复会话上下文。
         """
 
         return {
-            "messages": [HumanMessage(content=query)],  # 当前轮用户消息
+            "messages": [*cls._history_to_messages(history or []), HumanMessage(content=query)],  # 历史 + 当前轮用户消息
             "report": False,  # 每一轮先从普通客服模式开始；工具可在本轮把它切成报告模式
         }
 
     @staticmethod
-    def _run_config(user_id: str | None) -> dict:
+    def _history_to_messages(history: list[dict]) -> list[AnyMessage]:
+        """把 SQLite 消息记录转换成 LangChain 消息。"""
+
+        messages: list[AnyMessage] = []
+        for item in history:
+            role = item.get("role")
+            content = str(item.get("content") or "")
+            if not content:
+                continue
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+            elif role == "system":
+                messages.append(SystemMessage(content=content))
+        return messages
+
+    @staticmethod
+    def _run_config(user_id: str | None, conversation_id: str | None = None) -> dict:
         """生成 LangGraph 运行配置。
 
-        thread_id 是 checkpointer 区分会话的关键。
-        这里使用 user_id 作为 thread_id，让同一个用户的多轮请求能共享后端消息历史。
+        thread_id 主要用于 LangGraph 内部 tracing。
+        持久化历史以 SQLite conversation_id 为准。
         """
 
-        return {"configurable": {"thread_id": user_id or "anonymous"}}  # 没有 user_id 时使用 anonymous 兜底
+        return {"configurable": {"thread_id": conversation_id or user_id or "anonymous"}}
 
     def _call_model(self, state: AgentState) -> dict:
         """LangGraph 的 agent 节点：调用模型生成下一条 AIMessage。
@@ -191,34 +203,46 @@ class ReactAgent:
 
         return {}  # 没有报告工具调用，不修改状态
 
-    def execute(self, query: str, user_id: str | None = None) -> str:
+    def execute(
+            self,
+            query: str,
+            user_id: str | None = None,
+            conversation_id: str | None = None,
+            history: list[dict] | None = None,
+    ) -> str:
         """一次性执行 LangGraph，并返回最终回答。"""
 
         exact_faq_context = rag.try_answer_exact_faq_query(query)
         if exact_faq_context is not None:
             logger.info("[langgraph agent] 命中 FAQ Qdrant 检索，使用模型润色回答")
-            return self._answer_from_retrieved_context(query, exact_faq_context)
+            return self._answer_from_retrieved_context(query, exact_faq_context, history=history)
 
         result = self.graph.invoke(  # invoke 会等整张图运行结束
-            self._input_state(query),  # 当前轮输入
-            config=self._run_config(user_id),  # thread_id 配置，用于保存/读取会话历史
+            self._input_state(query, history=history),  # 历史 + 当前轮输入
+            config=self._run_config(user_id, conversation_id),  # thread_id 配置，用于 tracing
             context={"user_id": user_id},  # 运行时上下文，ToolRuntime 会把它注入 get_user_id 工具
         )
         latest_message = result["messages"][-1]  # 图结束时最后一条消息就是最终 AI 回答
         return self._message_content_to_text(latest_message.content).strip()  # 返回纯文本
 
-    def execute_stream(self, query: str, user_id: str | None = None):
+    def execute_stream(
+            self,
+            query: str,
+            user_id: str | None = None,
+            conversation_id: str | None = None,
+            history: list[dict] | None = None,
+    ):
         """流式执行 LangGraph，并逐段产出最终 AI 回答。"""
 
         exact_faq_context = rag.try_answer_exact_faq_query(query)
         if exact_faq_context is not None:
             logger.info("[langgraph agent] 流式接口命中 FAQ Qdrant 检索，使用模型润色回答")
-            yield from self._stream_answer_from_retrieved_context(query, exact_faq_context)
+            yield from self._stream_answer_from_retrieved_context(query, exact_faq_context, history=history)
             return
 
         for message, metadata in self.graph.stream(  # stream 会在图运行过程中持续产出消息片段
-                self._input_state(query),  # 当前轮输入
-                config=self._run_config(user_id),  # thread_id 配置
+                self._input_state(query, history=history),  # 历史 + 当前轮输入
+                config=self._run_config(user_id, conversation_id),  # thread_id 配置
                 context={"user_id": user_id},  # 工具运行上下文
                 stream_mode="messages",  # 只订阅消息流，适合转发模型 token
         ):
@@ -232,23 +256,37 @@ class ReactAgent:
             if content:  # 空 chunk 不输出
                 yield content  # 交给 FastAPI SSE 接口继续往前端推
 
-    def _answer_from_retrieved_context(self, query: str, context: str) -> str:
+    def _answer_from_retrieved_context(
+            self,
+            query: str,
+            context: str,
+            *,
+            history: list[dict] | None = None,
+    ) -> str:
         """把 Qdrant 检索结果交给模型，生成更自然的最终回答。"""
 
         response = chat_model.invoke(
             [
                 SystemMessage(content=self._retrieved_context_prompt()),
+                *self._history_to_messages(history or []),
                 HumanMessage(content=self._retrieved_context_user_message(query, context)),
             ]
         )
         return self._message_content_to_text(response.content).strip()
 
-    def _stream_answer_from_retrieved_context(self, query: str, context: str):
+    def _stream_answer_from_retrieved_context(
+            self,
+            query: str,
+            context: str,
+            *,
+            history: list[dict] | None = None,
+    ):
         """把 Qdrant 检索结果交给模型，并流式生成自然回答。"""
 
         for chunk in chat_model.stream(
                 [
                     SystemMessage(content=self._retrieved_context_prompt()),
+                    *self._history_to_messages(history or []),
                     HumanMessage(content=self._retrieved_context_user_message(query, context)),
                 ]
         ):
@@ -261,6 +299,7 @@ class ReactAgent:
         return (
             "你是扫地机器人/扫拖一体机器人客服。"
             "请只根据参考资料回答用户问题，不要编造。"
+            "可以结合会话历史理解用户省略的上下文。"
             "回答要像真实客服对话一样自然、简洁、专业。"
             "不要机械复述字段名，比如“来源文件、分类”，除非用户明确问来源。"
             "如果用户问第几问，说明该问题是什么，并直接给出答案。"

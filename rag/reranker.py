@@ -50,6 +50,85 @@ class RuleBasedReranker:
 
         return reranked_documents
 
+    def rerank_by_query(
+            self,
+            *,
+            original_query: str,
+            grouped_documents: list[tuple[str, list[Document]]],
+            analysis: QueryAnalysis,
+            per_query_keep: int = 2,
+            final_context_limit: int = 12,
+    ) -> list[Document]:
+        """按 search_query 分组精排，并保证每个子问题优先有资料覆盖。
+
+        设计目标：
+        - 每个 search_query 先独立精排。
+        - 每个 search_query 保留 top2。
+        - 最终按用户问题拆分顺序组织上下文。
+        - 对重复 Qdrant point 去重。
+        """
+
+        selected_documents: list[Document] = []
+        seen: set[str] = set()
+        safe_per_query_keep = max(1, per_query_keep)
+        safe_final_limit = max(1, final_context_limit)
+
+        for query_index, (search_query, documents) in enumerate(grouped_documents):
+            unique_documents = self._deduplicate_documents(documents)
+            scored_documents = [
+                (self._score_document(search_query, document, analysis), document)
+                for document in unique_documents
+            ]
+            scored_documents.sort(key=lambda item: item[0], reverse=True)
+
+            kept_for_query = 0
+            for score, document in scored_documents:
+                unique_key = self._document_key(document)
+                if unique_key in seen:
+                    continue
+
+                metadata = dict(document.metadata)
+                metadata["_rerank_score"] = round(score, 4)
+                metadata["_search_query"] = search_query
+                metadata["_search_query_index"] = query_index
+                selected_documents.append(Document(page_content=document.page_content, metadata=metadata))
+                seen.add(unique_key)
+                kept_for_query += 1
+
+                if kept_for_query >= safe_per_query_keep:
+                    break
+                if len(selected_documents) >= safe_final_limit:
+                    return selected_documents
+
+        if len(selected_documents) >= safe_final_limit:
+            return selected_documents[:safe_final_limit]
+
+        # 如果部分 query 因重复去重导致资料不足，用全局高分候选补齐。
+        overflow_candidates: list[tuple[float, Document]] = []
+        for search_query, documents in grouped_documents:
+            for document in self._deduplicate_documents(documents):
+                unique_key = self._document_key(document)
+                if unique_key in seen:
+                    continue
+                overflow_candidates.append((self._score_document(original_query or search_query, document, analysis), document))
+
+        overflow_candidates.sort(key=lambda item: item[0], reverse=True)
+        for score, document in overflow_candidates:
+            unique_key = self._document_key(document)
+            if unique_key in seen:
+                continue
+
+            metadata = dict(document.metadata)
+            metadata["_rerank_score"] = round(score, 4)
+            metadata.setdefault("_search_query", original_query)
+            selected_documents.append(Document(page_content=document.page_content, metadata=metadata))
+            seen.add(unique_key)
+
+            if len(selected_documents) >= safe_final_limit:
+                break
+
+        return selected_documents
+
     def _score_document(self, query: str, document: Document, analysis: QueryAnalysis) -> float:
         """计算单条候选资料的规则分数。"""
 
@@ -103,16 +182,7 @@ class RuleBasedReranker:
         seen: set[str] = set()
 
         for document in documents:
-            metadata = document.metadata
-            unit_id = metadata.get("unit_id")
-            chunk_id = metadata.get("chunk_id")
-
-            if unit_id:
-                unique_key = str(unit_id)
-            elif chunk_id:
-                unique_key = str(chunk_id)
-            else:
-                unique_key = f"{metadata.get('source')}::{metadata.get('page')}::{document.page_content[:80]}"
+            unique_key = RuleBasedReranker._document_key(document)
 
             if unique_key in seen:
                 continue
@@ -121,3 +191,21 @@ class RuleBasedReranker:
             result.append(document)
 
         return result
+
+    @staticmethod
+    def _document_key(document: Document) -> str:
+        metadata = document.metadata
+        point_id = metadata.get("_point_id")
+        unit_id = metadata.get("unit_id")
+        chunk_id = metadata.get("chunk_id")
+        segment_id = metadata.get("segment_id")
+
+        if point_id:
+            return f"point:{point_id}"
+        if unit_id:
+            return f"unit:{unit_id}"
+        if chunk_id:
+            return f"chunk:{chunk_id}"
+        if segment_id:
+            return f"segment:{segment_id}"
+        return f"{metadata.get('source_file') or metadata.get('source')}::{metadata.get('page')}::{document.page_content[:80]}"
