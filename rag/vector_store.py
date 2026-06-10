@@ -1,12 +1,16 @@
 from langchain_qdrant import QdrantVectorStore
 from langchain_core.documents import Document
-from qdrant_client import models
 from utils.config_handler import qdrant_conf
 from model.factory import embed_model
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from utils.path_tool import get_abs_path
 from utils.file_handler import pdf_loader, txt_loader, listdir_with_allowed_type, get_file_md5_hex
 from utils.logger_handler import logger
+from utils.qdrant_options import (
+    get_qdrant_client_options,
+    get_qdrant_collection_name,
+    get_qdrant_distance,
+)
 import os
 
 
@@ -14,9 +18,9 @@ class VectorStoreService:
     def __init__(self):
         self.vector_store = QdrantVectorStore.construct_instance(
             embedding=embed_model,
-            collection_name=qdrant_conf["collection_name"],
-            client_options=self._client_options(),
-            distance=self._distance(),
+            collection_name=get_qdrant_collection_name(),
+            client_options=get_qdrant_client_options(),
+            distance=get_qdrant_distance(),
             force_recreate=qdrant_conf.get("force_recreate", False),
         )
 
@@ -26,33 +30,6 @@ class VectorStoreService:
             separators=qdrant_conf["separators"],
             length_function=len,
         )
-
-    @staticmethod
-    def _client_options() -> dict:
-        if qdrant_conf.get("url"):
-            options = {
-                "url": qdrant_conf["url"],
-                "grpc_port": qdrant_conf.get("grpc_port", 6334),
-                "prefer_grpc": qdrant_conf.get("prefer_grpc", False),
-                "api_key": qdrant_conf.get("api_key"),
-                "timeout": qdrant_conf.get("timeout"),
-            }
-        else:
-            options = {
-                "host": qdrant_conf.get("host", "localhost"),
-                "port": qdrant_conf.get("port", 6333),
-                "grpc_port": qdrant_conf.get("grpc_port", 6334),
-                "prefer_grpc": qdrant_conf.get("prefer_grpc", False),
-                "api_key": qdrant_conf.get("api_key"),
-                "timeout": qdrant_conf.get("timeout"),
-            }
-
-        return {key: value for key, value in options.items() if value is not None}
-
-    @staticmethod
-    def _distance() -> models.Distance:
-        distance_name = qdrant_conf.get("distance", "COSINE").upper()
-        return getattr(models.Distance, distance_name, models.Distance.COSINE)
 
     def get_retriever(self):
         return self.vector_store.as_retriever(search_kwargs={"k": qdrant_conf["k"]})

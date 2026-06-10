@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+streamlit
+langchain
+langchain-core
+langchain-community
+langchain-qdrant
+langchain-text-splitters
+qdrant-client
+dashscope
+pypdf
+pyyaml
