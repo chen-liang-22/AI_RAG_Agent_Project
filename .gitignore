@@ -12,6 +12,7 @@ logs/
 qdrant_md5.text
 qdrant_storage/
 storage/
+uploads/
 chroma_db/
 **/chroma_db/
 *.zip
