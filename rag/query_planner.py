@@ -30,14 +30,28 @@ class QueryPlannerService:
         if not clean_query:
             return []
 
+        logger.info(
+            "[query planner] start query=%s history_count=%s",
+            clean_query,
+            len(history or []),
+        )
+        explicit_queries = self._split_explicit_questions(clean_query)
+        if len(explicit_queries) >= 2:
+            planned_queries = self._normalize_queries(explicit_queries, original_query=clean_query)
+            logger.info("[query planner] explicit_split_queries=%s", planned_queries)
+            return planned_queries
+
         try:
             queries = self._plan_with_llm(clean_query, history=history or [])
             if queries:
+                logger.info("[query planner] llm_queries=%s", queries)
                 return queries
         except Exception as exc:
             logger.warning(f"[query planner] llm planner failed, fallback to rules: {exc}")
 
-        return self._fallback_queries(clean_query)
+        fallback_queries = self._fallback_queries(clean_query)
+        logger.info("[query planner] fallback_queries=%s", fallback_queries)
+        return fallback_queries
 
     def _plan_with_llm(self, query: str, *, history: list[dict[str, Any]]) -> list[str]:
         history_text = self._format_history(history)
@@ -48,6 +62,7 @@ class QueryPlannerService:
             ]
         )
         content = self._message_content_to_text(response.content)
+        logger.info("[query planner] raw_output=%s", content[:1200])
         data = self._parse_json_object(content)
         raw_queries = data.get("queries") if isinstance(data, dict) else None
         if not isinstance(raw_queries, list):
@@ -56,23 +71,18 @@ class QueryPlannerService:
         return self._normalize_queries([str(item) for item in raw_queries], original_query=query)
 
     def _fallback_queries(self, query: str) -> list[str]:
-        parts = [
-            part.strip()
-            for part in re.split(r"[？?；;\n\r]+", query)
-            if part.strip()
-        ]
+        parts = self._split_explicit_questions(query)
         if len(parts) <= 1:
             analysis = self.fallback_analyzer.analyze(query)
             parts = analysis.sub_queries
-        else:
-            parts.insert(0, query)
         return self._normalize_queries(parts, original_query=query)
 
     def _normalize_queries(self, queries: list[str], *, original_query: str) -> list[str]:
         result: list[str] = []
         seen: set[str] = set()
+        source_queries = [original_query, *queries] if len(queries) <= 1 else queries
 
-        for value in [original_query, *queries]:
+        for value in source_queries:
             clean_value = self._clean_query(value)
             if not clean_value:
                 continue
@@ -90,6 +100,14 @@ class QueryPlannerService:
     def _clean_query(value: str) -> str:
         value = re.sub(r"\s+", " ", value).strip(" \t\r\n，。！？?；;、")
         return value[:160]
+
+    @classmethod
+    def _split_explicit_questions(cls, query: str) -> list[str]:
+        return [
+            cls._clean_query(part)
+            for part in re.split(r"[？?；;\n\r]+", query)
+            if cls._clean_query(part)
+        ]
 
     @staticmethod
     def _query_key(value: str) -> str:

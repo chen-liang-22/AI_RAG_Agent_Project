@@ -43,8 +43,9 @@ class RagSummarizeService(object):
         - “扫拖一体机器人100问第95问是什么？”
         - “扫拖一体机器人100问都有哪些？”
 
-        FAQ 文档入库后已经写入 Qdrant payload，因此这里直接做
-        Qdrant 结构化查询，能避免向量召回只召到片段导致“明明有第95问却答不上来”。
+        FAQ 文档入库后已经写入 Qdrant payload。
+        这里只处理编号/清单这类结构化问题，普通语义问题全部交给
+        Query Planner + 多 query 召回，避免单条 FAQ 语义命中截胡。
         返回 None 表示当前问题不是 FAQ 精确查询，继续走普通 Agent/RAG。
         """
 
@@ -59,7 +60,8 @@ class RagSummarizeService(object):
         if question_no is not None:
             return self.get_faq_item_by_number(question_no=question_no, document_hint=normalized_query)
 
-        return self.get_faq_item_by_question(normalized_query)
+        logger.info("[rag exact faq] skip semantic faq shortcut query=%s", normalized_query)
+        return None
 
     def get_faq_item_by_number(self, question_no: int, document_hint: str | None = None) -> str:
         """按编号从 Qdrant payload 中查询 FAQ/100问 的某一问。"""
@@ -126,6 +128,11 @@ class RagSummarizeService(object):
 
         best_document = documents[0]
         vector_score = float(best_document.metadata.get("_vector_score") or 0.0)
+        logger.info(
+            "[rag exact faq] semantic_faq_best score=%.4f doc=%s",
+            vector_score,
+            self._summarize_documents_for_log([best_document]),
+        )
         if vector_score < 0.62:
             return None
 
@@ -162,6 +169,7 @@ class RagSummarizeService(object):
         """
 
         analysis = self.intent_analyzer.analyze(query)
+        self._log_intent_analysis(query, analysis)
         search_queries = self.query_planner.plan(query, history=history)
         candidate_groups = self.retrieve_for_queries(search_queries, analysis)
         reranked_docs = self.reranker.rerank_by_query(
@@ -180,6 +188,7 @@ class RagSummarizeService(object):
             sum(len(documents) for _, documents in candidate_groups),
             len(reranked_docs),
         )
+        logger.info("[rag rerank] final_context=%s", self._summarize_documents_for_log(reranked_docs))
 
         return reranked_docs
 
@@ -195,6 +204,7 @@ class RagSummarizeService(object):
         """
 
         analysis = self.intent_analyzer.analyze(query)
+        self._log_intent_analysis(query, analysis)
         search_queries = self.query_planner.plan(query)
         candidate_groups = self.retrieve_for_queries(search_queries, analysis)
         reranked_docs = self.reranker.rerank_by_query(
@@ -243,6 +253,13 @@ class RagSummarizeService(object):
             documents: list[Document] = []
             if analysis.filters:
                 try:
+                    logger.info(
+                        "[rag retrieve] query_index=%s search_query=%s filters=%s top_k=%s",
+                        query_index,
+                        search_query,
+                        analysis.filters,
+                        per_query_top_k,
+                    )
                     documents = self._get_vector_store().search_documents(
                         search_query,
                         k=per_query_top_k,
@@ -253,6 +270,12 @@ class RagSummarizeService(object):
 
             if not documents:
                 try:
+                    logger.info(
+                        "[rag retrieve] query_index=%s search_query=%s filters=None top_k=%s",
+                        query_index,
+                        search_query,
+                        per_query_top_k,
+                    )
                     documents = self._get_vector_store().search_documents(
                         search_query,
                         k=per_query_top_k,
@@ -262,6 +285,12 @@ class RagSummarizeService(object):
                     logger.warning(f"[rag] vector retrieve failed query={search_query}: {exc}")
                     documents = []
 
+            logger.info(
+                "[rag retrieve] query_index=%s result_count=%s docs=%s",
+                query_index,
+                len(documents),
+                self._summarize_documents_for_log(documents),
+            )
             candidate_groups.append(
                 (
                     search_query,
@@ -274,6 +303,17 @@ class RagSummarizeService(object):
             )
 
         return candidate_groups
+
+    @staticmethod
+    def _log_intent_analysis(query: str, analysis: QueryAnalysis) -> None:
+        logger.info(
+            "[rag intent] query=%s intents=%s keywords=%s filters=%s rule_sub_queries=%s",
+            query,
+            analysis.intents,
+            analysis.keywords,
+            analysis.filters,
+            analysis.sub_queries,
+        )
 
     @staticmethod
     def _annotate_search_query(
@@ -289,6 +329,26 @@ class RagSummarizeService(object):
             metadata["_search_query_index"] = query_index
             annotated_documents.append(Document(page_content=document.page_content, metadata=metadata))
         return annotated_documents
+
+    @staticmethod
+    def _summarize_documents_for_log(documents: list[Document], limit: int = 8) -> list[dict]:
+        result: list[dict] = []
+        for index, document in enumerate(documents[:limit], start=1):
+            metadata = document.metadata
+            result.append(
+                {
+                    "rank": index,
+                    "source_file": metadata.get("source_file") or metadata.get("source"),
+                    "question_no": metadata.get("question_no"),
+                    "content_type": metadata.get("content_type"),
+                    "category": metadata.get("category"),
+                    "vector_score": metadata.get("_vector_score"),
+                    "rerank_score": metadata.get("_rerank_score"),
+                    "search_query": metadata.get("_search_query"),
+                    "preview": document.page_content.replace("\n", " ")[:120],
+                }
+            )
+        return result
 
     def _keyword_retrieve(self, analysis: QueryAnalysis, limit: int) -> list[Document]:
         """从 SQLite 做关键词补充召回。
