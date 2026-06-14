@@ -415,22 +415,8 @@ class KnowledgeStore:
     def find_faq_document(self, document_hint: str | None = None) -> dict[str, Any] | None:
         return None
 
-    def get_faq_item_by_number(
-            self,
-            question_no: int,
-            document_hint: str | None = None,
-    ) -> dict[str, Any] | None:
-        return None
-
     def search_faq_items_by_question(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         return []
-
-    def list_faq_questions(
-            self,
-            document_hint: str | None = None,
-            limit: int = 120,
-    ) -> dict[str, Any]:
-        return {"document": None, "total": 0, "items": []}
 
     def search_units_by_keywords(self, keywords: list[str], limit: int = 20) -> list[dict[str, Any]]:
         return []

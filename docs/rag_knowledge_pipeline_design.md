@@ -312,10 +312,10 @@ CREATE TABLE indexing_jobs (
 
 ## 8. 入库流程设计
 
-### 8.1 上传接口
+### 8.1 上传预览接口
 
 ```text
-POST /knowledge/upload
+POST /knowledge/upload/preview
 ```
 
 请求：
@@ -329,11 +329,31 @@ file: 知识库文件
 
 ```json
 {
-  "document_id": "doc_001",
+  "upload_id": "tmp_001",
   "filename": "扫地机器人100问.pdf",
-  "status": "uploaded"
+  "detected_type": "faq",
+  "split_strategy": "numbered_qa",
+  "sample_text": "..."
 }
 ```
+
+### 8.2 上传确认接口
+
+```text
+POST /knowledge/upload/confirm
+```
+
+请求：
+
+```json
+{
+  "upload_id": "tmp_001",
+  "document_type": "faq",
+  "split_strategy": "numbered_qa"
+}
+```
+
+确认后才会创建 documents 记录并写入 Qdrant。
 
 ### 8.2 入库流程
 
@@ -594,7 +614,8 @@ POST /chat/stream
 新增：
 
 ```text
-POST   /knowledge/upload
+POST   /knowledge/upload/preview
+POST   /knowledge/upload/confirm
 GET    /knowledge/files
 GET    /knowledge/files/{document_id}
 DELETE /knowledge/files/{document_id}

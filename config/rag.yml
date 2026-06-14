@@ -1,2 +1,9 @@
-chat_model_name: qwen3-max
+chat_provider: tongyi
+chat_model_name: qwen3.7-max
+openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 embedding_model_name: text-embedding-v4
+#chat_provider: openai_compatible
+#chat_model_name: qwen3-max
+#openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+#embedding_model_name: text-embedding-v4
+chat_route_mode: direct_rag

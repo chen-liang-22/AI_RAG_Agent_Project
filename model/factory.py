@@ -1,9 +1,11 @@
+import os  # 读取 OpenAI-compatible API key
 from abc import ABC, abstractmethod  # 定义抽象工厂基类，约束子类必须实现 generator
 from typing import Optional  # 标注 generator 可能返回模型对象，也可能返回 None
 from langchain_core.embeddings import Embeddings  # 向量模型的通用类型
 from langchain_community.chat_models.tongyi import BaseChatModel  # 聊天模型的通用类型
 from langchain_community.embeddings import DashScopeEmbeddings  # 通义 DashScope embedding 模型
 from langchain_community.chat_models.tongyi import ChatTongyi  # 通义聊天模型
+from langchain_openai import ChatOpenAI  # OpenAI-compatible 聊天模型，支持百炼兼容模式
 from utils.config_handler import rag_conf  # 读取 config 下的 RAG/模型配置
 
 
@@ -24,7 +26,21 @@ class ChatModelFactory(BaseModelFactory):
         #
         # 开启后，ChatTongyi 会把模型生成过程拆成多个 AIMessageChunk，
         # ReactAgent.execute_stream() 才能逐段 yield 给 FastAPI 的 SSE 接口。
-        return ChatTongyi(model=rag_conf["chat_model_name"], streaming=True)  # 创建聊天模型，并打开真实流式输出
+        provider = str(rag_conf.get("chat_provider") or "tongyi").strip().lower()
+        model_name = rag_conf["chat_model_name"]
+
+        if provider in {"openai_compatible", "openai-compatible", "openai"}:
+            return ChatOpenAI(
+                model=model_name,
+                base_url=rag_conf.get("openai_base_url"),
+                api_key=os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY") or "empty",
+                streaming=True,
+            )
+
+        if provider == "tongyi":
+            return ChatTongyi(model=model_name, streaming=True)  # 创建聊天模型，并打开真实流式输出
+
+        raise ValueError(f"不支持的 chat_provider：{provider}")
 
 
 class EmbeddingsFactory(BaseModelFactory):

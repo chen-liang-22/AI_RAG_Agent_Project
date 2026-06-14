@@ -5,6 +5,7 @@ streamlit
 langchain
 langchain-core
 langchain-community
+langchain-openai
 langchain-qdrant
 langchain-text-splitters
 qdrant-client

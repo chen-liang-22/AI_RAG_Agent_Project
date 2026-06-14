@@ -21,16 +21,6 @@ def rag_summarize(query: str) -> str:
     return rag.rag_summarize(query)
 
 
-@tool(description="按问题编号精确查询 FAQ/100问 文档中的某一问，适合回答“第95问是什么”这类问题")
-def get_faq_item_by_number(question_no: int, document_hint: str = "") -> str:
-    return rag.get_faq_item_by_number(question_no=question_no, document_hint=document_hint)
-
-
-@tool(description="列出 FAQ/100问 文档中的问题清单，适合回答“100问都有哪些”这类问题")
-def list_faq_questions(document_hint: str = "", limit: int = 120) -> str:
-    return rag.list_faq_questions(document_hint=document_hint, limit=limit)
-
-
 @tool(description="获取指定城市的天气，以消息字符串的形式返回")
 def get_weather(city: str) -> str:
     return f"城市{city}天气为晴天，气温26摄氏度，空气湿度50%，南风1级，AQI21，最近6小时降雨概率极低"

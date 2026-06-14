@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field  # Pydantic 用于定义请求体和响应
 from qdrant_client import QdrantClient  # 健康检查时用于连接 Qdrant 并读取 collection 列表
 
 from rag.knowledge_store import KnowledgeStore  # SQLite 元数据存储，保存文件记录和知识单元记录
-from utils.config_handler import qdrant_conf  # 读取知识库允许文件类型、切分配置等
+from utils.config_handler import qdrant_conf, rag_conf  # 读取知识库允许文件类型、切分配置和模型配置
 from utils.file_handler import get_file_md5_hex, listdir_with_allowed_type  # 计算文件 MD5；扫描 data 目录允许入库的文件
 from utils.logger_handler import logger  # 项目统一日志对象
 from utils.path_tool import get_abs_path  # 把 uploads/storage 等相对路径转成项目绝对路径
@@ -26,6 +26,8 @@ app = FastAPI(
 
 _agent = None  # 全局 Agent 单例；第一次聊天请求进来时才真正初始化
 _agent_lock = threading.Lock()  # 初始化锁；防止多个请求同时初始化多个 Agent
+_knowledge_answer_service = None  # 知识库直答服务单例；普通知识问答不再进入 Agent 工具链
+_knowledge_answer_lock = threading.Lock()  # 知识直答服务初始化锁
 
 
 class ChatRequest(BaseModel):
@@ -254,39 +256,6 @@ def _move_upload_file(source_path: str, document_id: str, filename: str) -> str:
     return target_path
 
 
-def _save_upload_file(file: UploadFile, filename: str, document_id: str) -> tuple[str, int]:
-    """把上传文件保存到 uploads/{document_id}/{filename}。
-
-    返回：
-    - file_path：服务端保存路径
-    - file_size：写入的字节数
-    """
-
-    upload_dir = os.path.join(get_abs_path("uploads"), document_id)
-    os.makedirs(upload_dir, exist_ok=True)
-
-    file_path = os.path.join(upload_dir, filename)
-    file_size = 0
-
-    try:
-        with open(file_path, "wb") as target:
-            while True:
-                chunk = file.file.read(1024 * 1024)
-                if not chunk:
-                    break
-                file_size += len(chunk)
-                target.write(chunk)
-    except Exception:
-        _remove_created_upload_dir(upload_dir)
-        raise
-
-    if file_size <= 0:
-        _remove_created_upload_dir(upload_dir)
-        raise HTTPException(status_code=400, detail="上传文件不能为空")
-
-    return file_path, file_size
-
-
 def _save_preview_file(file: UploadFile, filename: str, upload_id: str) -> tuple[str, int]:
     """把上传文件保存到临时 preview 目录。"""
 
@@ -449,6 +418,57 @@ def _get_agent():
     return _agent  # 返回初始化好的 Agent
 
 
+def _get_knowledge_answer_service():
+    """获取知识库直答服务单例。
+
+    普通知识问答走这条直线路径：
+    用户问题 -> Query Planner -> Qdrant -> 最终回答模型。
+    这条路径不会绑定 Agent 工具，所以不会触发“模型判断是否调用 rag_summarize”。
+    """
+
+    global _knowledge_answer_service
+
+    if _knowledge_answer_service is not None:
+        return _knowledge_answer_service
+
+    with _knowledge_answer_lock:
+        if _knowledge_answer_service is None:
+            try:
+                from rag.knowledge_answer_service import KnowledgeAnswerService
+
+                _knowledge_answer_service = KnowledgeAnswerService()
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"知识库直答服务初始化失败：{exc}") from exc
+
+    return _knowledge_answer_service
+
+
+def _get_chat_route_mode() -> str:
+    """读取聊天路由模式；不配置时默认直连 RAG。"""
+
+    mode = str(
+        rag_conf.get("chat_route_mode")
+        or rag_conf.get("knowledge_chat_mode")
+        or "direct_rag"
+    ).strip().lower()
+    return mode.replace("-", "_")
+
+
+def _should_use_direct_rag(message: str) -> tuple[bool, str]:
+    """判断当前问题是否走知识库直答。
+
+    这里不再按关键词猜意图：
+    - 不配置 chat_route_mode：默认全部走直连 RAG。
+    - chat_route_mode: agent：恢复之前的 Agent 工具链。
+    """
+
+    mode = _get_chat_route_mode()
+    if mode in {"agent", "react_agent", "legacy_agent"}:
+        return False, "配置 chat_route_mode=agent，使用之前的 Agent 工具链"
+
+    return True, f"配置 chat_route_mode={mode}，使用直连 RAG"
+
+
 def _build_conversation_title(message: str) -> str:
     """用首条用户问题生成一个简短会话标题。"""
 
@@ -553,6 +573,51 @@ def _stream_agent(
         yield f"event: error\ndata: {payload}\n\n"  # 用 SSE error 事件通知前端
 
 
+def _stream_direct_rag(
+        message: str,
+        user_id: str | None = None,
+        conversation_id: str | None = None,
+        history: list[dict] | None = None,
+) -> Iterator[str]:
+    """把知识库直答 token 流转换成 SSE 文本流。"""
+
+    try:
+        logger.info(
+            "[聊天路由] 流式接口走知识直答 user_id=%s conversation_id=%s 问题=%s",
+            user_id,
+            conversation_id,
+            message,
+        )
+        meta_payload = json.dumps(
+            {"conversation_id": conversation_id, "mode": "direct_rag"},
+            ensure_ascii=False,
+        )
+        yield f"event: meta\ndata: {meta_payload}\n\n"
+
+        chunks: list[str] = []
+        for chunk in _get_knowledge_answer_service().stream_answer(message, history=history or []):
+            chunks.append(chunk)
+            payload = json.dumps({"content": chunk}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {payload}\n\n"
+
+        answer = "".join(chunks).strip()
+        if conversation_id and answer:
+            _save_chat_exchange(
+                conversation_id=conversation_id,
+                message=message,
+                answer=answer,
+                metadata={"mode": "direct_rag_stream"},
+            )
+
+        logger.info("[聊天路由] 知识直答流式完成 user_id=%s conversation_id=%s", user_id, conversation_id)
+        done_payload = json.dumps({"done": True, "conversation_id": conversation_id}, ensure_ascii=False)
+        yield f"event: done\ndata: {done_payload}\n\n"
+    except Exception as exc:
+        logger.error("[聊天路由] 知识直答流式失败 user_id=%s 错误=%s", user_id, exc, exc_info=True)
+        payload = json.dumps({"error": str(exc)}, ensure_ascii=False)
+        yield f"event: error\ndata: {payload}\n\n"
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     logger.info("[api] /health")  # 记录健康检查访问日志
@@ -594,6 +659,32 @@ def chat(request: ChatRequest) -> ChatResponse:
         f"[api] /chat user_id={request.user_id} "
         f"conversation_id={conversation_id} message={request.message}"
     )  # 标记本次调用的是一次性接口
+
+    use_direct_rag, route_reason = _should_use_direct_rag(request.message)
+    if use_direct_rag:
+        logger.info(
+            "[聊天路由] 非流式接口路由结果=知识直答 原因=%s user_id=%s conversation_id=%s 问题=%s",
+            route_reason,
+            request.user_id,
+            conversation_id,
+            request.message,
+        )
+        answer = _get_knowledge_answer_service().answer(request.message, history=history)
+        _save_chat_exchange(
+            conversation_id=conversation_id,
+            message=request.message,
+            answer=answer,
+            metadata={"mode": "direct_rag_once", "route_reason": route_reason},
+        )
+        return ChatResponse(answer=answer, conversation_id=conversation_id)
+
+    logger.info(
+        "[聊天路由] 非流式接口路由结果=Agent工具链 原因=%s user_id=%s conversation_id=%s 问题=%s",
+        route_reason,
+        request.user_id,
+        conversation_id,
+        request.message,
+    )
     answer = _get_agent().execute(
         request.message,
         user_id=request.user_id,
@@ -604,7 +695,7 @@ def chat(request: ChatRequest) -> ChatResponse:
         conversation_id=conversation_id,
         message=request.message,
         answer=answer,
-        metadata={"mode": "once"},
+        metadata={"mode": "agent_once", "route_reason": route_reason},
     )
     return ChatResponse(answer=answer, conversation_id=conversation_id)
 
@@ -638,6 +729,38 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
         f"[api] /chat/stream requested user_id={request.user_id} "
         f"conversation_id={conversation_id} message={request.message}"
     )  # 标记本次调用的是流式接口
+
+    use_direct_rag, route_reason = _should_use_direct_rag(request.message)
+    if use_direct_rag:
+        logger.info(
+            "[聊天路由] 流式接口路由结果=知识直答 原因=%s user_id=%s conversation_id=%s 问题=%s",
+            route_reason,
+            request.user_id,
+            conversation_id,
+            request.message,
+        )
+        return StreamingResponse(
+            _stream_direct_rag(
+                request.message,
+                user_id=request.user_id,
+                conversation_id=conversation_id,
+                history=history,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    logger.info(
+        "[聊天路由] 流式接口路由结果=Agent工具链 原因=%s user_id=%s conversation_id=%s 问题=%s",
+        route_reason,
+        request.user_id,
+        conversation_id,
+        request.message,
+    )
     _get_agent()  # 提前初始化 Agent；初始化失败时可以在返回流之前直接报错
     return StreamingResponse(
         _stream_agent(
@@ -652,94 +775,6 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
             "Connection": "keep-alive",  # 保持连接不断开，适合长响应
             "X-Accel-Buffering": "no",  # Nginx 代理时关闭响应缓冲
         },
-    )
-
-
-@app.post("/knowledge/upload", response_model=KnowledgeUploadResponse)
-def upload_knowledge_file(file: UploadFile = File(...)) -> KnowledgeUploadResponse:
-    """上传知识库文件，并立即写入 SQLite 和 Qdrant。
-
-    这个接口是设计文档第一阶段的核心入口。
-
-    调用方通过 multipart/form-data 上传文件：
-    - key: file
-    - value: .txt 或 .pdf 文件
-
-    后端处理流程：
-    1. 清理文件名，避免目录穿越。
-    2. 校验文件类型，只允许 qdrant.yml 中配置的后缀。
-    3. 保存原始文件到 uploads/{document_id}/。
-    4. 计算文件 MD5，判断是否已经有相同内容的 active 文件。
-    5. 如果重复，删除本次刚保存的文件，返回已有文件记录。
-    6. 如果不重复，写入 documents 表。
-    7. 解析文件、切分知识单元、写入 Qdrant。
-    8. 写入 Qdrant，并更新 documents.status。
-    """
-
-    filename = _sanitize_upload_filename(file.filename)
-    file_type = _validate_file_type(filename)
-    document_id = f"doc_{uuid.uuid4().hex}"
-
-    logger.info(f"[knowledge] upload start filename={filename} document_id={document_id}")
-
-    try:
-        file_path, file_size = _save_upload_file(file, filename, document_id)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error(f"[knowledge] upload save failed filename={filename}: {exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"上传文件保存失败：{exc}") from exc
-
-    upload_dir = os.path.dirname(file_path)
-    file_md5 = get_file_md5_hex(file_path)
-    if not file_md5:
-        _remove_created_upload_dir(upload_dir)
-        raise HTTPException(status_code=500, detail="上传文件 MD5 计算失败")
-
-    store = _get_knowledge_store()
-    duplicate_document = store.find_active_document_by_md5(file_md5)
-    if duplicate_document is not None:
-        _remove_created_upload_dir(upload_dir)
-        logger.info(
-            "[knowledge] duplicate upload "
-            f"filename={filename} existing_document_id={duplicate_document['document_id']}"
-        )
-        return KnowledgeUploadResponse(
-            status="duplicate",
-            message="相同内容的文件已经存在，本次没有重复入库。",
-            document=_document_to_response(duplicate_document),
-        )
-
-    document = store.create_document(
-        document_id=document_id,
-        filename=filename,
-        file_path=file_path,
-        file_type=file_type,
-        file_md5=file_md5,
-        file_size=file_size,
-        status="uploaded",
-    )
-
-    try:
-        from rag.vector_store import VectorStoreService
-
-        vector_store = VectorStoreService()
-        preview = vector_store.preview_file(filename=filename, file_path=file_path)
-        indexed_document = _index_document(
-            store,
-            document,
-            document_type=preview["document_type"],
-            split_strategy=preview["split_strategy"],
-            vector_store=vector_store,
-        )
-    except HTTPException:
-        raise
-    logger.info(f"[knowledge] upload indexed document_id={document_id}")
-
-    return KnowledgeUploadResponse(
-        status="indexed",
-        message="文件已上传并写入知识库。",
-        document=_document_to_response(indexed_document),
     )
 
 

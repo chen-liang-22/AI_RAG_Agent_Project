@@ -846,29 +846,7 @@ POST /knowledge/upload/confirm
 7. 更新 documents.status = indexed。
 ```
 
-### 11.4 直接上传接口
-
-接口：
-
-```text
-POST /knowledge/upload
-```
-
-作用：
-
-```text
-兼容旧流程。
-上传后自动识别文档类型并立即入库。
-```
-
-建议：
-
-```text
-前端正式使用时优先走 preview + confirm。
-这样用户可以确认识别结果，避免误切分。
-```
-
-### 11.5 内置知识库重建接口
+### 11.4 内置知识库重建接口
 
 接口：
 
@@ -900,7 +878,7 @@ POST /knowledge/reload
 reload 会重新生成 embedding，文件多时会比较慢，也会消耗模型调用额度。
 ```
 
-### 11.6 单文件和全量重建
+### 11.5 单文件和全量重建
 
 接口：
 
@@ -933,7 +911,7 @@ faq_items
 knowledge_units
 ```
 
-### 11.7 文件删除
+### 11.6 文件删除
 
 接口：
 
@@ -949,7 +927,7 @@ DELETE /knowledge/files/{document_id}
 3. 原始文件可以暂时保留，便于审计和问题排查。
 ```
 
-### 11.8 知识库文件列表
+### 11.7 知识库文件列表
 
 接口：
 
@@ -1176,6 +1154,39 @@ QDRANT_URL=http://qdrant:6333
 
 ```text
 QDRANT_URL=http://localhost:6333
+```
+
+### 13.5 模型提供方切换
+
+聊天模型配置在：
+
+```text
+config/rag.yml
+```
+
+默认稳定配置：
+
+```yaml
+chat_provider: tongyi
+chat_model_name: qwen3-max
+openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+embedding_model_name: text-embedding-v4
+```
+
+试用百炼 OpenAI 兼容接口时：
+
+```yaml
+chat_provider: openai_compatible
+chat_model_name: qwen3.7-max
+openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+embedding_model_name: text-embedding-v4
+```
+
+注意：
+
+```text
+只切换 chat_provider 和 chat_model_name。
+embedding_model_name 继续使用 text-embedding-v4，不要改成聊天模型。
 ```
 
 ## 14. 迁移 SQL

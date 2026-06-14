@@ -31,26 +31,29 @@ class QueryPlannerService:
             return []
 
         logger.info(
-            "[query planner] start query=%s history_count=%s",
+            "[查询规划] 开始 原问题=%s 历史消息数=%s",
             clean_query,
             len(history or []),
         )
         explicit_queries = self._split_explicit_questions(clean_query)
         if len(explicit_queries) >= 2:
             planned_queries = self._normalize_queries(explicit_queries, original_query=clean_query)
-            logger.info("[query planner] explicit_split_queries=%s", planned_queries)
+            logger.info("[查询规划] 显式切分结果=%s", planned_queries)
+            self._log_split_questions("explicit", planned_queries)
             return planned_queries
 
         try:
             queries = self._plan_with_llm(clean_query, history=history or [])
             if queries:
-                logger.info("[query planner] llm_queries=%s", queries)
+                logger.info("[查询规划] 模型拆分结果=%s", queries)
+                self._log_split_questions("llm", queries)
                 return queries
         except Exception as exc:
-            logger.warning(f"[query planner] llm planner failed, fallback to rules: {exc}")
+            logger.warning(f"[查询规划] 模型拆分失败，改用规则兜底：{exc}")
 
         fallback_queries = self._fallback_queries(clean_query)
-        logger.info("[query planner] fallback_queries=%s", fallback_queries)
+        logger.info("[查询规划] 规则兜底结果=%s", fallback_queries)
+        self._log_split_questions("fallback", fallback_queries)
         return fallback_queries
 
     def _plan_with_llm(self, query: str, *, history: list[dict[str, Any]]) -> list[str]:
@@ -62,7 +65,7 @@ class QueryPlannerService:
             ]
         )
         content = self._message_content_to_text(response.content)
-        logger.info("[query planner] raw_output=%s", content[:1200])
+        logger.info("[查询规划] 模型原始输出=%s", content[:1200])
         data = self._parse_json_object(content)
         raw_queries = data.get("queries") if isinstance(data, dict) else None
         if not isinstance(raw_queries, list):
@@ -108,6 +111,23 @@ class QueryPlannerService:
             for part in re.split(r"[？?；;\n\r]+", query)
             if cls._clean_query(part)
         ]
+
+    @staticmethod
+    def _log_split_questions(source: str, queries: list[str]) -> None:
+        source_text = {
+            "explicit": "显式切分",
+            "llm": "模型拆分",
+            "fallback": "规则兜底",
+        }.get(source, source)
+        total = len(queries)
+        for index, query in enumerate(queries, start=1):
+            logger.info(
+                "[查询规划] 拆分问题 来源=%s 序号=%s/%s 问题=%s",
+                source_text,
+                index,
+                total,
+                query,
+            )
 
     @staticmethod
     def _query_key(value: str) -> str:

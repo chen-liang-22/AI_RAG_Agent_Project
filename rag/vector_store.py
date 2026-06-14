@@ -178,64 +178,6 @@ class VectorStoreService:
 
         return documents
 
-    def search_faq_documents(self, query: str, *, k: int = 8) -> list[Document]:
-        """只在 Qdrant 的 FAQ 向量里做语义检索。"""
-
-        return self.search_documents(
-            query,
-            k=k,
-            filters={"content_type": ["faq"]},
-        )
-
-    @staticmethod
-    def scroll_faq_documents(
-            *,
-            question_no: int | None = None,
-            limit: int = 1000,
-    ) -> list[Document]:
-        """从 Qdrant payload 中滚动读取 FAQ points。
-
-        这个方法用于“第95问是什么”“100问都有哪些”这类结构化查询。
-        它不走 SQLite，直接使用 Qdrant payload filter。
-        """
-
-        conditions: list[models.FieldCondition] = [
-            models.FieldCondition(
-                key="metadata.content_type",
-                match=models.MatchValue(value="faq"),
-            )
-        ]
-        if question_no is not None:
-            conditions.append(
-                models.FieldCondition(
-                    key="metadata.question_no",
-                    match=models.MatchValue(value=question_no),
-                )
-            )
-
-        client = QdrantClient(**get_qdrant_client_options())
-        points, _ = client.scroll(
-            collection_name=get_qdrant_collection_name(),
-            scroll_filter=models.Filter(must=conditions),
-            limit=limit,
-            with_payload=True,
-            with_vectors=False,
-        )
-
-        documents: list[Document] = []
-        for point in points:
-            payload = point.payload or {}
-            metadata = dict(payload.get("metadata") or {})
-            metadata["_point_id"] = str(point.id)
-            documents.append(
-                Document(
-                    page_content=str(payload.get("page_content") or ""),
-                    metadata=metadata,
-                )
-            )
-
-        return documents
-
     def preview_file(
             self,
             *,
