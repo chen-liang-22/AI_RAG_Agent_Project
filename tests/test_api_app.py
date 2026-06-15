@@ -13,6 +13,8 @@ def test_openapi_exposes_core_routes():
     assert "/health" in paths
     assert "/chat" in paths
     assert "/chat/stream" in paths
+    assert "/conversations" in paths
+    assert "/conversations/{conversation_id}" in paths
     assert "/debug/retrieve" in paths
     assert "/knowledge/upload/preview" in paths
     assert "/knowledge/upload/confirm" in paths

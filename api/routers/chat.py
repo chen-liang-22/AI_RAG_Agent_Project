@@ -1,12 +1,21 @@
 import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from api.schemas import ChatRequest, ChatResponse, DebugRetrieveRequest
+from api.schemas import (
+    ChatRequest,
+    ChatResponse,
+    ConversationDetailResponse,
+    ConversationListResponse,
+    ConversationMessageResponse,
+    ConversationSummaryResponse,
+    DebugRetrieveRequest,
+)
 from api.services import (
     _get_agent,
     _get_knowledge_answer_service,
+    _get_knowledge_store,
     _prepare_chat_conversation,
     _save_chat_exchange,
     _should_use_direct_rag,
@@ -16,6 +25,76 @@ from api.services import (
 from utils.logger_handler import logger
 
 router = APIRouter()
+
+
+def _conversation_summary(row: dict) -> ConversationSummaryResponse:
+    """把 SQLite 会话行转换成前端列表响应。"""
+
+    return ConversationSummaryResponse(
+        conversation_id=row["conversation_id"],
+        user_id=row.get("user_id"),
+        title=row.get("title"),
+        status=row["status"],
+        message_count=int(row.get("message_count") or 0),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        last_message_at=row.get("last_message_at"),
+    )
+
+
+def _conversation_message(row: dict) -> ConversationMessageResponse:
+    """把 SQLite 消息行转换成前端详情响应。"""
+
+    return ConversationMessageResponse(
+        message_id=row["message_id"],
+        conversation_id=row["conversation_id"],
+        sequence_no=int(row["sequence_no"]),
+        role=row["role"],
+        content=row["content"],
+        content_type=row["content_type"],
+        model_name=row.get("model_name"),
+        token_count=row.get("token_count"),
+        created_at=row["created_at"],
+    )
+
+
+@router.get("/conversations", response_model=ConversationListResponse)
+def list_conversations(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=50),
+        user_id: str | None = None,
+) -> ConversationListResponse:
+    """分页查询聊天记录列表。"""
+
+    logger.info("[接口] 查询聊天记录列表 页码=%s 每页数量=%s 用户编号=%s", page, page_size, user_id)
+    conversations, total = _get_knowledge_store().list_conversations(
+        page=page,
+        page_size=page_size,
+        user_id=user_id,
+    )
+    return ConversationListResponse(
+        items=[_conversation_summary(row) for row in conversations],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/conversations/{conversation_id}", response_model=ConversationDetailResponse)
+def get_conversation_detail(conversation_id: str) -> ConversationDetailResponse:
+    """查询单个聊天记录详情。"""
+
+    logger.info("[接口] 查询聊天记录详情 会话编号=%s", conversation_id)
+    store = _get_knowledge_store()
+    conversation = store.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    messages = store.list_conversation_messages(conversation_id)
+    return ConversationDetailResponse(
+        conversation=_conversation_summary(conversation),
+        messages=[_conversation_message(row) for row in messages],
+    )
 
 
 @router.post("/chat", response_model=ChatResponse)

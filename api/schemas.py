@@ -28,6 +28,49 @@ class ChatResponse(BaseModel):
     conversation_id: str  # 当前会话 ID；前端后续请求需要继续携带
 
 
+class ConversationSummaryResponse(BaseModel):
+    """会话列表中的单个会话摘要。"""
+
+    conversation_id: str  # 会话唯一 ID
+    user_id: str | None = None  # 会话所属用户 ID
+    title: str | None = None  # 会话标题，通常来自首条用户问题
+    status: str  # 会话状态
+    message_count: int  # 会话消息数量
+    created_at: str  # 创建时间
+    updated_at: str  # 更新时间
+    last_message_at: str | None = None  # 最后一条消息时间
+
+
+class ConversationListResponse(BaseModel):
+    """会话分页列表响应体。"""
+
+    items: list[ConversationSummaryResponse]  # 当前页会话摘要
+    total: int  # 总会话数
+    page: int  # 当前页码
+    page_size: int  # 每页数量
+
+
+class ConversationMessageResponse(BaseModel):
+    """会话详情中的单条消息。"""
+
+    message_id: str  # 消息唯一 ID
+    conversation_id: str  # 所属会话 ID
+    sequence_no: int  # 会话内顺序号
+    role: str  # user/assistant/system
+    content: str  # 消息正文
+    content_type: str  # 消息类型，默认 text
+    model_name: str | None = None  # 助手消息使用的模型名
+    token_count: int | None = None  # token 数量，当前可为空
+    created_at: str  # 创建时间
+
+
+class ConversationDetailResponse(BaseModel):
+    """会话详情响应体。"""
+
+    conversation: ConversationSummaryResponse  # 会话摘要
+    messages: list[ConversationMessageResponse]  # 会话全部消息
+
+
 class DebugRetrieveRequest(BaseModel):
     """RAG 检索调试请求体。"""
 
@@ -130,4 +173,3 @@ class KnowledgeBulkReindexResponse(BaseModel):
     succeeded: int  # 成功数量
     failed: int  # 失败数量
     results: list[KnowledgeReindexResult]  # 每个文件的结果
-

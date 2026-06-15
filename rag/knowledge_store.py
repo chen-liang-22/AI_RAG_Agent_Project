@@ -276,6 +276,44 @@ class KnowledgeStore:
             ).fetchone()
         return self.row_to_dict(row)
 
+    def list_conversations(
+            self,
+            *,
+            page: int = 1,
+            page_size: int = 10,
+            user_id: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """分页查询会话列表。"""
+
+        final_page = max(1, int(page))
+        final_page_size = max(1, min(int(page_size), 50))
+        offset = (final_page - 1) * final_page_size
+        conditions = ["status != 'deleted'"]
+        params: list[Any] = []
+
+        if user_id:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+
+        where_sql = " AND ".join(conditions)
+        with self.connect() as conn:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS total FROM conversations WHERE {where_sql}",
+                params,
+            ).fetchone()
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM conversations
+                WHERE {where_sql}
+                ORDER BY COALESCE(last_message_at, updated_at, created_at) DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, final_page_size, offset],
+            ).fetchall()
+
+        return [dict(row) for row in rows], int(total_row["total"] if total_row else 0)
+
     def list_recent_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, Any]]:
         final_limit = max(1, min(int(limit), 100))
         with self.connect() as conn:
@@ -290,6 +328,21 @@ class KnowledgeStore:
                 (conversation_id, final_limit),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
+
+    def list_conversation_messages(self, conversation_id: str) -> list[dict[str, Any]]:
+        """查询某个会话的全部消息。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM conversation_messages
+                WHERE conversation_id = ?
+                ORDER BY sequence_no ASC
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_message(
             self,
