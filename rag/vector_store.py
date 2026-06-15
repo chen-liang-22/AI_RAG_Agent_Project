@@ -108,7 +108,7 @@ class VectorStoreService:
     def build_metadata_filter(filters: dict[str, list[str]] | None) -> models.Filter | None:
         """把业务过滤条件转换成 Qdrant Filter。
 
-        filters 的结构来自 RuleBasedIntentAnalyzer，例如：
+        filters 的结构来自 QueryAnalysis，例如：
 
             {
                 "unit_type": ["guide", "faq"],

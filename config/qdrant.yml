@@ -1,19 +1,84 @@
+# Qdrant 向量库配置。
+
+# Qdrant collection 名称。
+# 作用：所有知识向量会写入该 collection。
 collection_name: agent
+
+# Qdrant HTTP 地址。
+# 本地 Docker 默认是 http://localhost:6333。
 url: http://localhost:6333
+
+# Qdrant gRPC 端口。
+# 仅 prefer_grpc=true 时实际使用。
 grpc_port: 6334
+
+# 是否优先使用 gRPC。
+# 枚举：
+# - true：优先使用 gRPC，吞吐可能更好，但本地/代理环境要确保 6334 可用。
+# - false：使用 HTTP，开发环境更简单，推荐默认。
 prefer_grpc: false
+
+# 向量距离算法。
+# 枚举：
+# - COSINE：余弦相似度，文本 embedding 常用，推荐默认。
+# - DOT：点积，相同模型明确要求时使用。
+# - EUCLID：欧氏距离，较少用于文本语义检索。
 distance: COSINE
+
+# 启动向量服务时是否强制重建 collection。
+# 枚举：
+# - true：删除并重建 collection，会清空已有向量。
+# - false：复用已有 collection，推荐默认。
 force_recreate: false
 
+# 旧版 retriever 的默认 topK。
+# 目前主要保留兼容，新版多 query 检索优先使用 per_query_top_k。
 k: 3
+
+# 每个 search_query 从 Qdrant 召回的候选数量。
+# 值越大召回覆盖越广，但 rerank 和上下文更重。
 per_query_top_k: 5
+
+# 每个 search_query 精排后至少保留的资料数。
+# 用于多 query 覆盖，避免某个子问题完全没有上下文。
 per_query_keep: 2
+
+# 最终放进回答上下文的资料数量上限。
+# 值越大答案参考更全，但模型输入更长，首 token 可能更慢。
 final_context_limit: 12
+
+# 是否在 Qdrant 检索阶段启用 metadata 强过滤。
+# 枚举：
+# - true：先按 metadata filter 过滤再向量召回，适合 metadata 非常可靠的数据。
+# - false：不做强过滤，只依赖向量召回和 rerank，适合管理端自由输入，推荐默认。
 use_metadata_filter: false
+
+# 并行检索线程数上限。
+# 多个 search_query 时并行查 Qdrant，降低复杂问题的检索等待。
+parallel_query_workers: 4
+
+# 内置知识库目录。
+# /knowledge/reload 会扫描该目录下允许类型的文件。
 data_path: data
+
+# 旧版 data/ 自动加载的 MD5 记录文件。
+# 用于避免重复导入相同文件，主要保留兼容。
 md5_hex_store: qdrant_md5.text
+
+# 允许入库的知识文件类型。
+# 枚举：
+# - txt：纯文本知识文件。
+# - pdf：PDF 知识文件，会按页读取。
 allow_knowledge_file_type: ["txt", "pdf"]
 
+# 文本切分块大小。
+# 值越小召回更精细，值越大上下文更完整。
 chunk_size: 200
+
+# 文本切分重叠字符数。
+# 用于减少分片边界导致的语义截断。
 chunk_overlap: 20
+
+# 文本切分分隔符优先级。
+# 顺序越靠前优先级越高；最后的空字符串表示必要时按字符切分。
 separators: ["\n\n", "\n", ".", "!", "?", "。", "！", "？", " ", ""]

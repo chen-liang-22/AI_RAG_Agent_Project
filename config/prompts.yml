@@ -1,4 +1,12 @@
+# 提示词文件路径配置。
 
+# 普通客服/Agent 系统提示词路径。
 main_prompt_path: prompts/main_prompt.txt
+
+# RAG 总结提示词路径。
+# 当前直连知识库回答链路主要使用代码内提示词；该配置保留给工具链和旧流程兼容。
 rag_summarize_prompt_path: prompts/rag_summarize.txt
+
+# 报告生成提示词路径。
+# 当 Agent 进入报告模式时使用。
 report_prompt_path: prompts/report_prompt.txt

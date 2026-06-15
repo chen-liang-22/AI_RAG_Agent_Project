@@ -119,8 +119,14 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
       Nginx 场景下关闭响应缓冲；本地开发也保留，便于以后部署。
     """
 
+    # 记录请求进入时间，用来统计“从接口收到请求到返回流”的准备耗时。
     request_start_time = time.perf_counter()
+
+    # 确保本次聊天有 conversation_id，并从 SQLite 读取最近的历史消息。
+    # 如果前端没有传 conversation_id，这里会创建一个新的会话。
     conversation_id, history = _prepare_chat_conversation(request)
+
+    # 打印接口准备耗时和历史消息数量，方便判断慢点是否出现在会话读取阶段。
     logger.info(
         "[性能] 聊天请求准备完成 模式=流式 会话编号=%s 耗时毫秒=%.2f 历史消息数=%s",
         conversation_id,
@@ -132,7 +138,12 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
         f"会话编号={conversation_id} 问题={request.message}"
     )  # 标记本次调用的是流式接口
 
+    # 根据配置决定走哪条聊天链路：
+    # - direct_rag：普通知识问答直接走 RAG 检索 + 最终回答模型。
+    # - agent：走 ReAct Agent，让模型自己决定是否调用工具。
     use_direct_rag, route_reason = _should_use_direct_rag(request.message)
+
+    # 当前项目默认走 direct_rag，这条链路更短，首 token 更快。
     if use_direct_rag:
         logger.info(
             "[聊天路由] 流式接口路由结果=知识直答 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
@@ -141,21 +152,29 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
             conversation_id,
             request.message,
         )
+
+        # StreamingResponse 接收一个可迭代对象。
+        # _stream_direct_rag() 会不断 yield SSE 文本块，FastAPI 会边生成边发给前端。
         return StreamingResponse(
             _stream_direct_rag(
-                request.message,
-                user_id=request.user_id,
-                conversation_id=conversation_id,
-                history=history,
+                request.message,  # 用户本轮问题。
+                user_id=request.user_id,  # 用户编号，后续工具或画像逻辑可能会用到。
+                conversation_id=conversation_id,  # 当前会话编号，用于保存聊天历史。
+                history=history,  # 最近历史消息，会传给 RAG 最终回答模型做上下文参考。
             ),
-            media_type="text/event-stream",
+            media_type="text/event-stream",  # 告诉浏览器这是 SSE 文本流，不是普通 JSON。
             headers={
+                # 禁止浏览器或代理缓存响应，避免流式内容被攒到最后才显示。
                 "Cache-Control": "no-cache, no-transform",
+                # 保持 HTTP 连接不断开，方便服务端持续推送 chunk。
                 "Connection": "keep-alive",
+                # Nginx 反向代理场景下关闭缓冲，部署时很有用。
                 "X-Accel-Buffering": "no",
             },
         )
 
+    # 如果配置为 agent 模式，会走到这里。
+    # Agent 链路更灵活，但通常比 direct_rag 慢，因为模型需要判断工具调用。
     logger.info(
         "[聊天路由] 流式接口路由结果=Agent工具链 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
         route_reason,
@@ -163,19 +182,25 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
         conversation_id,
         request.message,
     )
-    _get_agent()  # 提前初始化 Agent；初始化失败时可以在返回流之前直接报错
+
+    # 提前初始化 Agent。
+    # 这样如果 Agent 初始化失败，可以在 StreamingResponse 开始前直接返回 HTTP 500。
+    _get_agent()
+
+    # 返回 Agent 的 SSE 流。
+    # _stream_agent() 内部会调用 ReactAgent.execute_stream() 并把 token 包装成 SSE 事件。
     return StreamingResponse(
         _stream_agent(
-            request.message,
-            user_id=request.user_id,
-            conversation_id=conversation_id,
-            history=history,
-        ),  # 把生成器交给 FastAPI 持续输出
-        media_type="text/event-stream",  # 告诉浏览器这是 SSE 文本流
+            request.message,  # 用户本轮问题。
+            user_id=request.user_id,  # 用户编号，传给 Agent 工具链。
+            conversation_id=conversation_id,  # 当前会话编号，用于保存聊天历史。
+            history=history,  # 最近历史消息，给 Agent 保持上下文。
+        ),
+        media_type="text/event-stream",  # 告诉浏览器这是 SSE 文本流。
         headers={
-            "Cache-Control": "no-cache, no-transform",  # 不缓存、不转换内容，减少代理缓冲风险
-            "Connection": "keep-alive",  # 保持连接不断开，适合长响应
-            "X-Accel-Buffering": "no",  # Nginx 代理时关闭响应缓冲
+            "Cache-Control": "no-cache, no-transform",  # 不缓存、不转换内容，减少代理缓冲风险。
+            "Connection": "keep-alive",  # 保持连接不断开，适合长响应。
+            "X-Accel-Buffering": "no",  # Nginx 代理时关闭响应缓冲。
         },
     )
 

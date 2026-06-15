@@ -4,25 +4,25 @@
 这个模块是 Agent 工具 `rag_summarize` 背后的核心检索链路。
 现在它不再只是“原问题 -> 向量召回 topK”，而是按照设计文档做了一个 MVP 版升级：
 
-1. 规则版多意图识别。
-2. 根据意图生成子查询。
-3. 根据意图生成 Qdrant metadata filter。
-4. 多路召回候选资料。
-5. 规则版 rerank 精排。
-6. 输出更干净的参考资料上下文。
+1. 默认用原问题直接召回。
+2. 根据召回质量判断是否需要 LLM Query Planner 做语义改写/拆分。
+3. 多路召回候选资料。
+4. 轻量 rerank 精排。
+5. 输出更干净的参考资料上下文。
 
 这里仍然不额外调用大模型做中间总结。
 这样可以减少流式回答前的等待时间，把模型调用留给最终 Agent 回答。
 """
 
 import time
+import json
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.documents import Document
 
 from rag.query_planner import QueryPlannerService
-from rag.query_pipeline import QueryAnalysis, RuleBasedIntentAnalyzer
+from rag.query_pipeline import QueryAnalysis
 from rag.reranker import RuleBasedReranker
 from rag.vector_store import VectorStoreService
 from utils.config_handler import qdrant_conf, rag_conf
@@ -46,7 +46,6 @@ class RagSummarizeService(object):
     def __init__(self):
         self.vector_store: VectorStoreService | None = None  # Qdrant 向量库服务，懒加载，避免 Qdrant 不可用时整个 RAG 初始化失败
         self.query_planner = QueryPlannerService()  # LLM Query Planner，负责把复杂问题拆成多个 search_query
-        self.intent_analyzer = RuleBasedIntentAnalyzer()  # 规则版多意图分析器
         self.reranker = RuleBasedReranker()  # 规则版精排器
 
     def _get_vector_store(self) -> VectorStoreService:
@@ -74,28 +73,20 @@ class RagSummarizeService(object):
         """检索并精排用户问题相关资料。
 
         这个方法是新版 RAG 的核心：
-        - LLM Query Planner 先把复杂问题拆成多个 search_query。
-        - 每个 search_query 单独查 Qdrant top5。
-        - 每个 search_query 精排后保留 top2。
+        - adaptive 模式先用原问题检索。
+        - 召回质量差时，才调用 LLM Query Planner 做语义改写/拆分。
+        - 多个 search_query 会并行查 Qdrant topK。
         - 最终按用户问题顺序组装上下文，并做去重和数量截断。
         """
 
         total_start_time = time.perf_counter()
         analysis_start_time = time.perf_counter()
-        analysis = self.intent_analyzer.analyze(query)
+        analysis = self._build_neutral_analysis(query)
         logger.info(
-            "[性能] RAG意图分析完成 追踪编号=%s 耗时毫秒=%.2f 意图=%s",
+            "[性能] RAG轻量分析完成 追踪编号=%s 耗时毫秒=%.2f 说明=%s",
             trace_id,
             self._elapsed_ms(analysis_start_time),
-            analysis.intents,
-        )
-        logger.info(
-            "[性能] 意图分析摘要 追踪编号=%s 意图数=%s 意图=%s 关键词数=%s 过滤字段=%s",
-            trace_id,
-            len(analysis.intents),
-            ",".join(analysis.intents),
-            len(analysis.keywords),
-            ",".join(analysis.filters.keys()),
+            "未使用规则意图硬匹配",
         )
         self._log_intent_analysis(query, analysis)
         plan_retrieve_start_time = time.perf_counter()
@@ -128,12 +119,12 @@ class RagSummarizeService(object):
         )
 
         logger.info(
-            "[RAG检索] 原问题=%s 意图=%s 检索问题列表=%s 候选总数=%s 最终资料数=%s",
+            "[RAG检索] 原问题=%s 意图=%s 候选总数=%s 最终资料数=%s\n检索问题列表：\n%s",
             query,
             analysis.intents,
-            search_queries,
             sum(len(documents) for _, documents in candidate_groups),
             len(reranked_docs),
+            self._format_query_lines(search_queries),
         )
         logger.info("[RAG精排] 最终上下文=%s", self._summarize_documents_for_log(reranked_docs))
         logger.info(
@@ -159,11 +150,11 @@ class RagSummarizeService(object):
 
         search_queries = self.query_planner.plan(query, history=history, trace_id=trace_id)
         logger.info(
-            "[查询规划] 固定模式查询规划结果 追踪编号=%s 模式=%s 检索问题数=%s 检索问题=%s",
+            "[查询规划] 固定模式查询规划结果 追踪编号=%s 模式=%s 检索问题数=%s\n检索问题列表：\n%s",
             trace_id,
             planner_mode,
             len(search_queries),
-            " | ".join(search_queries),
+            self._format_query_lines(search_queries),
         )
         return search_queries, self.retrieve_for_queries(search_queries, analysis, trace_id=trace_id)
 
@@ -198,13 +189,17 @@ class RagSummarizeService(object):
         if search_queries == first_queries:
             return first_queries, first_groups
 
+        additional_queries = search_queries[len(first_queries):]
         logger.info(
-            "[查询规划] adaptive模式触发模型拆分 追踪编号=%s 检索问题数=%s 检索问题=%s",
+            "[查询规划] adaptive模式触发模型拆分 追踪编号=%s 总检索问题数=%s 新增检索问题数=%s\n检索问题列表：\n%s",
             trace_id,
             len(search_queries),
-            " | ".join(search_queries),
+            len(additional_queries),
+            self._format_query_lines(search_queries),
         )
-        return search_queries, self.retrieve_for_queries(search_queries, analysis, trace_id=trace_id)
+        logger.info("[查询规划] adaptive模式复用首次原问题召回结果 追踪编号=%s", trace_id)
+        additional_groups = self.retrieve_for_queries(additional_queries, analysis, trace_id=trace_id)
+        return search_queries, [*first_groups, *additional_groups]
 
     @staticmethod
     def evaluate_retrieval_quality(documents: list[Document]) -> RetrievalQuality:
@@ -248,7 +243,7 @@ class RagSummarizeService(object):
         - 精排后的资料来源和分数
         """
 
-        analysis = self.intent_analyzer.analyze(query)
+        analysis = self._build_neutral_analysis(query)
         self._log_intent_analysis(query, analysis)
         search_queries, candidate_groups = self._plan_and_retrieve(query, analysis)
         reranked_docs = self.reranker.rerank_by_query(
@@ -346,6 +341,7 @@ class RagSummarizeService(object):
             len(documents),
             self._summarize_documents_for_log(documents),
         )
+        self._log_retrieved_scores(search_query, documents)
         return (
             search_query,
             self._annotate_search_query(
@@ -388,7 +384,7 @@ class RagSummarizeService(object):
                 len(documents),
             )
             return documents
-        except Exception as exc:
+        except (ConnectionError, TimeoutError, RuntimeError, ValueError) as exc:
             logger.warning(
                 "[RAG召回] 向量检索失败 追踪编号=%s 查询序号=%s 过滤方式=%s 检索问题=%s 错误=%s",
                 trace_id,
@@ -402,12 +398,28 @@ class RagSummarizeService(object):
     @staticmethod
     def _log_intent_analysis(query: str, analysis: QueryAnalysis) -> None:
         logger.info(
-            "[RAG意图分析] 原问题=%s 意图=%s 关键词=%s 过滤条件=%s 规则子问题=%s",
+            "[RAG轻量分析] 原问题=%s 意图=%s 关键词=%s 过滤条件=%s 子问题=%s",
             query,
             analysis.intents,
             analysis.keywords,
             analysis.filters,
             analysis.sub_queries,
+        )
+
+    @staticmethod
+    def _build_neutral_analysis(query: str) -> QueryAnalysis:
+        """构造无规则硬匹配的分析结果。
+
+        主链路不再依赖关键词意图、规则子问题或 metadata 强过滤。
+        QueryAnalysis 只作为 rerank 和调试接口的兼容数据结构。
+        """
+
+        return QueryAnalysis(
+            original_query=query.strip(),
+            intents=[],
+            sub_queries=[query.strip()] if query.strip() else [],
+            filters={},
+            keywords=[],
         )
 
     @staticmethod
@@ -445,6 +457,35 @@ class RagSummarizeService(object):
             )
         return result
 
+    @staticmethod
+    def _log_retrieved_scores(search_query: str, documents: list[Document]) -> None:
+        """按检索问题逐行打印召回分值，方便校准 adaptive 阈值。"""
+
+        if not documents:
+            logger.info("[RAG召回分值]\n检索问题：%s\n无召回结果", search_query)
+            return
+
+        score_lines: list[str] = []
+        for index, document in enumerate(documents, start=1):
+            metadata = document.metadata
+            score = float(metadata.get("_vector_score") or 0.0)
+            source_file = metadata.get("source_file") or metadata.get("source") or "未知来源"
+            question_no = metadata.get("question_no")
+            question_text = f" 问题编号={question_no}" if question_no is not None else ""
+            score_lines.append(
+                f"第{index}条：分值={score:.6f} 来源={source_file}{question_text}"
+            )
+
+        logger.info("[RAG召回分值]\n检索问题：%s\n%s", search_query, "\n".join(score_lines))
+
+    @staticmethod
+    def _format_query_lines(queries: list[str]) -> str:
+        """把检索问题列表格式化为多行日志。"""
+
+        if not queries:
+            return "无"
+        return "\n".join(f"第{index}个：{query}" for index, query in enumerate(queries, start=1))
+
     def _keyword_retrieve(self, analysis: QueryAnalysis, limit: int) -> list[Document]:
         """从 SQLite 做关键词补充召回。
 
@@ -460,10 +501,8 @@ class RagSummarizeService(object):
             return None
 
         try:
-            import json
-
             metadata = json.loads(metadata_json)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             return None
 
         return metadata.get(key)

@@ -26,9 +26,7 @@ def test_planner_falls_back_when_model_fails(monkeypatch):
 
     queries = planner.plan("扫地机器人充电失败怎么办")
 
-    assert queries
-    assert queries[0] == "扫地机器人充电失败怎么办"
-    assert any("故障" in query or "解决" in query for query in queries)
+    assert queries == ["扫地机器人充电失败怎么办"]
 
 
 def test_invalid_planner_json_raises_parse_error():

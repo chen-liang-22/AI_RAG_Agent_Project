@@ -1,13 +1,58 @@
-#chat_provider: tongyi
-#chat_model_name: qwen3-max
-#openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-#embedding_model_name: text-embedding-v4
+# RAG 与大模型配置。
+
+# 聊天模型调用方式。
+# 枚举：
+# - openai_compatible：使用 OpenAI 兼容接口，适合百炼 compatible-mode/v1 以及其他兼容服务。
+# - tongyi：使用 DashScope/通义原生接口；部分新模型可能和该封装不兼容。
+# - openai：openai_compatible 的等价别名。
 chat_provider: openai_compatible
+
+# 最终回答模型名称。
+# 作用：用于 Query Planner 的 LLM 改写，以及最终客服回答生成。
+# 注意：模型名必须和 chat_provider 对应的接口兼容。
 chat_model_name: deepseek-v4-flash
+
+# OpenAI 兼容接口地址。
+# 仅 chat_provider=openai_compatible/openai 时使用。
 openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+# 文本向量模型名称。
+# 作用：知识入库和问题检索时生成 embedding。
+# 注意：更换向量模型或向量维度后，需要重建 Qdrant collection。
 embedding_model_name: text-embedding-v4
+
+# 聊天路由模式。
+# 枚举：
+# - direct_rag：普通聊天直接走“知识库检索 -> 模型回答”，首包更短，推荐默认。
+# - agent：走 LangGraph Agent 工具链，会让模型判断是否调用工具，适合复杂工具编排但更慢。
+# - react_agent：agent 的等价别名。
+# - legacy_agent：agent 的等价别名，保留给旧配置兼容。
 chat_route_mode: direct_rag
+
+# Query Planner 模式。
+# 枚举：
+# - adaptive：推荐。先用原问题检索，召回质量差才调用 LLM 改写/拆分。
+# - llm：每次检索前都调用 LLM 改写/拆分，效果可能更强但首包更慢。
+# - rule/rules/off/disabled：不调用 LLM，也不做关键词硬匹配，只用原问题和显式多问号拆分兜底。
 query_planner_mode: adaptive
+
+# Query Planner 可读取的最近历史消息条数。
+# 作用：让模型拆分“那这个呢”“继续上面的问题”这类追问时能看懂上下文。
+# 值越大上下文越完整，但 Query Planner 调用会更慢、消耗更多 token。
+query_planner_history_limit: 20
+
+# Query Planner 中每条历史消息最多保留的字符数。
+# 作用：避免历史消息过长导致拆分模型变慢；只保留足够判断上下文的摘要片段。
+query_planner_history_chars: 300
+
+# adaptive 模式下，首次召回 top1 分数阈值。
+# 低于该值会认为召回偏弱，触发 LLM Query Planner。
 adaptive_retrieve_min_score: 0.72
+
+# adaptive 模式下，首次召回最少资料数。
+# 少于该数量会认为覆盖不足，触发 LLM Query Planner。
 adaptive_retrieve_min_docs: 3
+
+# adaptive 模式下，首次召回 top3 平均分阈值。
+# 低于该值说明整体相关性不稳定，会触发 LLM Query Planner。
 adaptive_retrieve_top3_avg_score: 0.68

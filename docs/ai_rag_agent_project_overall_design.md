@@ -40,10 +40,11 @@ LLM 负责 query planning 和自然回答。
 | FAQ 一问一答切分 | 已完成 | FAQ / 100问 文档按一问一答写入 Qdrant |
 | 普通文档切分 | 已完成 | 普通文档按 RecursiveCharacterTextSplitter 切分 |
 | 用户答案检索只走 Qdrant | 已完成 | 回答链路和 FAQ 精确查询均以 Qdrant 为知识来源，SQLite 只保留业务元数据 |
-| LLM Query Planner | 已完成 | 已新增 `QueryPlannerService`，用于把用户复杂问题拆成多个 `search_query` |
-| 多 query 召回 | 已完成 | 已实现每个 `search_query` 单独查 Qdrant top5 |
+| direct_rag 知识直答 | 已完成 | 普通知识问答默认不走 Agent 工具判断，直接执行 RAG 检索和最终模型流式回答 |
+| adaptive Query Planner | 已完成 | 先用原问题召回并评估质量，质量不足才调用 `QueryPlannerService` 做 LLM 改写/拆分 |
+| 多 query 并行召回 | 已完成 | 已实现每个 `search_query` 单独查 Qdrant top5，多个 query 使用线程池并行召回 |
 | 精排每 query 保留 top2 | 已完成 | 已实现按子问题分组精排，每个 query 保留 2 条 |
-| LLM 最终润色回答 | 已完成 | FAQ 精确命中和普通 RAG 工具链路都交由 LLM 生成自然回答 |
+| LLM 最终客服回答 | 已完成 | 最终回答由 LLM 生成，要求像资深中文客服，不暴露内部资料编号或检索痕迹 |
 | SQLite 知识表清理 | 已完成 | `document_segments`、`faq_items`、`knowledge_units` 已停用，并在启动初始化时清理 |
 | `documents` 文件管理表 | 已完成 | 用于文件记录、状态、版本、chunk_count |
 | 会话历史 SQLite 持久化 | 已完成 | 已新增 `conversations`、`conversation_messages` 并保存 user / assistant 消息 |
@@ -56,9 +57,14 @@ flowchart TD
     U["用户"] --> FE["Vue 3 前端"]
     FE --> API["FastAPI 后端"]
 
-    API --> CHAT["LangGraph Agent"]
-    CHAT --> PLAN["LLM Query Planner"]
-    PLAN --> RAG["RAG 检索服务"]
+    API --> ROUTE{"聊天路由"}
+    ROUTE -->|direct_rag 默认| KA["KnowledgeAnswerService 知识直答"]
+    ROUTE -->|agent 可选| CHAT["LangGraph Agent"]
+    KA --> RAG["RAG 检索服务"]
+    CHAT --> RAG
+    RAG --> PLAN{"adaptive 判断"}
+    PLAN -->|召回质量差| QP["LLM Query Planner"]
+    QP --> RAG
 
     RAG --> QD["Qdrant 向量库"]
     RAG --> LLM["通义千问 Chat Model"]
@@ -70,7 +76,9 @@ flowchart TD
 
     QD --> RAG
     DB --> API
+    LLM --> KA
     LLM --> CHAT
+    KA --> API
     CHAT --> API
     API --> FE
 ```
@@ -81,7 +89,8 @@ flowchart TD
 | --- | --- |
 | Vue 3 前端 | 聊天页面、知识库上传、流式/非流式切换 |
 | FastAPI | API 网关、聊天接口、上传接口、健康检查 |
-| LangGraph Agent | 管理工具调用、会话上下文、流式输出 |
+| KnowledgeAnswerService | 默认知识直答链路，负责 RAG 上下文准备和最终模型流式回答 |
+| LangGraph Agent | 可选复杂工具编排链路，管理工具调用、会话上下文、流式输出 |
 | Qdrant | 保存知识向量和 payload，作为唯一知识检索来源 |
 | SQLite | 保存文件记录、上传状态、会话历史等业务元数据 |
 | DashScope Chat Model | Query planning 和最终自然语言回答 |
@@ -92,17 +101,19 @@ flowchart TD
 | 文件/目录 | 作用 |
 | --- | --- |
 | `api/main.py` | FastAPI 入口，提供聊天、知识库、调试、健康检查接口 |
-| `agent/react_agent.py` | LangGraph Agent，负责执行一次性/流式聊天 |
+| `agent/react_agent.py` | LangGraph Agent，负责执行一次性/流式聊天，当前作为复杂工具编排可选链路 |
 | `agent/tools/agent_tools.py` | Agent 可调用工具 |
 | `rag/vector_store.py` | Qdrant 向量库连接、写入、检索、payload filter |
-| `rag/rag_service.py` | RAG 检索、query 拆解后的多路召回、上下文组装 |
+| `rag/knowledge_answer_service.py` | 知识库直答服务，负责 RAG 检索上下文、最终回答模型调用和流式输出 |
+| `rag/rag_service.py` | adaptive RAG 检索、召回质量判断、多路并行召回、精排、上下文组装 |
 | `rag/document_parser.py` | 文档类型识别、FAQ/普通文档切分 |
 | `rag/reranker.py` | 候选资料精排 |
-| `rag/query_pipeline.py` | 旧版规则 query 分析，后续应收敛到 LLM Query Planner |
+| `rag/query_planner.py` | LLM Query Planner，负责在召回质量不足时改写/拆分 search_query |
+| `rag/query_pipeline.py` | QueryAnalysis 兼容数据结构；规则意图硬匹配已停用 |
 | `rag/knowledge_store.py` | SQLite 业务元数据存储，最终只保留文件/会话管理 |
 | `model/factory.py` | Chat 模型和 Embedding 模型创建 |
 | `config/qdrant.yml` | Qdrant、切分、topK 等配置 |
-| `config/rag.yml` | 模型名称配置 |
+| `config/rag.yml` | 模型、聊天路由、adaptive 阈值、Query Planner 历史等配置 |
 | `config/prompts.yml` | prompt 文件路径配置 |
 | `prompts/main_prompt.txt` | Agent 主提示词 |
 | `prompts/rag_summarize.txt` | RAG 总结提示词 |
@@ -129,7 +140,7 @@ flowchart TD
 | 组件 | 职责 |
 | --- | --- |
 | Qdrant | 保存知识 chunk / FAQ / payload / vector，负责知识检索 |
-| LLM | 拆解用户问题、生成检索 query、根据参考资料自然回答 |
+| LLM | 在必要时拆解用户问题、生成检索 query，并结合可用信息生成自然客服回答 |
 | SQLite | 保存文件记录、上传状态、会话历史等业务元数据 |
 | FastAPI | 提供上传、检索、聊天、会话接口 |
 
@@ -297,7 +308,7 @@ CREATE TABLE conversation_messages (
 | `role` | TEXT | 是 | 消息角色，建议值：`user`、`assistant`、`system`、`tool`。 |
 | `content` | TEXT | 是 | 消息正文。用户问题和 AI 回答都存这里。 |
 | `content_type` | TEXT | 是 | 内容类型，默认 `text`。后续可扩展 `image`、`file`、`json`。 |
-| `model_name` | TEXT | 否 | assistant 消息使用的模型名，例如 `qwen3-max`。用户消息为空。 |
+| `model_name` | TEXT | 否 | assistant 消息使用的模型名，例如 `deepseek-v4-flash`。用户消息为空。 |
 | `token_count` | INTEGER | 否 | 该消息 token 数，用于成本统计和上下文裁剪。 |
 | `metadata_json` | TEXT | 否 | 扩展字段，JSON 字符串。可保存 query plan、召回 point_id、耗时、错误信息等。 |
 | `created_at` | TEXT | 是 | 消息创建时间。 |
@@ -524,20 +535,32 @@ QDRANT_COLLECTION_NAME
 
 ## 5. 用户提问处理流程
 
+当前默认聊天链路使用 `direct_rag` 知识直答。
+
+它的目标是减少 Agent 工具决策带来的额外模型调用，让普通知识问答更快进入 RAG 检索和最终流式回答。
+
 整体流程：
 
 ```mermaid
 flowchart TD
     A["用户问题"] --> B["读取 conversation_id 和历史"]
-    B --> C["LLM Query Planner"]
-    C --> D["生成多个 search_query"]
-    D --> E["每个 search_query 查 Qdrant"]
-    E --> F["合并候选资料"]
-    F --> G["去重 + 精排 + 子问题覆盖"]
-    G --> H["组装参考上下文"]
-    H --> I["LLM 生成自然回答"]
-    I --> J["保存会话消息"]
-    J --> K["返回前端"]
+    B --> C["chat_route_mode 判断"]
+    C -->|direct_rag| D["KnowledgeAnswerService"]
+    C -->|agent 可选| E["LangGraph Agent"]
+    D --> F["RagSummarizeService"]
+    E --> F
+    F --> G["原问题首轮 Qdrant 召回"]
+    G --> H["召回质量评估"]
+    H -->|质量达标| I["跳过 Query Planner"]
+    H -->|质量不足| J["LLM Query Planner 改写/拆分"]
+    J --> K["只查询新增 search_query，复用首轮原问题结果"]
+    I --> L["候选资料合并"]
+    K --> L
+    L --> M["去重 + 精排 + 子问题覆盖"]
+    M --> N["组装可用信息"]
+    N --> O["最终回答模型 stream"]
+    O --> P["逐段 SSE 返回前端"]
+    P --> Q["保存 user / assistant 会话消息"]
 ```
 
 ## 6. Query Planner 设计
@@ -555,7 +578,23 @@ flowchart TD
 
 如果把整句话作为一个 query 去 Qdrant 召回，top1 很可能只覆盖其中一个问题。
 
-因此需要 LLM 把用户问题拆成多个检索 query。
+因此需要在必要时让 LLM 把用户问题拆成多个检索 query。
+
+但 Query Planner 本身也会消耗一次模型调用，可能明显增加首字等待时间。
+
+当前默认策略不是每次都调用 Query Planner，而是使用 adaptive 模式：
+
+```text
+原问题首轮召回
+  ↓
+评估召回质量
+  ↓
+质量达标：跳过 Query Planner，直接精排和回答
+  ↓
+质量不足：调用 LLM Query Planner 改写/拆分
+```
+
+这样简单问题可以更快，复杂或召回不稳定的问题仍然有机会通过 LLM 改写提升覆盖率。
 
 ### 6.2 Planner 输出格式
 
@@ -579,9 +618,163 @@ flowchart TD
 LLM 只负责把用户问题拆成适合检索的 query。
 ```
 
+### 6.3 显式多问句切分
+
+如果用户已经用问号、分号或换行明确写了多个问题，例如：
+
+```text
+怎么选扫地机器人？滤网多久换？充电找不到基站怎么办？
+```
+
+系统可以直接按显式分隔符切分，不调用 LLM。
+
+这不是规则意图匹配，不会根据“宠物、地毯、预算”等关键词强行拆分。
+
+### 6.4 历史消息使用
+
+Query Planner 可以读取最近历史消息，默认配置：
+
+```yaml
+query_planner_history_limit: 20
+query_planner_history_chars: 300
+```
+
+历史只用于理解追问上下文，例如：
+
+```text
+用户：我家 160 平，有宠物和地毯，预算 3000 怎么选？
+用户：那如果不要自动集尘呢？
+```
+
+第二句单独看不完整，带历史后可以改写成更适合检索的 query。
+
+注意：历史只用于拆检索问题，不用于让 Query Planner 生成答案。
+
+### 6.5 不使用规则意图硬匹配
+
+主链路不再使用 `RuleBasedIntentAnalyzer` 这类关键词硬匹配。
+
+原因：
+
+```text
+1. 管理端输入是自由文本，关键词规则容易漏判或误判。
+2. 规则词表会把用户表达强行拉到固定分类，影响召回质量。
+3. 复杂问题更适合由 LLM 在召回质量不足时做语义改写。
+```
+
+当前 `rule/rules/off/disabled` 配置只表示“不调用 LLM Query Planner”，并不会启用关键词硬拆分。
+
 ## 7. Qdrant 召回策略
 
-### 7.1 普通语义问题
+### 7.1 adaptive 首轮召回质量判断
+
+默认先只使用原问题执行一次 Qdrant 召回：
+
+```text
+原问题 -> Qdrant similarity_search(top5)
+```
+
+然后根据召回结果评估是否需要调用 LLM Query Planner。
+
+当前质量判断配置：
+
+```yaml
+adaptive_retrieve_min_score: 0.72
+adaptive_retrieve_min_docs: 3
+adaptive_retrieve_top3_avg_score: 0.68
+```
+
+判断规则：
+
+```text
+1. 召回资料数少于 adaptive_retrieve_min_docs，质量不足。
+2. top1 分数低于 adaptive_retrieve_min_score，质量不足。
+3. 分数最高的前三条平均分低于 adaptive_retrieve_top3_avg_score，质量不足。
+4. 三个条件都通过，认为首轮召回质量达标。
+```
+
+说明：
+
+```text
+per_query_top_k 可以是 5，但 top3_avg 只计算分数最高的前 3 条。
+如果只召回 1~2 条，则按实际条数计算平均分，但资料数不足仍会导致质量不足。
+```
+
+### 7.2 召回质量达标
+
+如果首轮召回质量达标：
+
+```text
+不调用 LLM Query Planner。
+直接进入精排、上下文组装和最终回答。
+```
+
+这样简单问题可以避免多一次模型调用，降低首字等待时间。
+
+例如“扫地机器人迷路怎么办？”这类问题，首轮召回分数较高时可以直接回答。
+
+### 7.3 召回质量不足
+
+如果首轮召回质量不足：
+
+```text
+1. 调用 LLM Query Planner 生成新增 search_query。
+2. 合并“原问题 + 新增 search_query”并去重。
+3. 复用首轮原问题召回结果。
+4. 只对新增 search_query 执行 Qdrant 查询。
+5. 合并所有候选资料进入精排。
+```
+
+这样避免质量不足后重复查询原问题。
+
+例如：
+
+```text
+首轮原问题 1 次
+LLM 新增 3 个 search_query
+第二轮只查新增 3 次
+总共 4 次向量查询
+```
+
+### 7.4 多 query 并行召回
+
+多个 search_query 会使用线程池并行查 Qdrant：
+
+```text
+parallel_query_workers: 4
+```
+
+也就是说新增的 3 个 query 会同时发起，不是查完一个再查下一个。
+
+Qdrant 查询耗时通常不是最大瓶颈；更常见的耗时来自：
+
+```text
+1. LLM Query Planner 模型调用。
+2. 最终回答模型首个 chunk。
+```
+
+### 7.5 召回分值日志
+
+系统会按检索问题打印每条召回资料的向量分值，方便校准阈值：
+
+```text
+[RAG召回分值]
+检索问题：预算3000 大户型160平 扫地机器人 推荐
+第1条：分值=0.764697 来源=扫地机器人100问.pdf 问题编号=40
+第2条：分值=0.729204 来源=选购指南.txt
+第3条：分值=0.717272 来源=维护保养.txt
+```
+
+检索问题列表也按多行打印：
+
+```text
+检索问题列表：
+第1个：原问题
+第2个：LLM 改写问题
+第3个：LLM 改写问题
+```
+
+### 7.6 普通语义问题
 
 每个 search_query 执行：
 
@@ -605,7 +798,7 @@ per_query_keep = 2
 final_context_limit = 10 ~ 12
 ```
 
-### 7.2 第几问
+### 7.7 第几问
 
 例如：
 
@@ -624,7 +817,7 @@ metadata.question_no = 95
 
 注意：仍然是查 Qdrant，不查 SQLite。
 
-### 7.3 100问列表
+### 7.8 100问列表
 
 例如：
 
@@ -689,17 +882,29 @@ Qdrant 只负责找资料，不直接把 payload 原样返回给用户。
 ```text
 用户问题
 + 会话历史
-+ Qdrant 参考资料
++ Qdrant 可用信息
 -> LLM 自然回答
 ```
 
 要求：
 
 ```text
-1. 像真实客服对话，不要像数据库字段 dump。
-2. 多个问题逐项回答，不能漏答。
-3. 只能基于参考资料回答，资料不足时明确说明。
-4. 不默认输出 source_file、category，除非用户问来源。
+1. 像资深中文客服直接回答，不要像数据库字段 dump。
+2. 先给结论，再按用户关心点分条说明。
+3. 多个问题逐项回答，不能漏答。
+4. 不暴露内部检索流程、工具名、向量库名。
+5. 不输出“根据参考资料”“资料显示”“【参考资料1】”这类内部痕迹。
+6. 不默认输出 source_file、category、知识类型，除非用户明确问来源。
+7. 具体品牌型号、APP 路径、售后政策、价格、参数、故障代码，信息不足时不能编造。
+8. 大众都知道、几乎不依赖具体型号资料的基础常识可以直接回答。
+9. 经验性建议、复杂维护方案、选购判断、故障诊断不能泛化成常识乱答。
+```
+
+常识边界示例：
+
+```text
+可以直接答：没电了不能继续工作；尘盒满了需要清理；断网后远程控制可能不可用。
+不能当常识编：某品牌 APP 的具体入口；某型号是否支持某功能；复杂故障代码含义；准确价格。
 ```
 
 ## 10. 会话历史设计
@@ -999,6 +1204,16 @@ QueryPlannerService
 用户问题 + 会话历史 -> search_query 列表
 ```
 
+当前约束：
+
+```text
+1. adaptive 模式下，首轮召回质量不足后才调用。
+2. 默认读取最近 20 条历史，每条最多 300 字。
+3. 输出只允许是 {"queries":["..."]}。
+4. 不输出 intent 分类字段。
+5. 不使用规则关键词硬匹配兜底；失败时回退原问题。
+```
+
 ### 12.4 多 query 召回
 
 新增或改造：
@@ -1011,6 +1226,8 @@ retrieve_for_queries(queries)
 
 ```text
 每个 search_query 单独召回 Qdrant top5。
+多个 search_query 并行召回。
+adaptive 二次召回只查新增 search_query，复用首轮原问题结果。
 ```
 
 ### 12.5 精排
@@ -1164,20 +1381,20 @@ QDRANT_URL=http://localhost:6333
 config/rag.yml
 ```
 
-默认稳定配置：
+当前默认配置：
 
 ```yaml
-chat_provider: tongyi
-chat_model_name: qwen3-max
+chat_provider: openai_compatible
+chat_model_name: deepseek-v4-flash
 openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 embedding_model_name: text-embedding-v4
 ```
 
-试用百炼 OpenAI 兼容接口时：
+如需切换到其他百炼 OpenAI 兼容模型：
 
 ```yaml
 chat_provider: openai_compatible
-chat_model_name: qwen3.7-max
+chat_model_name: 目标聊天模型名称
 openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 embedding_model_name: text-embedding-v4
 ```
@@ -1210,8 +1427,14 @@ documents
 ```text
 1. 知识检索只走 Qdrant。
 2. SQLite 不查知识答案。
-3. LLM 负责拆问题和自然回答。
-4. Qdrant payload 支持编号、来源、分类等结构化过滤。
-5. 多问题必须多 query 召回，每个 query 获取 5 条，精排保留 2 条。
-6. 会话历史可以存 SQLite，但它不是知识库。
+3. 默认聊天走 direct_rag 知识直答，Agent 作为复杂工具编排可选链路。
+4. adaptive 模式先查原问题，召回质量不足才调用 LLM Query Planner。
+5. LLM Query Planner 只负责生成 search_query，不负责生成答案。
+6. 主链路不使用规则关键词硬匹配做多意图拆分。
+7. Qdrant payload 支持编号、来源、分类等结构化过滤。
+8. 多问题必须多 query 召回，每个 query 获取 5 条，精排保留 2 条。
+9. 二次召回复用首轮原问题结果，只查询新增 query。
+10. 会话历史可以存 SQLite，但它不是知识库。
+11. 最终回答要像专业客服，不暴露参考资料编号、来源编号或内部检索痕迹。
+12. 基础大众常识可以回答，具体产品能力、路径、价格、参数不能编造。
 ```

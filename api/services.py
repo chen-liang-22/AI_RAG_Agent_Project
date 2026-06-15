@@ -337,14 +337,25 @@ def _build_conversation_title(message: str) -> str:
 def _prepare_chat_conversation(request: ChatRequest) -> tuple[str, list[dict]]:
     """创建或读取会话，并返回 conversation_id 和最近历史。"""
 
+    # KnowledgeStore 是 SQLite 元数据仓库，负责 documents 和 conversations 等业务表。
     store = _get_knowledge_store()
+
+    # 如果 request.conversation_id 已存在，则复用旧会话。
+    # 如果前端没有传 conversation_id，则创建新会话，并用当前问题生成一个短标题。
     conversation = store.ensure_conversation(
         conversation_id=request.conversation_id,
         user_id=request.user_id,
         title=_build_conversation_title(request.message),
     )
+
+    # 统一取出最终使用的 conversation_id；新建会话时这个值由后端生成。
     conversation_id = conversation["conversation_id"]
+
+    # 读取最近 20 条历史消息，传给后续模型做上下文。
+    # 这里不会读取整段会话，避免 prompt 越来越长。
     history = store.list_recent_messages(conversation_id, limit=20)
+
+    # 返回给路由层：conversation_id 用于响应和保存历史，history 用于 RAG/Agent 上下文。
     return conversation_id, history
 
 
@@ -438,28 +449,54 @@ def _stream_direct_rag(
         conversation_id: str | None = None,
         history: list[dict] | None = None,
 ) -> Iterator[str]:
-    """把知识库直答 token 流转换成 SSE 文本流。"""
+    """把知识库直答 token 流转换成 SSE 文本流。
+
+    这个生成器会被 FastAPI 的 StreamingResponse 消费。
+    只要这里 yield 一段文本，前端就有机会立刻收到一段内容。
+    """
 
     try:
+        # 记录当前流式请求进入 direct_rag 链路。
         logger.info(
             "[聊天路由] 流式接口走知识直答 用户编号=%s 会话编号=%s 问题=%s",
             user_id,
             conversation_id,
             message,
         )
+
+        # 先发一个 meta 事件给前端。
+        # 前端可以在收到正文前就拿到 conversation_id，并知道当前模式是 direct_rag。
         meta_payload = json.dumps(
             {"conversation_id": conversation_id, "mode": "direct_rag"},
             ensure_ascii=False,
         )
+
+        # SSE 格式要求：
+        # event: 事件名
+        # data: JSON 字符串
+        # 空行表示一个事件结束。
         yield f"event: meta\ndata: {meta_payload}\n\n"
 
+        # 用列表缓存所有 chunk，流式结束后拼成完整回答并保存到 SQLite。
         chunks: list[str] = []
+
+        # 调用知识库直答服务：
+        # 内部流程是 RAG 检索上下文 -> 调用最终回答模型 stream() -> 逐段返回文本。
         for chunk in _get_knowledge_answer_service().stream_answer(message, history=history or []):
+            # 保存当前分片，后面用于拼接完整回答。
             chunks.append(chunk)
+
+            # 把文本分片包装成 JSON，ensure_ascii=False 保证中文直接输出。
             payload = json.dumps({"content": chunk}, ensure_ascii=False)
+
+            # 发给前端一个 chunk 事件。
+            # 前端收到后会把 content 追加到聊天气泡里。
             yield f"event: chunk\ndata: {payload}\n\n"
 
+        # 模型流结束后，把所有分片拼成最终回答。
         answer = "".join(chunks).strip()
+
+        # 如果有会话编号且回答非空，就把“用户问题 + 助手回答”保存到 SQLite。
         if conversation_id and answer:
             _save_chat_exchange(
                 conversation_id=conversation_id,
@@ -468,11 +505,17 @@ def _stream_direct_rag(
                 metadata={"mode": "direct_rag_stream"},
             )
 
+        # 记录后端流式生成结束。
         logger.info("[聊天路由] 知识直答流式完成 用户编号=%s 会话编号=%s", user_id, conversation_id)
+
+        # 通知前端本次流式回答结束。
         done_payload = json.dumps({"done": True, "conversation_id": conversation_id}, ensure_ascii=False)
         yield f"event: done\ndata: {done_payload}\n\n"
     except Exception as exc:
+        # 流式响应开始后，HTTP 状态码通常已经发给浏览器了。
+        # 所以异常不能再改成 500，只能通过 SSE error 事件告诉前端。
         logger.error("[聊天路由] 知识直答流式失败 用户编号=%s 错误=%s", user_id, exc, exc_info=True)
+
+        # 把错误消息包装成 JSON 并推给前端。
         payload = json.dumps({"error": str(exc)}, ensure_ascii=False)
         yield f"event: error\ndata: {payload}\n\n"
-

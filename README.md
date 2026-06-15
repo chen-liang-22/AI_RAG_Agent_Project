@@ -75,6 +75,10 @@ Load knowledge documents into Qdrant:
 Invoke-RestMethod -Method Post http://localhost:8000/knowledge/reload
 ```
 
+RAG query planning is configured in `config/rag.yml`. The recommended default is `query_planner_mode: adaptive`:
+the backend first retrieves with the original question, evaluates recall quality, and only calls the LLM Query Planner
+when the first recall is weak. Rule-based keyword intent matching is not used in the main chain.
+
 Chat:
 
 ```powershell
