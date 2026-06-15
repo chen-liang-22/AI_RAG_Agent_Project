@@ -45,7 +45,7 @@ per_query_keep: 2
 
 # 最终放进回答上下文的资料数量上限。
 # 值越大答案参考更全，但模型输入更长，首 token 可能更慢。
-final_context_limit: 12
+final_context_limit: 6
 
 # 是否在 Qdrant 检索阶段启用 metadata 强过滤。
 # 枚举：

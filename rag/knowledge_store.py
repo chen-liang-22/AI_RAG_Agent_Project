@@ -243,8 +243,10 @@ class KnowledgeStore:
         clean_conversation_id = (conversation_id or "").strip()
         if clean_conversation_id:
             existing = self.get_conversation(clean_conversation_id)
-            if existing is not None:
+            if existing is not None and existing.get("status") != "deleted":
                 return existing
+            if existing is not None and existing.get("status") == "deleted":
+                clean_conversation_id = f"conv_{uuid.uuid4().hex}"
         else:
             clean_conversation_id = f"conv_{uuid.uuid4().hex}"
 
@@ -276,12 +278,47 @@ class KnowledgeStore:
             ).fetchone()
         return self.row_to_dict(row)
 
+    def delete_conversation(self, conversation_id: str) -> bool:
+        """删除聊天记录。
+
+        会话主表保留一条 deleted 状态记录，避免历史 ID 误复用；
+        消息明细直接删除，避免已删除会话的问答正文继续留在数据库里。
+        """
+
+        now = utc_now_text()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None or row["status"] == "deleted":
+                return False
+
+            conn.execute(
+                "DELETE FROM conversation_messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            conn.execute(
+                """
+                UPDATE conversations
+                SET status = 'deleted',
+                    message_count = 0,
+                    updated_at = ?,
+                    last_message_at = ?
+                WHERE conversation_id = ?
+                """,
+                (now, now, conversation_id),
+            )
+
+        return True
+
     def list_conversations(
             self,
             *,
             page: int = 1,
             page_size: int = 10,
             user_id: str | None = None,
+            keyword: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """分页查询会话列表。"""
 
@@ -294,6 +331,14 @@ class KnowledgeStore:
         if user_id:
             conditions.append("user_id = ?")
             params.append(user_id)
+
+        clean_keyword = (keyword or "").strip()
+        if clean_keyword:
+            like_keyword = f"%{self._escape_like_keyword(clean_keyword)}%"
+            conditions.append(
+                "(title LIKE ? ESCAPE '\\' OR user_id LIKE ? ESCAPE '\\' OR conversation_id LIKE ? ESCAPE '\\')"
+            )
+            params.extend([like_keyword, like_keyword, like_keyword])
 
         where_sql = " AND ".join(conditions)
         with self.connect() as conn:
@@ -313,6 +358,12 @@ class KnowledgeStore:
             ).fetchall()
 
         return [dict(row) for row in rows], int(total_row["total"] if total_row else 0)
+
+    @staticmethod
+    def _escape_like_keyword(keyword: str) -> str:
+        """转义 LIKE 通配符，避免用户输入被当成模式语法。"""
+
+        return keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     def list_recent_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, Any]]:
         final_limit = max(1, min(int(limit), 100))

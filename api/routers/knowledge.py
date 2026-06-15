@@ -1,12 +1,13 @@
 import os
 import uuid
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
 from api.schemas import (
     KnowledgeBulkReindexResponse,
     KnowledgeDeleteResponse,
     KnowledgeFileResponse,
+    KnowledgeFilePreviewResponse,
     KnowledgeReindexResult,
     KnowledgeUploadConfirmRequest,
     KnowledgeUploadPreviewResponse,
@@ -23,12 +24,142 @@ from api.services import (
     _sync_data_files_to_documents,
     _validate_file_type,
 )
-from utils.file_handler import get_file_md5_hex
+from utils.file_handler import get_file_md5_hex, pdf_loader
 from utils.logger_handler import logger
 from utils.path_tool import get_abs_path
 from utils.qdrant_options import get_qdrant_collection_name
 
 router = APIRouter()
+
+DEFAULT_PREVIEW_CHAR_LIMIT = 20000
+MAX_PREVIEW_CHAR_LIMIT = 100000
+
+
+def _is_path_inside(child_path: str, parent_path: str) -> bool:
+    """判断 child_path 是否位于 parent_path 下。
+
+    文件预览会读取 documents.file_path 指向的本地文件。
+    这里先做路径白名单校验，避免数据库中异常路径导致接口读取项目外文件。
+    """
+
+    try:
+        return os.path.commonpath([parent_path, child_path]) == parent_path
+    except ValueError:
+        return False
+
+
+def _validate_preview_file_path(file_path: str) -> str:
+    """校验知识库文件是否允许被预览，并返回绝对路径。"""
+
+    target_path = os.path.abspath(file_path)
+    uploads_root = os.path.abspath(get_abs_path("uploads"))
+    data_root = os.path.abspath(get_abs_path("data"))
+    preview_root = os.path.abspath(os.path.join(uploads_root, "_preview"))
+
+    allowed_roots = (uploads_root, data_root)
+    if not any(_is_path_inside(target_path, root) for root in allowed_roots):
+        logger.warning(f"[知识库] 拒绝预览非知识库目录文件 路径={target_path}")
+        raise HTTPException(status_code=403, detail="该文件路径不允许预览")
+
+    if _is_path_inside(target_path, preview_root):
+        logger.warning(f"[知识库] 拒绝预览临时上传目录文件 路径={target_path}")
+        raise HTTPException(status_code=403, detail="临时上传文件不允许通过正式预览接口访问")
+
+    if not os.path.isfile(target_path):
+        raise HTTPException(status_code=404, detail="原始文件不存在，可能已被移动或删除")
+
+    return target_path
+
+
+def _read_text_file_preview(file_path: str, max_chars: int) -> tuple[str, bool]:
+    """读取 TXT 文件预览内容。
+
+    TXT 预览不走 LangChain loader，直接按 UTF-8 读取。
+    errors="replace" 可以避免少量异常字符导致整个预览失败。
+    """
+
+    with open(file_path, "r", encoding="utf-8", errors="replace") as file:
+        content = file.read(max_chars + 1)
+
+    truncated = len(content) > max_chars
+    return content[:max_chars], truncated
+
+
+def _append_preview_page(
+        parts: list[str],
+        total_chars: int,
+        page_title: str,
+        page_content: str,
+        max_chars: int,
+) -> tuple[int, bool]:
+    """把一页 PDF 文本追加到预览内容中，超出 max_chars 时截断。"""
+
+    page_text = f"{page_title}\n{page_content.strip()}"
+    if not page_content.strip():
+        return total_chars, False
+
+    candidate = f"\n\n{page_text}" if parts else page_text
+    remaining_chars = max_chars - total_chars
+    if len(candidate) > remaining_chars:
+        parts.append(candidate[:remaining_chars])
+        return max_chars, True
+
+    parts.append(candidate)
+    return total_chars + len(candidate), False
+
+
+def _read_pdf_file_preview(file_path: str, max_chars: int) -> tuple[str, bool, int]:
+    """读取 PDF 文件的文本预览。
+
+    PDF 在浏览器端直接预览需要额外的文件流接口和鉴权设计。
+    当前接口先返回抽取后的文本，适合知识库管理里快速核对文件内容。
+    """
+
+    documents = pdf_loader(file_path)
+    parts: list[str] = []
+    total_chars = 0
+    truncated = False
+
+    for page_index, document in enumerate(documents, start=1):
+        page_no = int(document.metadata.get("page", page_index - 1)) + 1
+        total_chars, truncated = _append_preview_page(
+            parts=parts,
+            total_chars=total_chars,
+            page_title=f"第 {page_no} 页",
+            page_content=document.page_content,
+            max_chars=max_chars,
+        )
+        if truncated:
+            break
+
+    return "".join(parts), truncated, len(documents)
+
+
+def _read_knowledge_file_preview(document: dict, max_chars: int) -> dict:
+    """按文件类型读取预览文本。"""
+
+    file_path = _validate_preview_file_path(document["file_path"])
+    file_type = str(document["file_type"]).lower().lstrip(".")
+
+    if file_type == "txt":
+        content, truncated = _read_text_file_preview(file_path, max_chars)
+        return {
+            "preview_type": "text",
+            "content": content,
+            "truncated": truncated,
+            "page_count": None,
+        }
+
+    if file_type == "pdf":
+        content, truncated, page_count = _read_pdf_file_preview(file_path, max_chars)
+        return {
+            "preview_type": "pdf_text",
+            "content": content,
+            "truncated": truncated,
+            "page_count": page_count,
+        }
+
+    raise HTTPException(status_code=400, detail=f"当前文件类型不支持预览：{file_type}")
 
 
 @router.post("/knowledge/upload/preview", response_model=KnowledgeUploadPreviewResponse)
@@ -188,6 +319,48 @@ def get_knowledge_file(document_id: str) -> KnowledgeFileResponse:
         raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
     return _document_to_response(document)
+
+
+@router.get("/knowledge/files/{document_id}/preview", response_model=KnowledgeFilePreviewResponse)
+def preview_indexed_knowledge_file(
+        document_id: str,
+        max_chars: int = Query(
+            DEFAULT_PREVIEW_CHAR_LIMIT,
+            ge=1000,
+            le=MAX_PREVIEW_CHAR_LIMIT,
+            description="最多返回的预览字符数，避免大文件一次性返回过多内容。",
+        ),
+) -> KnowledgeFilePreviewResponse:
+    """预览已入库知识库文件的原始文本内容。
+
+    这个接口服务于知识库管理页面：
+    - 它读取 documents 表中的 file_path。
+    - 它只允许访问 uploads/ 和 data/ 下的知识库文件。
+    - 它不访问 Qdrant，不触发 embedding，不改变索引。
+    """
+
+    logger.info(f"[知识库] 预览文件 文档编号={document_id} 最大字符数={max_chars}")
+    store = _get_knowledge_store()
+    document = store.get_document(document_id)
+
+    if document is None or document["status"] == "deleted":
+        raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
+
+    try:
+        preview = _read_knowledge_file_preview(document, max_chars)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"[知识库] 预览文件失败 文档编号={document_id} 错误={exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"文件预览失败：{exc}") from exc
+
+    return KnowledgeFilePreviewResponse(
+        document=_document_to_response(document),
+        preview_type=preview["preview_type"],
+        content=preview["content"],
+        truncated=preview["truncated"],
+        page_count=preview["page_count"],
+    )
 
 
 @router.delete("/knowledge/files/{document_id}", response_model=KnowledgeDeleteResponse)

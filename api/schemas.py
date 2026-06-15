@@ -26,6 +26,8 @@ class ChatResponse(BaseModel):
 
     answer: str  # 一次性接口返回的完整最终回答
     conversation_id: str  # 当前会话 ID；前端后续请求需要继续携带
+    first_token_ms: float | None = None  # 首字/首片耗时；一次性接口没有真实首字，默认等于 total_ms
+    total_ms: float | None = None  # 本次请求总耗时
 
 
 class ConversationSummaryResponse(BaseModel):
@@ -61,6 +63,8 @@ class ConversationMessageResponse(BaseModel):
     content_type: str  # 消息类型，默认 text
     model_name: str | None = None  # 助手消息使用的模型名
     token_count: int | None = None  # token 数量，当前可为空
+    first_token_ms: float | None = None  # 助手首字/首片耗时；旧数据没有该字段时为空
+    total_ms: float | None = None  # 助手完整回答耗时；旧数据没有该字段时为空
     created_at: str  # 创建时间
 
 
@@ -69,6 +73,13 @@ class ConversationDetailResponse(BaseModel):
 
     conversation: ConversationSummaryResponse  # 会话摘要
     messages: list[ConversationMessageResponse]  # 会话全部消息
+
+
+class ConversationDeleteResponse(BaseModel):
+    """删除聊天会话响应体。"""
+
+    status: str  # 固定返回 deleted
+    conversation_id: str  # 被删除的会话 ID
 
 
 class DebugRetrieveRequest(BaseModel):
@@ -105,6 +116,20 @@ class KnowledgeFileResponse(BaseModel):
     created_at: str  # 文件记录创建时间
     updated_at: str  # 文件记录最后更新时间
     error_message: str | None = None  # 入库失败时保存错误原因
+
+
+class KnowledgeFilePreviewResponse(BaseModel):
+    """已入库知识库文件的预览响应体。
+
+    这个模型用于知识库管理页面查看原始文件内容。
+    它只读取 documents.file_path 指向的服务端原文件，不参与 Qdrant 检索，也不改变索引数据。
+    """
+
+    document: KnowledgeFileResponse  # 被预览的文件元数据
+    preview_type: str  # text/pdf_text/unsupported，表示本次预览内容的来源类型
+    content: str  # 预览文本内容；大文件会按 max_chars 截断
+    truncated: bool  # 是否因为超过 max_chars 被截断
+    page_count: int | None = None  # PDF 页数；TXT 文件为空
 
 
 class KnowledgeUploadResponse(BaseModel):

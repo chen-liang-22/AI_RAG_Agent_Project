@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 
@@ -403,6 +404,8 @@ def _stream_agent(
     """
 
     try:  # 流式生成期间任何异常都会转成 SSE error 事件
+        stream_start_time = time.perf_counter()
+        first_token_ms: float | None = None
         logger.info(
             f"[接口] Agent流式输出开始 用户编号={user_id} "
             f"会话编号={conversation_id} 问题={message}"
@@ -419,21 +422,38 @@ def _stream_agent(
         ):
             # ensure_ascii=False 可以让中文直接以 UTF-8 传给前端，
             # 避免浏览器端看到 \u4f60\u597d 这种转义内容。
+            if first_token_ms is None:
+                first_token_ms = _elapsed_ms(stream_start_time)
+                metric_payload = json.dumps({"first_token_ms": first_token_ms}, ensure_ascii=False)
+                yield f"event: metric\ndata: {metric_payload}\n\n"
             chunks.append(chunk)
             payload = json.dumps({"content": chunk}, ensure_ascii=False)  # 把文本片段包装成 JSON
             yield f"event: chunk\ndata: {payload}\n\n"  # yield 一次，浏览器就有机会收到一个 SSE chunk
 
         answer = "".join(chunks).strip()
+        total_ms = _elapsed_ms(stream_start_time)
         if conversation_id and answer:
             _save_chat_exchange(
                 conversation_id=conversation_id,
                 message=message,
                 answer=answer,
-                metadata={"mode": "stream"},
+                metadata={
+                    "mode": "stream",
+                    "first_token_ms": first_token_ms,
+                    "total_ms": total_ms,
+                },
             )
 
         logger.info(f"[接口] Agent流式输出完成 用户编号={user_id} 会话编号={conversation_id}")
-        done_payload = json.dumps({"done": True, "conversation_id": conversation_id}, ensure_ascii=False)
+        done_payload = json.dumps(
+            {
+                "done": True,
+                "conversation_id": conversation_id,
+                "first_token_ms": first_token_ms,
+                "total_ms": total_ms,
+            },
+            ensure_ascii=False,
+        )
         yield f"event: done\ndata: {done_payload}\n\n"  # 告诉前端流式回答已经结束
     except Exception as exc:
         logger.error(f"[接口] Agent流式输出失败 用户编号={user_id} 错误={exc}", exc_info=True)
@@ -456,6 +476,8 @@ def _stream_direct_rag(
     """
 
     try:
+        stream_start_time = time.perf_counter()
+        first_token_ms: float | None = None
         # 记录当前流式请求进入 direct_rag 链路。
         logger.info(
             "[聊天路由] 流式接口走知识直答 用户编号=%s 会话编号=%s 问题=%s",
@@ -484,6 +506,10 @@ def _stream_direct_rag(
         # 内部流程是 RAG 检索上下文 -> 调用最终回答模型 stream() -> 逐段返回文本。
         for chunk in _get_knowledge_answer_service().stream_answer(message, history=history or []):
             # 保存当前分片，后面用于拼接完整回答。
+            if first_token_ms is None:
+                first_token_ms = _elapsed_ms(stream_start_time)
+                metric_payload = json.dumps({"first_token_ms": first_token_ms}, ensure_ascii=False)
+                yield f"event: metric\ndata: {metric_payload}\n\n"
             chunks.append(chunk)
 
             # 把文本分片包装成 JSON，ensure_ascii=False 保证中文直接输出。
@@ -495,6 +521,7 @@ def _stream_direct_rag(
 
         # 模型流结束后，把所有分片拼成最终回答。
         answer = "".join(chunks).strip()
+        total_ms = _elapsed_ms(stream_start_time)
 
         # 如果有会话编号且回答非空，就把“用户问题 + 助手回答”保存到 SQLite。
         if conversation_id and answer:
@@ -502,14 +529,26 @@ def _stream_direct_rag(
                 conversation_id=conversation_id,
                 message=message,
                 answer=answer,
-                metadata={"mode": "direct_rag_stream"},
+                metadata={
+                    "mode": "direct_rag_stream",
+                    "first_token_ms": first_token_ms,
+                    "total_ms": total_ms,
+                },
             )
 
         # 记录后端流式生成结束。
         logger.info("[聊天路由] 知识直答流式完成 用户编号=%s 会话编号=%s", user_id, conversation_id)
 
         # 通知前端本次流式回答结束。
-        done_payload = json.dumps({"done": True, "conversation_id": conversation_id}, ensure_ascii=False)
+        done_payload = json.dumps(
+            {
+                "done": True,
+                "conversation_id": conversation_id,
+                "first_token_ms": first_token_ms,
+                "total_ms": total_ms,
+            },
+            ensure_ascii=False,
+        )
         yield f"event: done\ndata: {done_payload}\n\n"
     except Exception as exc:
         # 流式响应开始后，HTTP 状态码通常已经发给浏览器了。
@@ -519,3 +558,7 @@ def _stream_direct_rag(
         # 把错误消息包装成 JSON 并推给前端。
         payload = json.dumps({"error": str(exc)}, ensure_ascii=False)
         yield f"event: error\ndata: {payload}\n\n"
+
+
+def _elapsed_ms(start_time: float) -> float:
+    return (time.perf_counter() - start_time) * 1000

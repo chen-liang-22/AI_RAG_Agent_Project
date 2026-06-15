@@ -43,3 +43,20 @@ def test_conversations_can_be_listed_and_loaded_with_messages(tmp_path):
     assert total == 2
     assert {conversation["conversation_id"] for conversation in conversations} == {"conv_a", "conv_b"}
     assert [message["role"] for message in messages] == ["user", "assistant"]
+
+
+def test_conversations_can_be_filtered_by_keyword(tmp_path):
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    store.ensure_conversation(conversation_id="conv_robot", user_id="1001", title="扫拖预约设置")
+    store.ensure_conversation(conversation_id="conv_report", user_id="1002", title="使用报告查询")
+
+    title_matches, title_total = store.list_conversations(page=1, page_size=10, keyword="预约")
+    user_matches, user_total = store.list_conversations(page=1, page_size=10, keyword="1002")
+    id_matches, id_total = store.list_conversations(page=1, page_size=10, keyword="robot")
+
+    assert title_total == 1
+    assert title_matches[0]["conversation_id"] == "conv_robot"
+    assert user_total == 1
+    assert user_matches[0]["conversation_id"] == "conv_report"
+    assert id_total == 1
+    assert id_matches[0]["conversation_id"] == "conv_robot"

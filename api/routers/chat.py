@@ -1,3 +1,4 @@
+import json
 import time
 
 from fastapi import APIRouter, HTTPException, Query
@@ -6,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from api.schemas import (
     ChatRequest,
     ChatResponse,
+    ConversationDeleteResponse,
     ConversationDetailResponse,
     ConversationListResponse,
     ConversationMessageResponse,
@@ -45,6 +47,7 @@ def _conversation_summary(row: dict) -> ConversationSummaryResponse:
 def _conversation_message(row: dict) -> ConversationMessageResponse:
     """把 SQLite 消息行转换成前端详情响应。"""
 
+    metadata = _read_message_metadata(row.get("metadata_json"))
     return ConversationMessageResponse(
         message_id=row["message_id"],
         conversation_id=row["conversation_id"],
@@ -54,8 +57,33 @@ def _conversation_message(row: dict) -> ConversationMessageResponse:
         content_type=row["content_type"],
         model_name=row.get("model_name"),
         token_count=row.get("token_count"),
+        first_token_ms=_optional_float(metadata.get("first_token_ms")),
+        total_ms=_optional_float(metadata.get("total_ms")),
         created_at=row["created_at"],
     )
+
+
+def _read_message_metadata(metadata_json: str | None) -> dict:
+    """读取消息 metadata_json，旧数据为空或格式异常时按空字典处理。"""
+
+    if not metadata_json:
+        return {}
+    try:
+        parsed = json.loads(metadata_json)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _optional_float(value: object) -> float | None:
+    """把 metadata 中的耗时安全转换成 float。"""
+
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @router.get("/conversations", response_model=ConversationListResponse)
@@ -63,14 +91,22 @@ def list_conversations(
         page: int = Query(1, ge=1),
         page_size: int = Query(10, ge=1, le=50),
         user_id: str | None = None,
+        keyword: str | None = Query(default=None, max_length=100),
 ) -> ConversationListResponse:
     """分页查询聊天记录列表。"""
 
-    logger.info("[接口] 查询聊天记录列表 页码=%s 每页数量=%s 用户编号=%s", page, page_size, user_id)
+    logger.info(
+        "[接口] 查询聊天记录列表 页码=%s 每页数量=%s 用户编号=%s 关键词=%s",
+        page,
+        page_size,
+        user_id,
+        keyword,
+    )
     conversations, total = _get_knowledge_store().list_conversations(
         page=page,
         page_size=page_size,
         user_id=user_id,
+        keyword=keyword,
     )
     return ConversationListResponse(
         items=[_conversation_summary(row) for row in conversations],
@@ -87,7 +123,7 @@ def get_conversation_detail(conversation_id: str) -> ConversationDetailResponse:
     logger.info("[接口] 查询聊天记录详情 会话编号=%s", conversation_id)
     store = _get_knowledge_store()
     conversation = store.get_conversation(conversation_id)
-    if conversation is None:
+    if conversation is None or conversation.get("status") == "deleted":
         raise HTTPException(status_code=404, detail="会话不存在")
 
     messages = store.list_conversation_messages(conversation_id)
@@ -95,6 +131,18 @@ def get_conversation_detail(conversation_id: str) -> ConversationDetailResponse:
         conversation=_conversation_summary(conversation),
         messages=[_conversation_message(row) for row in messages],
     )
+
+
+@router.delete("/conversations/{conversation_id}", response_model=ConversationDeleteResponse)
+def delete_conversation(conversation_id: str) -> ConversationDeleteResponse:
+    """删除聊天记录。"""
+
+    logger.info("[接口] 删除聊天记录 会话编号=%s", conversation_id)
+    deleted = _get_knowledge_store().delete_conversation(conversation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="会话不存在或已删除")
+
+    return ConversationDeleteResponse(status="deleted", conversation_id=conversation_id)
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -134,18 +182,29 @@ def chat(request: ChatRequest) -> ChatResponse:
             request.message,
         )
         answer = _get_knowledge_answer_service().answer(request.message, history=history)
+        total_ms = _elapsed_ms(request_start_time)
         _save_chat_exchange(
             conversation_id=conversation_id,
             message=request.message,
             answer=answer,
-            metadata={"mode": "direct_rag_once", "route_reason": route_reason},
+            metadata={
+                "mode": "direct_rag_once",
+                "route_reason": route_reason,
+                "first_token_ms": total_ms,
+                "total_ms": total_ms,
+            },
         )
         logger.info(
             "[性能] 聊天请求完成 模式=非流式 路由=知识直答 会话编号=%s 耗时毫秒=%.2f",
             conversation_id,
-            _elapsed_ms(request_start_time),
+            total_ms,
         )
-        return ChatResponse(answer=answer, conversation_id=conversation_id)
+        return ChatResponse(
+            answer=answer,
+            conversation_id=conversation_id,
+            first_token_ms=total_ms,
+            total_ms=total_ms,
+        )
 
     logger.info(
         "[聊天路由] 非流式接口路由结果=Agent工具链 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
@@ -160,18 +219,29 @@ def chat(request: ChatRequest) -> ChatResponse:
         conversation_id=conversation_id,
         history=history,
     )  # 阻塞等待 Agent 完整生成最终回答
+    total_ms = _elapsed_ms(request_start_time)
     _save_chat_exchange(
         conversation_id=conversation_id,
         message=request.message,
         answer=answer,
-        metadata={"mode": "agent_once", "route_reason": route_reason},
+        metadata={
+            "mode": "agent_once",
+            "route_reason": route_reason,
+            "first_token_ms": total_ms,
+            "total_ms": total_ms,
+        },
     )
     logger.info(
         "[性能] 聊天请求完成 模式=非流式 路由=Agent工具链 会话编号=%s 耗时毫秒=%.2f",
         conversation_id,
-        _elapsed_ms(request_start_time),
+        total_ms,
     )
-    return ChatResponse(answer=answer, conversation_id=conversation_id)
+    return ChatResponse(
+        answer=answer,
+        conversation_id=conversation_id,
+        first_token_ms=total_ms,
+        total_ms=total_ms,
+    )
 
 
 @router.post("/chat/stream")
