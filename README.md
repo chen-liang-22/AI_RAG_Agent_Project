@@ -25,10 +25,36 @@ DASHSCOPE_API_KEY=your_dashscope_api_key
 
 ## Local Run
 
+Recommended Python version:
+
+```text
+Python 3.12
+```
+
+Create and activate a Python 3.12 virtual environment:
+
+```powershell
+& "C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe" -m venv .venv312
+.\.venv312\Scripts\Activate.ps1
+```
+
 Install dependencies:
 
 ```powershell
 pip install -r requirements.txt
+```
+
+The API service depends on `fastapi` and `uvicorn[standard]`. If FastAPI is missing, install project
+dependencies again:
+
+```powershell
+pip install fastapi "uvicorn[standard]"
+```
+
+Install test dependencies when running the local test suite:
+
+```powershell
+pip install -r requirements-dev.txt
 ```
 
 Start Qdrant:
@@ -80,15 +106,21 @@ http://localhost:8080
 The frontend project is created next to this backend project:
 
 ```text
-D:\PycharmProjects\AI_RAG_Agent_Frontend
+C:\Users\Administrator\WebstormProjects\AI_RAG_Agent_Frontend
 ```
 
 Local frontend development:
 
 ```powershell
-cd D:\PycharmProjects\AI_RAG_Agent_Frontend
+cd C:\Users\Administrator\WebstormProjects\AI_RAG_Agent_Frontend
 npm install
 npm run dev
+```
+
+## Tests
+
+```powershell
+.\.venv312\Scripts\python.exe -m pytest
 ```
 
 Vite serves the frontend at:

@@ -1,5 +1,10 @@
 # RAG 知识库结构化入库、多意图识别与精排设计方案
 
+> 当前状态说明：本文最初描述的是“SQLite 保存结构化知识单元 + Qdrant 保存向量索引”的演进方案。
+> 项目当前实现已经进一步收敛为：SQLite 只保存文件、索引状态和会话等业务元数据；知识正文、FAQ、
+> chunk payload 和向量统一以 Qdrant 为准。本文中涉及 `knowledge_units` 表的内容保留为历史设计背景，
+> 不再代表当前落地方案。当前实现以 `ai_rag_agent_project_overall_design.md` 为准。
+
 ## 1. 背景
 
 当前项目已经具备基础 RAG 能力：

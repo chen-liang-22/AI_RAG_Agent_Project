@@ -5,6 +5,7 @@ __pycache__/
 .idea/
 .env
 .venv/
+.venv312/
 venv/
 
 logs/

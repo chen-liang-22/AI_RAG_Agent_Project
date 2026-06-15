@@ -170,7 +170,7 @@ class ReactAgent:
         report = state.get("report", False)  # 判断是否处于报告生成场景
         prompt = load_report_prompts() if report else load_system_prompts()  # 根据状态选择系统提示词
 
-        logger.info(f"[langgraph agent] 调用模型，messages={len(messages)} report={report}")  # 记录模型调用日志
+        logger.info(f"[LangGraph代理] 调用模型 消息数={len(messages)} 是否报告模式={report}")  # 记录模型调用日志
         response = self.model.invoke([SystemMessage(content=prompt), *messages])  # 系统提示词 + 历史消息一起发给模型
 
         return {"messages": [response]}  # 返回新 AIMessage，由 add_messages 合并进 state["messages"]
@@ -190,7 +190,7 @@ class ReactAgent:
         for message in reversed(state.get("messages", [])):  # 从最新消息往前看
             if isinstance(message, ToolMessage):  # 只关心工具返回消息
                 if message.name == "fill_context_for_report":  # 该工具用于触发报告场景
-                    logger.info("[langgraph agent] 检测到报告工具调用，切换 report=True")  # 记录状态切换
+                    logger.info("[LangGraph代理] 检测到报告工具调用，切换为报告模式")  # 记录状态切换
                     return {"report": True}  # 更新图状态
                 continue  # 其他工具消息继续往前检查
 

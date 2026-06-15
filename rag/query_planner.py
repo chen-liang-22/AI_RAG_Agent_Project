@@ -1,12 +1,22 @@
 import json
 import re
+import time
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from model.factory import chat_model
 from rag.query_pipeline import RuleBasedIntentAnalyzer
+from utils.config_handler import rag_conf
 from utils.logger_handler import logger
+
+
+class QueryPlannerModelError(RuntimeError):
+    """Raised when the LLM planner call fails."""
+
+
+class QueryPlannerParseError(ValueError):
+    """Raised when the LLM planner output is not valid JSON."""
 
 
 class QueryPlannerService:
@@ -25,48 +35,127 @@ class QueryPlannerService:
             query: str,
             *,
             history: list[dict[str, Any]] | None = None,
+            trace_id: str | None = None,
     ) -> list[str]:
+        start_time = time.perf_counter()
         clean_query = query.strip()
         if not clean_query:
             return []
 
         logger.info(
-            "[查询规划] 开始 原问题=%s 历史消息数=%s",
+            "[查询规划] 开始 追踪编号=%s 原问题=%s 历史消息数=%s",
+            trace_id,
             clean_query,
             len(history or []),
         )
         explicit_queries = self._split_explicit_questions(clean_query)
         if len(explicit_queries) >= 2:
             planned_queries = self._normalize_queries(explicit_queries, original_query=clean_query)
+            logger.info(
+                "[性能] 查询规划完成 追踪编号=%s 模式=显式切分 耗时毫秒=%.2f 检索问题数=%s",
+                trace_id,
+                self._elapsed_ms(start_time),
+                len(planned_queries),
+            )
             logger.info("[查询规划] 显式切分结果=%s", planned_queries)
             self._log_split_questions("explicit", planned_queries)
             return planned_queries
 
+        planner_mode = str(rag_conf.get("query_planner_mode") or "llm").strip().lower()
+        if planner_mode in {"rule", "rules", "off", "disabled"}:
+            fallback_queries = self._fallback_queries(clean_query)
+            logger.info(
+                "[性能] 查询规划完成 追踪编号=%s 模式=规则 耗时毫秒=%.2f 检索问题数=%s",
+                trace_id,
+                self._elapsed_ms(start_time),
+                len(fallback_queries),
+            )
+            logger.info("[查询规划] 配置为规则模式，结果=%s", fallback_queries)
+            self._log_split_questions("fallback", fallback_queries)
+            return fallback_queries
+
         try:
-            queries = self._plan_with_llm(clean_query, history=history or [])
+            queries = self._plan_with_llm(clean_query, history=history or [], trace_id=trace_id)
             if queries:
+                logger.info(
+                    "[性能] 查询规划完成 追踪编号=%s 模式=模型 耗时毫秒=%.2f 检索问题数=%s",
+                    trace_id,
+                    self._elapsed_ms(start_time),
+                    len(queries),
+                )
                 logger.info("[查询规划] 模型拆分结果=%s", queries)
                 self._log_split_questions("llm", queries)
                 return queries
-        except Exception as exc:
-            logger.warning(f"[查询规划] 模型拆分失败，改用规则兜底：{exc}")
+        except (QueryPlannerModelError, QueryPlannerParseError) as exc:
+            logger.warning("[查询规划] 模型拆分失败，改用规则兜底：%s", exc)
 
         fallback_queries = self._fallback_queries(clean_query)
+        logger.info(
+            "[性能] 查询规划完成 追踪编号=%s 模式=兜底 耗时毫秒=%.2f 检索问题数=%s",
+            trace_id,
+            self._elapsed_ms(start_time),
+            len(fallback_queries),
+        )
         logger.info("[查询规划] 规则兜底结果=%s", fallback_queries)
         self._log_split_questions("fallback", fallback_queries)
         return fallback_queries
 
-    def _plan_with_llm(self, query: str, *, history: list[dict[str, Any]]) -> list[str]:
+    def plan_initial(self, query: str, *, trace_id: str | None = None) -> list[str]:
+        """adaptive 模式的首轮查询：只保留原问题，不调用模型或规则扩展。"""
+
+        clean_query = self._clean_query(query)
+        if not clean_query:
+            return []
+        logger.info("[查询规划] adaptive首轮使用原问题 追踪编号=%s 检索问题=%s", trace_id, clean_query)
+        return [clean_query]
+
+    def plan_with_config(
+            self,
+            query: str,
+            *,
+            history: list[dict[str, Any]] | None = None,
+            trace_id: str | None = None,
+    ) -> list[str]:
+        """按配置执行完整查询规划，用于 adaptive 首轮召回质量不足后的补救。"""
+
+        return self.plan(query, history=history, trace_id=trace_id)
+
+    def merge_queries(self, primary_queries: list[str], secondary_queries: list[str]) -> list[str]:
+        """合并两批检索问题，保留顺序并去重。"""
+
+        return self._normalize_queries([*primary_queries, *secondary_queries], original_query="")
+
+    def _plan_with_llm(
+            self,
+            query: str,
+            *,
+            history: list[dict[str, Any]],
+            trace_id: str | None = None,
+    ) -> list[str]:
         history_text = self._format_history(history)
-        response = chat_model.invoke(
-            [
-                SystemMessage(content=self._system_prompt()),
-                HumanMessage(content=self._user_prompt(query, history_text)),
-            ]
+        start_time = time.perf_counter()
+        try:
+            response = chat_model.invoke(
+                [
+                    SystemMessage(content=self._system_prompt()),
+                    HumanMessage(content=self._user_prompt(query, history_text)),
+                ]
+            )
+        except (ConnectionError, TimeoutError, RuntimeError, ValueError) as exc:
+            raise QueryPlannerModelError(str(exc)) from exc
+
+        logger.info(
+            "[性能] 查询规划模型调用完成 追踪编号=%s 耗时毫秒=%.2f",
+            trace_id,
+            self._elapsed_ms(start_time),
         )
         content = self._message_content_to_text(response.content)
         logger.info("[查询规划] 模型原始输出=%s", content[:1200])
-        data = self._parse_json_object(content)
+        try:
+            data = self._parse_json_object(content)
+        except json.JSONDecodeError as exc:
+            raise QueryPlannerParseError(f"invalid planner JSON: {content[:200]}") from exc
+
         raw_queries = data.get("queries") if isinstance(data, dict) else None
         if not isinstance(raw_queries, list):
             return []
@@ -190,3 +279,7 @@ class QueryPlannerService:
             f"用户当前问题：\n{query}\n\n"
             "请输出 JSON。"
         )
+
+    @staticmethod
+    def _elapsed_ms(start_time: float) -> float:
+        return (time.perf_counter() - start_time) * 1000

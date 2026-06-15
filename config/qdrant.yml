@@ -9,6 +9,7 @@ k: 3
 per_query_top_k: 5
 per_query_keep: 2
 final_context_limit: 12
+use_metadata_filter: false
 data_path: data
 md5_hex_store: qdrant_md5.text
 allow_knowledge_file_type: ["txt", "pdf"]

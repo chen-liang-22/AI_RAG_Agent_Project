@@ -15,14 +15,29 @@
 这样可以减少流式回答前的等待时间，把模型调用留给最终 Agent 回答。
 """
 
+import time
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+
 from langchain_core.documents import Document
 
 from rag.query_planner import QueryPlannerService
 from rag.query_pipeline import QueryAnalysis, RuleBasedIntentAnalyzer
 from rag.reranker import RuleBasedReranker
 from rag.vector_store import VectorStoreService
-from utils.config_handler import qdrant_conf
+from utils.config_handler import qdrant_conf, rag_conf
 from utils.logger_handler import logger
+
+
+@dataclass
+class RetrievalQuality:
+    """召回质量评估结果。"""
+
+    good_enough: bool
+    doc_count: int
+    top1_score: float
+    top3_avg_score: float
+    reason: str
 
 
 class RagSummarizeService(object):
@@ -54,6 +69,7 @@ class RagSummarizeService(object):
             query: str,
             *,
             history: list[dict] | None = None,
+            trace_id: str | None = None,
     ) -> list[Document]:
         """检索并精排用户问题相关资料。
 
@@ -64,16 +80,51 @@ class RagSummarizeService(object):
         - 最终按用户问题顺序组装上下文，并做去重和数量截断。
         """
 
+        total_start_time = time.perf_counter()
+        analysis_start_time = time.perf_counter()
         analysis = self.intent_analyzer.analyze(query)
+        logger.info(
+            "[性能] RAG意图分析完成 追踪编号=%s 耗时毫秒=%.2f 意图=%s",
+            trace_id,
+            self._elapsed_ms(analysis_start_time),
+            analysis.intents,
+        )
+        logger.info(
+            "[性能] 意图分析摘要 追踪编号=%s 意图数=%s 意图=%s 关键词数=%s 过滤字段=%s",
+            trace_id,
+            len(analysis.intents),
+            ",".join(analysis.intents),
+            len(analysis.keywords),
+            ",".join(analysis.filters.keys()),
+        )
         self._log_intent_analysis(query, analysis)
-        search_queries = self.query_planner.plan(query, history=history)
-        candidate_groups = self.retrieve_for_queries(search_queries, analysis)
+        plan_retrieve_start_time = time.perf_counter()
+        search_queries, candidate_groups = self._plan_and_retrieve(
+            query,
+            analysis,
+            history=history,
+            trace_id=trace_id,
+        )
+        logger.info(
+            "[性能] RAG召回完成 追踪编号=%s 耗时毫秒=%.2f 检索问题数=%s 候选资料数=%s",
+            trace_id,
+            self._elapsed_ms(plan_retrieve_start_time),
+            len(search_queries),
+            sum(len(documents) for _, documents in candidate_groups),
+        )
+        rerank_start_time = time.perf_counter()
         reranked_docs = self.reranker.rerank_by_query(
             original_query=query,
             grouped_documents=candidate_groups,
             analysis=analysis,
             per_query_keep=int(qdrant_conf.get("per_query_keep", 2) or 2),
             final_context_limit=int(qdrant_conf.get("final_context_limit", 12) or 12),
+        )
+        logger.info(
+            "[性能] RAG精排完成 追踪编号=%s 耗时毫秒=%.2f 最终资料数=%s",
+            trace_id,
+            self._elapsed_ms(rerank_start_time),
+            len(reranked_docs),
         )
 
         logger.info(
@@ -85,8 +136,106 @@ class RagSummarizeService(object):
             len(reranked_docs),
         )
         logger.info("[RAG精排] 最终上下文=%s", self._summarize_documents_for_log(reranked_docs))
+        logger.info(
+            "[性能] RAG检索精排总耗时 追踪编号=%s 耗时毫秒=%.2f",
+            trace_id,
+            self._elapsed_ms(total_start_time),
+        )
 
         return reranked_docs
+
+    def _plan_and_retrieve(
+            self,
+            query: str,
+            analysis: QueryAnalysis,
+            *,
+            history: list[dict] | None = None,
+            trace_id: str | None = None,
+    ) -> tuple[list[str], list[tuple[str, list[Document]]]]:
+        planner_mode = str(rag_conf.get("query_planner_mode") or "adaptive").strip().lower()
+
+        if planner_mode == "adaptive":
+            return self._adaptive_plan_and_retrieve(query, analysis, history=history, trace_id=trace_id)
+
+        search_queries = self.query_planner.plan(query, history=history, trace_id=trace_id)
+        logger.info(
+            "[查询规划] 固定模式查询规划结果 追踪编号=%s 模式=%s 检索问题数=%s 检索问题=%s",
+            trace_id,
+            planner_mode,
+            len(search_queries),
+            " | ".join(search_queries),
+        )
+        return search_queries, self.retrieve_for_queries(search_queries, analysis, trace_id=trace_id)
+
+    def _adaptive_plan_and_retrieve(
+            self,
+            query: str,
+            analysis: QueryAnalysis,
+            *,
+            history: list[dict] | None = None,
+            trace_id: str | None = None,
+    ) -> tuple[list[str], list[tuple[str, list[Document]]]]:
+        first_queries = self.query_planner.plan_initial(query, trace_id=trace_id)
+        first_groups = self.retrieve_for_queries(first_queries, analysis, trace_id=trace_id)
+        first_documents = [document for _, documents in first_groups for document in documents]
+        quality = self.evaluate_retrieval_quality(first_documents)
+        logger.info(
+            "[召回质量] 首次召回评估完成 追踪编号=%s 是否足够=%s 资料数=%s 最高分=%.4f 前三平均分=%.4f 原因=%s",
+            trace_id,
+            quality.good_enough,
+            quality.doc_count,
+            quality.top1_score,
+            quality.top3_avg_score,
+            quality.reason,
+        )
+
+        if quality.good_enough:
+            logger.info("[查询规划] adaptive模式跳过模型拆分 追踪编号=%s", trace_id)
+            return first_queries, first_groups
+
+        planned_queries = self.query_planner.plan_with_config(query, history=history, trace_id=trace_id)
+        search_queries = self.query_planner.merge_queries(first_queries, planned_queries)
+        if search_queries == first_queries:
+            return first_queries, first_groups
+
+        logger.info(
+            "[查询规划] adaptive模式触发模型拆分 追踪编号=%s 检索问题数=%s 检索问题=%s",
+            trace_id,
+            len(search_queries),
+            " | ".join(search_queries),
+        )
+        return search_queries, self.retrieve_for_queries(search_queries, analysis, trace_id=trace_id)
+
+    @staticmethod
+    def evaluate_retrieval_quality(documents: list[Document]) -> RetrievalQuality:
+        min_docs = int(rag_conf.get("adaptive_retrieve_min_docs", 3) or 3)
+        min_score = float(rag_conf.get("adaptive_retrieve_min_score", 0.72) or 0.72)
+        min_top3_avg = float(rag_conf.get("adaptive_retrieve_top3_avg_score", 0.68) or 0.68)
+
+        scores = sorted(
+            [float(document.metadata.get("_vector_score") or 0.0) for document in documents],
+            reverse=True,
+        )
+        doc_count = len(documents)
+        top1_score = scores[0] if scores else 0.0
+        top3_scores = scores[:3]
+        top3_avg_score = sum(top3_scores) / len(top3_scores) if top3_scores else 0.0
+
+        reasons: list[str] = []
+        if doc_count < min_docs:
+            reasons.append(f"资料数不足{min_docs}")
+        if top1_score < min_score:
+            reasons.append(f"最高分低于{min_score}")
+        if top3_avg_score < min_top3_avg:
+            reasons.append(f"前三平均分低于{min_top3_avg}")
+
+        return RetrievalQuality(
+            good_enough=not reasons,
+            doc_count=doc_count,
+            top1_score=top1_score,
+            top3_avg_score=top3_avg_score,
+            reason="；".join(reasons) or "召回质量达标",
+        )
 
     def debug_retrieve(self, query: str) -> dict:
         """返回 RAG 检索调试信息。
@@ -101,8 +250,7 @@ class RagSummarizeService(object):
 
         analysis = self.intent_analyzer.analyze(query)
         self._log_intent_analysis(query, analysis)
-        search_queries = self.query_planner.plan(query)
-        candidate_groups = self.retrieve_for_queries(search_queries, analysis)
+        search_queries, candidate_groups = self._plan_and_retrieve(query, analysis)
         reranked_docs = self.reranker.rerank_by_query(
             original_query=query,
             grouped_documents=candidate_groups,
@@ -139,66 +287,117 @@ class RagSummarizeService(object):
             self,
             queries: list[str],
             analysis: QueryAnalysis,
+            *,
+            trace_id: str | None = None,
     ) -> list[tuple[str, list[Document]]]:
         """每个 search_query 单独召回 Qdrant top5。"""
 
-        candidate_groups: list[tuple[str, list[Document]]] = []
+        safe_queries = [query for query in queries if query.strip()]
+        if not safe_queries:
+            return []
+
+        if len(safe_queries) == 1:
+            return [self._retrieve_one_query(0, safe_queries[0], analysis, trace_id=trace_id)]
+
+        self._get_vector_store()
+        max_workers = min(len(safe_queries), int(qdrant_conf.get("parallel_query_workers", 4) or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(self._retrieve_one_query, query_index, search_query, analysis, trace_id=trace_id)
+                for query_index, search_query in enumerate(safe_queries)
+            ]
+            return [future.result() for future in futures]
+
+    def _retrieve_one_query(
+            self,
+            query_index: int,
+            search_query: str,
+            analysis: QueryAnalysis,
+            *,
+            trace_id: str | None = None,
+    ) -> tuple[str, list[Document]]:
         per_query_top_k = int(qdrant_conf.get("per_query_top_k", 5) or 5)
+        use_metadata_filter = bool(qdrant_conf.get("use_metadata_filter", False))
+        documents: list[Document] = []
 
-        for query_index, search_query in enumerate(queries):
-            documents: list[Document] = []
-            if analysis.filters:
-                try:
-                    logger.info(
-                        "[RAG召回] 查询序号=%s 检索问题=%s 过滤条件=%s 召回数量=%s",
-                        query_index,
-                        search_query,
-                        analysis.filters,
-                        per_query_top_k,
-                    )
-                    documents = self._get_vector_store().search_documents(
-                        search_query,
-                        k=per_query_top_k,
-                        filters=analysis.filters,
-                    )
-                except Exception as exc:
-                    logger.warning(f"[rag] vector retrieve with filters failed query={search_query}: {exc}")
-
-            if not documents:
-                try:
-                    logger.info(
-                        "[RAG召回] 查询序号=%s 检索问题=%s 过滤条件=无 召回数量=%s",
-                        query_index,
-                        search_query,
-                        per_query_top_k,
-                    )
-                    documents = self._get_vector_store().search_documents(
-                        search_query,
-                        k=per_query_top_k,
-                        filters=None,
-                    )
-                except Exception as exc:
-                    logger.warning(f"[rag] vector retrieve failed query={search_query}: {exc}")
-                    documents = []
-
-            logger.info(
-                "[RAG召回] 查询序号=%s 实际召回数=%s 候选资料=%s",
+        if use_metadata_filter and analysis.filters:
+            documents = self._search_documents(
                 query_index,
-                len(documents),
-                self._summarize_documents_for_log(documents),
-            )
-            candidate_groups.append(
-                (
-                    search_query,
-                    self._annotate_search_query(
-                        documents,
-                        search_query=search_query,
-                        query_index=query_index,
-                    ),
-                )
+                search_query,
+                per_query_top_k,
+                filters=analysis.filters,
+                filter_label="元数据",
+                trace_id=trace_id,
             )
 
-        return candidate_groups
+        if not documents:
+            documents = self._search_documents(
+                query_index,
+                search_query,
+                per_query_top_k,
+                filters=None,
+                filter_label="无",
+                trace_id=trace_id,
+            )
+
+        logger.info(
+            "[RAG召回] 查询序号=%s 实际召回数=%s 候选资料=%s",
+            query_index,
+            len(documents),
+            self._summarize_documents_for_log(documents),
+        )
+        return (
+            search_query,
+            self._annotate_search_query(
+                documents,
+                search_query=search_query,
+                query_index=query_index,
+            ),
+        )
+
+    def _search_documents(
+            self,
+            query_index: int,
+            search_query: str,
+            k: int,
+            *,
+            filters: dict[str, list[str]] | None,
+            filter_label: str,
+            trace_id: str | None = None,
+    ) -> list[Document]:
+        try:
+            retrieve_start_time = time.perf_counter()
+            logger.info(
+                "[RAG召回] 查询序号=%s 检索问题=%s 过滤条件=%s 召回数量=%s",
+                query_index,
+                search_query,
+                filters or "无",
+                k,
+            )
+            documents = self._get_vector_store().search_documents(
+                search_query,
+                k=k,
+                filters=filters,
+            )
+            logger.info(
+                "[性能] 向量召回完成 追踪编号=%s 查询序号=%s 过滤方式=%s 耗时毫秒=%.2f 资料数=%s",
+                trace_id,
+                query_index,
+                filter_label,
+                self._elapsed_ms(retrieve_start_time),
+                len(documents),
+            )
+            return documents
+        except Exception as exc:
+            logger.warning(
+                "[RAG召回] 向量检索失败 追踪编号=%s 查询序号=%s 过滤方式=%s 检索问题=%s 错误=%s",
+                trace_id,
+                query_index,
+                filter_label,
+                search_query,
+                exc,
+            )
+            return []
 
     @staticmethod
     def _log_intent_analysis(query: str, analysis: QueryAnalysis) -> None:
@@ -269,19 +468,33 @@ class RagSummarizeService(object):
 
         return metadata.get(key)
 
-    def rag_summarize(self, query: str, *, history: list[dict] | None = None) -> str:
+    def rag_summarize(
+            self,
+            query: str,
+            *,
+            history: list[dict] | None = None,
+            trace_id: str | None = None,
+    ) -> str:
         """返回给 Agent 的 RAG 参考资料文本。
 
         注意这里不是最终回答。
         它只是把检索到的资料整理成上下文，交给 Agent 再生成自然语言答案。
         """
 
-        context_docs = self.retriever_docs(query, history=history)
+        start_time = time.perf_counter()
+        context_docs = self.retriever_docs(query, history=history, trace_id=trace_id)
 
         context = ""
         for counter, doc in enumerate(context_docs, start=1):
             context += self._format_reference(counter, doc)
 
+        logger.info(
+            "[性能] RAG上下文格式化完成 追踪编号=%s 耗时毫秒=%.2f 资料数=%s 上下文字符数=%s",
+            trace_id,
+            self._elapsed_ms(start_time),
+            len(context_docs),
+            len(context),
+        )
         return context or "未检索到相关参考资料。"
 
     @staticmethod
@@ -308,6 +521,10 @@ class RagSummarizeService(object):
             f"{doc.page_content}\n"
             f"来源：{'；'.join(source_parts)}\n\n"
         )
+
+    @staticmethod
+    def _elapsed_ms(start_time: float) -> float:
+        return (time.perf_counter() - start_time) * 1000
 
 
 if __name__ == '__main__':

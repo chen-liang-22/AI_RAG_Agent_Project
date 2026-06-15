@@ -7,6 +7,8 @@
 因此适合扫拖机器人说明、APP 操作、保养、故障处理等知识类问题。
 """
 
+import time
+import uuid
 from collections.abc import Iterator
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
@@ -25,40 +27,95 @@ class KnowledgeAnswerService:
     def answer(self, query: str, *, history: list[dict] | None = None) -> str:
         """一次性生成知识库问答结果。"""
 
-        context = self._retrieve_context(query, history=history)
+        trace_id = self._new_trace_id()
+        total_start_time = time.perf_counter()
+        context = self._retrieve_context(query, history=history, trace_id=trace_id)
         logger.info(
-            "[知识直答] 非流式回答开始 问题=%s 参考资料字符数=%s",
+            "[知识直答] 非流式回答开始 追踪编号=%s 问题=%s 参考资料字符数=%s",
+            trace_id,
             query,
             len(context),
         )
+        llm_start_time = time.perf_counter()
         response = chat_model.invoke(self._build_messages(query, context, history=history))
+        logger.info(
+            "[性能] 最终模型调用完成 追踪编号=%s 模式=非流式 耗时毫秒=%.2f",
+            trace_id,
+            self._elapsed_ms(llm_start_time),
+        )
         answer = self._message_content_to_text(response.content).strip()
-        logger.info("[知识直答] 非流式回答完成 问题=%s 回答字符数=%s", query, len(answer))
+        logger.info(
+            "[性能] 知识直答总耗时 追踪编号=%s 模式=非流式 耗时毫秒=%.2f 回答字符数=%s",
+            trace_id,
+            self._elapsed_ms(total_start_time),
+            len(answer),
+        )
+        logger.info("[知识直答] 非流式回答完成 追踪编号=%s 问题=%s 回答字符数=%s", trace_id, query, len(answer))
         return answer
 
     def stream_answer(self, query: str, *, history: list[dict] | None = None) -> Iterator[str]:
         """流式生成知识库问答结果。"""
 
-        context = self._retrieve_context(query, history=history)
+        trace_id = self._new_trace_id()
+        total_start_time = time.perf_counter()
+        context = self._retrieve_context(query, history=history, trace_id=trace_id)
         logger.info(
-            "[知识直答] 流式回答开始 问题=%s 参考资料字符数=%s",
+            "[知识直答] 流式回答开始 追踪编号=%s 问题=%s 参考资料字符数=%s",
+            trace_id,
             query,
             len(context),
         )
         total_chars = 0
+        chunk_count = 0
+        llm_start_time = time.perf_counter()
+        first_chunk_time: float | None = None
         for chunk in chat_model.stream(self._build_messages(query, context, history=history)):
             content = self._message_content_to_text(chunk.content)
             if not content:
                 continue
+            if first_chunk_time is None:
+                first_chunk_time = time.perf_counter()
+                logger.info(
+                    "[性能] 首个回答分片到达 追踪编号=%s 耗时毫秒=%.2f 上下文字符数=%s",
+                    trace_id,
+                    self._elapsed_ms(llm_start_time),
+                    len(context),
+                )
             total_chars += len(content)
+            chunk_count += 1
             yield content
-        logger.info("[知识直答] 流式回答完成 问题=%s 回答字符数=%s", query, total_chars)
+        logger.info(
+            "[性能] 流式模型输出完成 追踪编号=%s 耗时毫秒=%.2f 分片数=%s 回答字符数=%s",
+            trace_id,
+            self._elapsed_ms(llm_start_time),
+            chunk_count,
+            total_chars,
+        )
+        logger.info(
+            "[性能] 知识直答总耗时 追踪编号=%s 模式=流式 耗时毫秒=%.2f",
+            trace_id,
+            self._elapsed_ms(total_start_time),
+        )
+        logger.info("[知识直答] 流式回答完成 追踪编号=%s 问题=%s 回答字符数=%s", trace_id, query, total_chars)
 
-    def _retrieve_context(self, query: str, *, history: list[dict] | None = None) -> str:
+    def _retrieve_context(
+            self,
+            query: str,
+            *,
+            history: list[dict] | None = None,
+            trace_id: str | None = None,
+    ) -> str:
         """统一走普通多意图 RAG 检索，不再做 FAQ 编号/列表特殊分支。"""
 
-        context = self.rag.rag_summarize(query, history=history)
-        logger.info("[知识直答] RAG 检索完成 问题=%s 参考资料字符数=%s", query, len(context))
+        start_time = time.perf_counter()
+        context = self.rag.rag_summarize(query, history=history, trace_id=trace_id)
+        logger.info(
+            "[性能] 知识直答上下文准备完成 追踪编号=%s 耗时毫秒=%.2f 上下文字符数=%s",
+            trace_id,
+            self._elapsed_ms(start_time),
+            len(context),
+        )
+        logger.info("[知识直答] RAG 检索完成 追踪编号=%s 问题=%s 参考资料字符数=%s", trace_id, query, len(context))
         return context
 
     def _build_messages(
@@ -129,3 +186,11 @@ class KnowledgeAnswerService:
             f"参考资料：\n{context}\n\n"
             "请根据参考资料生成最终回答。"
         )
+
+    @staticmethod
+    def _new_trace_id() -> str:
+        return f"chat_{uuid.uuid4().hex[:12]}"
+
+    @staticmethod
+    def _elapsed_ms(start_time: float) -> float:
+        return (time.perf_counter() - start_time) * 1000
