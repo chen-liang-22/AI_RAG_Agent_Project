@@ -2,10 +2,17 @@ from fastapi import APIRouter
 from qdrant_client import QdrantClient
 
 from api.schemas import HealthResponse
+from rag.knowledge_store import KnowledgeStore
 from utils.logger_handler import logger
 from utils.qdrant_options import get_qdrant_client_options, get_qdrant_collection_name
 
 router = APIRouter()
+
+
+def _service_status(item_code: str) -> str:
+    """从服务状态字典读取状态码，避免健康检查里写散落状态值。"""
+
+    return KnowledgeStore().normalize_dictionary_code("service_status", item_code)
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -16,12 +23,12 @@ def health() -> HealthResponse:
     try:
         client = QdrantClient(**get_qdrant_client_options())  # 按配置连接 Qdrant
         collections = [collection.name for collection in client.get_collections().collections]  # 获取全部 collection 名称
-        qdrant_status = "ok"  # 能正常连接和读取 collection，说明 Qdrant 可用
+        qdrant_status = _service_status("ok")  # 能正常连接和读取 collection，说明 Qdrant 可用
     except Exception:
         collections = []  # Qdrant 不可用时返回空列表，避免健康检查接口直接报错
-        qdrant_status = "unavailable"  # 标记 Qdrant 不可用
+        qdrant_status = _service_status("unavailable")  # 标记 Qdrant 不可用
 
-    status = "ok" if qdrant_status == "ok" else "degraded"  # 依赖不可用时整体状态降级
+    status = _service_status("ok") if qdrant_status == _service_status("ok") else _service_status("degraded")
     return HealthResponse(
         status=status,  # 返回整体状态
         qdrant=qdrant_status,  # 返回 Qdrant 状态

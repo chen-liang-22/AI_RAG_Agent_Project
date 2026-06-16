@@ -689,7 +689,7 @@ class RagSummarizeService(object):
         metadata = doc.metadata
         source_file = metadata.get("source_file") or metadata.get("source") or "未知来源"
         source_page = metadata.get("source_page") or metadata.get("page")
-        unit_type = metadata.get("unit_type") or "general"
+        unit_type = metadata.get("unit_type") or "text"
         category = metadata.get("category") or "通用知识"
 
         source_parts = [

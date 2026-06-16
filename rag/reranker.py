@@ -20,16 +20,16 @@ class RuleBasedReranker:
     # 意图到知识单元类型的匹配关系。
     # 如果命中，说明这条资料更符合用户问题的业务方向。
     intent_unit_type_bonus: dict[str, list[str]] = {
-        "purchase": ["guide", "faq"],
-        "comparison": ["guide", "faq"],
-        "troubleshooting": ["troubleshooting", "faq"],
-        "maintenance": ["maintenance", "faq"],
+        "purchase": ["qa", "numbered"],
+        "comparison": ["qa", "numbered"],
+        "problem": ["qa", "numbered"],
+        "usage": ["qa", "numbered"],
     }
 
     intent_negative_keywords: dict[str, list[str]] = {
-        "troubleshooting": ["导航技术", "选购", "参数", "品牌对比"],
+        "problem": ["导航技术", "选购", "参数", "品牌对比"],
         "purchase": ["故障现象", "修复", "检测："],
-        "maintenance": ["选购", "品牌对比"],
+        "usage": ["选购", "品牌对比"],
     }
 
     def rerank(self, query: str, documents: list[Document], analysis: QueryAnalysis, limit: int) -> list[Document]:

@@ -8,6 +8,7 @@ from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.embeddings import Embeddings
 from langchain_openai import ChatOpenAI
 
+from rag.knowledge_store import KnowledgeStore
 from utils.config_handler import rag_conf
 
 
@@ -37,10 +38,10 @@ class ChatModelFactory(BaseModelFactory):
 
 
 def normalize_chat_model_mode(model_mode: str | None) -> str:
-    mode = str(model_mode or "high").strip().lower()
-    if mode in {"low", "medium", "high"}:
-        return mode
-    return "high"
+    """从模型档位字典里归一化前端传入的模型模式。"""
+
+    store = KnowledgeStore()
+    return store.normalize_dictionary_code("model_mode", model_mode)
 
 
 def get_chat_model_name_for_mode(model_mode: str | None = None) -> str:

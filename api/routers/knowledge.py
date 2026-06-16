@@ -41,6 +41,15 @@ DEFAULT_PREVIEW_CHAR_LIMIT = 20000
 MAX_PREVIEW_CHAR_LIMIT = 100000
 
 
+def _dictionary_status(dictionary_code: str, item_code: str) -> str:
+    """从字典表读取协议状态码，避免接口里直接散落未校验的状态值。"""
+
+    store = _get_knowledge_store()
+    if hasattr(store, "normalize_dictionary_code"):
+        return store.normalize_dictionary_code(dictionary_code, item_code)
+    return item_code
+
+
 def _is_path_inside(child_path: str, parent_path: str) -> bool:
     """判断 child_path 是否位于 parent_path 下。
 
@@ -252,7 +261,7 @@ def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeU
     if duplicate_document is not None:
         _remove_created_upload_dir(preview_dir)
         return KnowledgeUploadResponse(
-            status="duplicate",
+            status=_dictionary_status("knowledge_result_status", "duplicate"),
             message="相同内容的文件已经存在，本次没有重复入库。",
             document=_document_to_response(duplicate_document),
         )
@@ -272,7 +281,7 @@ def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeU
         file_type=file_type,
         file_md5=file_md5,
         file_size=file_size,
-        status="uploaded",
+        status=_dictionary_status("document_status", "uploaded"),
         collection_name=collection_name,
         document_type=request.document_type,
         split_strategy=request.split_strategy,
@@ -287,7 +296,7 @@ def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeU
     )
 
     return KnowledgeUploadResponse(
-        status="indexed",
+        status=_dictionary_status("knowledge_result_status", "indexed"),
         message="文件已按确认配置写入知识库。",
         document=_document_to_response(indexed_document),
     )
@@ -314,7 +323,7 @@ def get_knowledge_file(document_id: str) -> KnowledgeFileResponse:
     store = _get_knowledge_store()
     document = store.get_document(document_id)
 
-    if document is None or document["status"] == "deleted":
+    if document is None or document["status"] == _dictionary_status("document_status", "deleted"):
         raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
     return _document_to_response(document)
@@ -342,7 +351,7 @@ def preview_indexed_knowledge_file(
     store = _get_knowledge_store()
     document = store.get_document(document_id)
 
-    if document is None or document["status"] == "deleted":
+    if document is None or document["status"] == _dictionary_status("document_status", "deleted"):
         raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
     try:
@@ -378,7 +387,7 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
     store = _get_knowledge_store()
     document = store.get_document(document_id)
 
-    if document is None or document["status"] == "deleted":
+    if document is None or document["status"] == _dictionary_status("document_status", "deleted"):
         raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
     try:
@@ -390,7 +399,7 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
         logger.error(f"[知识库] 删除文件失败 文档编号={document_id} 错误={exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"知识库文件删除失败：{exc}") from exc
 
-    return KnowledgeDeleteResponse(status="deleted", document_id=document_id)
+    return KnowledgeDeleteResponse(status=_dictionary_status("document_status", "deleted"), document_id=document_id)
 
 
 @router.post("/knowledge/files/reindex-all", response_model=KnowledgeBulkReindexResponse)
@@ -441,7 +450,7 @@ def reindex_all_knowledge_files() -> KnowledgeBulkReindexResponse:
                 KnowledgeReindexResult(
                     document_id=document_id,
                     filename=filename,
-                    status="indexed",
+                    status=_dictionary_status("knowledge_result_status", "indexed"),
                     message=f"chunk_count={indexed_document['chunk_count']}",
                 )
             )
@@ -452,12 +461,12 @@ def reindex_all_knowledge_files() -> KnowledgeBulkReindexResponse:
                 KnowledgeReindexResult(
                     document_id=document_id,
                     filename=filename,
-                    status="failed",
+                    status=_dictionary_status("knowledge_result_status", "failed"),
                     message=str(message),
                 )
             )
 
-    status = "ok" if failed == 0 else "partial_failed"
+    status = _dictionary_status("knowledge_result_status", "ok" if failed == 0 else "partial_failed")
     return KnowledgeBulkReindexResponse(
         status=status,
         total=len(documents),
@@ -484,7 +493,7 @@ def reindex_knowledge_file(document_id: str) -> KnowledgeFileResponse:
     store = _get_knowledge_store()
     document = store.get_document(document_id)
 
-    if document is None or document["status"] == "deleted":
+    if document is None or document["status"] == _dictionary_status("document_status", "deleted"):
         raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
     indexed_document = _index_document(store, document, increment_version=True)
@@ -531,7 +540,7 @@ def reload_knowledge() -> dict:
                     {
                         "document_id": indexed_document["document_id"],
                         "filename": indexed_document["filename"],
-                        "status": "indexed",
+                        "status": _dictionary_status("knowledge_result_status", "indexed"),
                         "chunk_count": indexed_document["chunk_count"],
                     }
                 )
@@ -542,7 +551,7 @@ def reload_knowledge() -> dict:
                     {
                         "document_id": document["document_id"],
                         "filename": document["filename"],
-                        "status": "failed",
+                        "status": _dictionary_status("knowledge_result_status", "failed"),
                         "message": str(message),
                     }
                 )
@@ -551,7 +560,7 @@ def reload_knowledge() -> dict:
         raise HTTPException(status_code=500, detail=f"Knowledge reload failed: {exc}") from exc
 
     return {
-        "status": "ok" if failed == 0 else "partial_failed",
+        "status": _dictionary_status("knowledge_result_status", "ok" if failed == 0 else "partial_failed"),
         "collection_name": get_qdrant_collection_name(),
         "total": len(results),
         "succeeded": succeeded,

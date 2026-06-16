@@ -15,7 +15,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)  # 用户输入的问题；不能为空字符串
     user_id: str | None = None  # 当前会话用户 ID；可为空，工具层会兜底随机用户
     conversation_id: str | None = None  # 当前会话 ID；为空时后端创建新会话
-    model_mode: str | None = Field(default="high", pattern="^(low|medium|high)$")  # 回答模型档位：low/medium/high
+    model_mode: str | None = None  # 回答模型档位，具体可选值和默认值来自 model_mode 字典
     collection_name: str | None = None  # 本次聊天要检索的 Qdrant collection；为空时使用默认 collection
 
 
@@ -99,6 +99,31 @@ class HealthResponse(BaseModel):
     collections: list[str] = Field(default_factory=list)  # Qdrant 中已有的 collection 列表
 
 
+class DictionaryItemResponse(BaseModel):
+    """字典项响应体，支持通过 children 表示多层级字典。"""
+
+    dictionary_item_id: str  # 字典项唯一 ID
+    dictionary_code: str  # 字典编码，例如 document_structure
+    dictionary_name: str  # 字典名称，例如 文档结构类型
+    item_code: str  # 字典项编码，例如 qa
+    item_name: str  # 字典项名称，例如 问答型
+    parent_item_id: str | None = None  # 父级字典项 ID；为空表示一级项
+    item_level: int  # 层级，从 1 开始
+    sort_order: int  # 同级排序号
+    enabled: bool  # 是否启用
+    description: str | None = None  # 字典项说明
+    metadata: dict = Field(default_factory=dict)  # 前端展示或业务扩展元数据
+    children: list["DictionaryItemResponse"] = Field(default_factory=list)  # 子级字典项
+
+
+class DictionaryGroupResponse(BaseModel):
+    """单个字典分组响应体。"""
+
+    dictionary_code: str  # 字典编码
+    dictionary_name: str  # 字典名称
+    items: list[DictionaryItemResponse] = Field(default_factory=list)  # 当前字典的树形字典项
+
+
 class KnowledgeFileResponse(BaseModel):
     """知识库文件响应体。
 
@@ -116,8 +141,8 @@ class KnowledgeFileResponse(BaseModel):
     version: int  # 文件索引版本；每次 reindex 会递增
     chunk_count: int  # 当前版本写入 Qdrant 的知识单元数量
     collection_name: str = "agent"  # 文件写入的 Qdrant collection
-    document_type: str = "general"  # 文件的业务/通用分类，仅作为 metadata
-    split_strategy: str = "recursive"  # 文件入库时使用的切分策略
+    document_type: str = "text"  # 文档结构类型：qa/numbered/text
+    split_strategy: str = "recursive"  # 文件入库时使用的切分策略：numbered_qa/outline_qa/numbered_segments/recursive
     created_at: str  # 文件记录创建时间
     updated_at: str  # 文件记录最后更新时间
     error_message: str | None = None  # 入库失败时保存错误原因
@@ -181,7 +206,7 @@ class KnowledgeUploadRecommendResponse(BaseModel):
     """上传文件模型推荐响应体。"""
 
     document_type: str  # 模型推荐的文档类型
-    split_strategy: str  # 模型推荐的切分策略
+    split_strategy: str  # 模型推荐的切分策略：numbered_qa/outline_qa/numbered_segments/recursive
     confidence: float  # 模型推荐置信度，范围 0 到 1
     reasons: list[str] = Field(default_factory=list)  # 模型推荐原因
     sample_chars: int  # 实际发送给模型的样本文本字符数
@@ -192,8 +217,8 @@ class KnowledgeUploadConfirmRequest(BaseModel):
     """上传确认请求体。"""
 
     upload_id: str = Field(..., min_length=1)  # 预览阶段返回的 upload_id
-    document_type: str = Field(..., min_length=1)  # 用户确认后的文档类型
-    split_strategy: str = Field(..., min_length=1)  # 用户确认后的切分策略
+    document_type: str = Field(..., min_length=1)  # 用户确认后的文档结构类型：qa/numbered/text
+    split_strategy: str = Field(..., min_length=1)  # 用户确认后的切分策略：numbered_qa/outline_qa/numbered_segments/recursive
     collection_name: str | None = None  # 用户选择或输入的 Qdrant collection；为空时使用默认 collection
 
 

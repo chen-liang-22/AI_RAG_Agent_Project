@@ -10,6 +10,112 @@ from typing import Any
 from utils.path_tool import get_abs_path
 
 
+DEFAULT_DICTIONARY_ITEMS = [
+    {
+        "dictionary_code": "document_structure",
+        "dictionary_name": "文档结构类型",
+        "items": [
+            ("text", "普通文本型", None, 1, "没有稳定结构的普通文本", {"default": True}),
+            ("qa", "问答型", None, 2, "按问题和答案组织的文档结构"),
+            ("numbered", "编号条目型", None, 3, "按编号条目组织的文档结构"),
+        ],
+    },
+    {
+        "dictionary_code": "split_strategy",
+        "dictionary_name": "切分策略",
+        "items": [
+            ("recursive", "递归通用切分", None, 1, "按分隔符和长度递归切分", {"default": True}),
+            ("numbered_qa", "编号问答切分", None, 2, "把编号问答切成 QA 片段"),
+            ("outline_qa", "目录问答切分", None, 3, "把 PDF 书签目录中的章节和问题切成 QA 片段"),
+            ("numbered_segments", "编号条目切分", None, 4, "把编号条目切成普通片段"),
+        ],
+    },
+    {
+        "dictionary_code": "model_mode",
+        "dictionary_name": "回答模型档位",
+        "items": [
+            ("high", "高", None, 1, "高质量模型档位", {"quality": "high", "default": True}),
+            ("medium", "中", None, 2, "平衡模型档位", {"quality": "medium"}),
+            ("low", "低", None, 3, "低延迟模型档位", {"quality": "low", "recommendation": True}),
+        ],
+    },
+    {
+        "dictionary_code": "output_mode",
+        "dictionary_name": "输出模式",
+        "items": [
+            ("stream", "流式", None, 1, "边生成边返回", {"mode_kind": "stream", "default": True}),
+            ("once", "一次性", None, 2, "生成完成后一次性返回", {"mode_kind": "once"}),
+        ],
+    },
+    {
+        "dictionary_code": "document_status",
+        "dictionary_name": "知识库文件状态",
+        "items": [
+            ("uploaded", "已上传", None, 1, "文件已保存但未完成入库", {"tag_type": "info"}),
+            ("indexing", "入库中", None, 2, "正在解析、切分和写入向量库", {"tag_type": "warning"}),
+            ("indexed", "已索引", None, 3, "已完成向量索引", {"tag_type": "success"}),
+            ("failed", "入库失败", None, 4, "入库过程失败", {"tag_type": "danger"}),
+            ("deleted", "已删除", None, 5, "文件已标记删除", {"tag_type": "info"}),
+        ],
+    },
+    {
+        "dictionary_code": "conversation_status",
+        "dictionary_name": "会话状态",
+        "items": [
+            ("active", "正常", None, 1, "可继续使用的会话"),
+            ("deleted", "已删除", None, 2, "已删除的会话"),
+        ],
+    },
+    {
+        "dictionary_code": "message_role",
+        "dictionary_name": "消息角色",
+        "items": [
+            ("user", "用户", None, 1, "用户消息"),
+            ("assistant", "助手", None, 2, "助手消息"),
+            ("system", "系统", None, 3, "系统消息"),
+        ],
+    },
+    {
+        "dictionary_code": "content_type",
+        "dictionary_name": "内容类型",
+        "items": [
+            ("text", "文本", None, 1, "普通文本内容"),
+            ("qa", "问答片段", None, 2, "问答型知识片段"),
+            ("segment", "普通片段", None, 3, "普通知识片段"),
+        ],
+    },
+    {
+        "dictionary_code": "service_status",
+        "dictionary_name": "服务状态",
+        "items": [
+            ("ok", "正常", None, 1, "服务可用"),
+            ("degraded", "降级", None, 2, "部分依赖不可用"),
+            ("unavailable", "不可用", None, 3, "服务或依赖不可用"),
+        ],
+    },
+    {
+        "dictionary_code": "knowledge_result_status",
+        "dictionary_name": "知识库操作结果",
+        "items": [
+            ("indexed", "已索引", None, 1, "文件入库成功", {"result_kind": "indexed"}),
+            ("duplicate", "重复", None, 2, "存在相同内容文件", {"result_kind": "duplicate"}),
+            ("failed", "失败", None, 3, "操作失败", {"result_kind": "failed"}),
+            ("ok", "成功", None, 4, "批量操作全部成功", {"result_kind": "ok"}),
+            ("partial_failed", "部分失败", None, 5, "批量操作存在失败项", {"result_kind": "partial_failed"}),
+        ],
+    },
+    {
+        "dictionary_code": "preview_type",
+        "dictionary_name": "预览类型",
+        "items": [
+            ("text", "TXT 文本", None, 1, "TXT 文件预览"),
+            ("pdf_text", "PDF 文本", None, 2, "PDF 提取文本预览"),
+            ("unsupported", "不支持", None, 3, "暂不支持预览"),
+        ],
+    },
+]
+
+
 def utc_now_text() -> str:
     """返回统一格式的 UTC 时间字符串。"""
 
@@ -63,7 +169,7 @@ class KnowledgeStore:
                     version INTEGER NOT NULL DEFAULT 1,
                     chunk_count INTEGER NOT NULL DEFAULT 0,
                     collection_name TEXT NOT NULL DEFAULT 'agent',
-                    document_type TEXT NOT NULL DEFAULT 'general',
+                    document_type TEXT NOT NULL DEFAULT 'text',
                     split_strategy TEXT NOT NULL DEFAULT 'recursive',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -111,6 +217,26 @@ class KnowledgeStore:
                 ON documents(file_md5)
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dictionary_items (
+                    dictionary_item_id TEXT PRIMARY KEY,
+                    dictionary_code TEXT NOT NULL,
+                    dictionary_name TEXT NOT NULL,
+                    item_code TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    parent_item_id TEXT,
+                    item_level INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    description TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(dictionary_code, item_code)
+                )
+                """
+            )
             self._ensure_document_columns(conn)
             conn.execute(
                 """
@@ -144,16 +270,161 @@ class KnowledgeStore:
             )
 
             # 旧知识表不再作为知识答案来源，启动时清理，避免继续双写或误查。
-            conn.execute("DROP TABLE IF EXISTS faq_items")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dictionary_items_code_parent
+                ON dictionary_items(dictionary_code, parent_item_id, sort_order)
+                """
+            )
+            self.seed_default_dictionaries(conn)
+            conn.execute("DROP TABLE IF EXISTS qa_items")
             conn.execute("DROP TABLE IF EXISTS document_segments")
             conn.execute("DROP TABLE IF EXISTS knowledge_units")
+
+    def seed_default_dictionaries(self, conn: sqlite3.Connection) -> None:
+        """初始化系统默认字典项，已有字典项只更新展示信息。"""
+
+        now = utc_now_text()
+        for dictionary in DEFAULT_DICTIONARY_ITEMS:
+            dictionary_code = dictionary["dictionary_code"]
+            dictionary_name = dictionary["dictionary_name"]
+            item_id_by_code: dict[str, str] = {}
+            for item in dictionary["items"]:
+                item_code, item_name, parent_code, sort_order, description = item[:5]
+                metadata = item[5] if len(item) > 5 else None
+                metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+                existing = conn.execute(
+                    """
+                    SELECT dictionary_item_id
+                    FROM dictionary_items
+                    WHERE dictionary_code = ? AND item_code = ?
+                    """,
+                    (dictionary_code, item_code),
+                ).fetchone()
+                parent_item_id = item_id_by_code.get(parent_code or "")
+                item_level = 1 if parent_item_id is None else 2
+                if existing:
+                    dictionary_item_id = existing["dictionary_item_id"]
+                    conn.execute(
+                        """
+                        UPDATE dictionary_items
+                        SET dictionary_name = ?, item_name = ?, parent_item_id = ?,
+                            item_level = ?, sort_order = ?, description = ?, metadata_json = ?, updated_at = ?
+                        WHERE dictionary_item_id = ?
+                        """,
+                        (
+                            dictionary_name,
+                            item_name,
+                            parent_item_id,
+                            item_level,
+                            sort_order,
+                            description,
+                            metadata_json,
+                            now,
+                            dictionary_item_id,
+                        ),
+                    )
+                else:
+                    dictionary_item_id = f"dict_{uuid.uuid4().hex}"
+                    conn.execute(
+                        """
+                        INSERT INTO dictionary_items (
+                            dictionary_item_id, dictionary_code, dictionary_name,
+                            item_code, item_name, parent_item_id, item_level,
+                            sort_order, enabled, description, metadata_json,
+                            created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                        """,
+                        (
+                            dictionary_item_id,
+                            dictionary_code,
+                            dictionary_name,
+                            item_code,
+                            item_name,
+                            parent_item_id,
+                            item_level,
+                            sort_order,
+                            description,
+                            metadata_json,
+                            now,
+                            now,
+                        ),
+                    )
+                item_id_by_code[item_code] = dictionary_item_id
+
+    def list_dictionary_items(self, dictionary_code: str | None = None) -> list[dict[str, Any]]:
+        """查询字典项列表，支持按字典编码过滤。"""
+
+        with self.connect() as conn:
+            if dictionary_code:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM dictionary_items
+                    WHERE dictionary_code = ?
+                    ORDER BY dictionary_code, item_level, sort_order, item_code
+                    """,
+                    (dictionary_code,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM dictionary_items
+                    ORDER BY dictionary_code, item_level, sort_order, item_code
+                    """
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_enabled_dictionary_codes(self, dictionary_code: str) -> list[str]:
+        """查询某个字典下已启用的字典项编码。"""
+
+        rows = self.list_dictionary_items(dictionary_code=dictionary_code)
+        return [str(row["item_code"]) for row in rows if int(row.get("enabled") or 0) == 1]
+
+    def get_default_dictionary_code(self, dictionary_code: str) -> str:
+        """查询某个字典的默认编码，默认取启用且排序最靠前的字典项。"""
+
+        codes = self.list_enabled_dictionary_codes(dictionary_code)
+        if not codes:
+            raise ValueError(f"字典没有可用项：{dictionary_code}")
+        return codes[0]
+
+    def get_dictionary_code_by_metadata(self, dictionary_code: str, metadata_key: str, metadata_value: Any) -> str | None:
+        """按字典项 metadata 查询编码，用于把默认项、推荐项等业务含义放到字典表维护。"""
+
+        rows = self.list_dictionary_items(dictionary_code=dictionary_code)
+        for row in rows:
+            if int(row.get("enabled") or 0) != 1:
+                continue
+            raw_metadata = row.get("metadata_json")
+            if not raw_metadata:
+                continue
+            try:
+                metadata = json.loads(str(raw_metadata))
+            except json.JSONDecodeError:
+                continue
+            if metadata.get(metadata_key) == metadata_value:
+                return str(row["item_code"])
+        return None
+
+    def normalize_dictionary_code(self, dictionary_code: str, value: str | None = None) -> str:
+        """按字典表归一化编码；非法或空值时返回该字典的默认编码。"""
+
+        enabled_codes = set(self.list_enabled_dictionary_codes(dictionary_code))
+        default_code = self.get_default_dictionary_code(dictionary_code)
+        normalized_value = str(value or default_code).strip().lower()
+        if normalized_value in enabled_codes:
+            return normalized_value
+        return default_code
 
     @staticmethod
     def _ensure_document_columns(conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
         migrations = {
             "collection_name": "ALTER TABLE documents ADD COLUMN collection_name TEXT NOT NULL DEFAULT 'agent'",
-            "document_type": "ALTER TABLE documents ADD COLUMN document_type TEXT NOT NULL DEFAULT 'general'",
+            "document_type": "ALTER TABLE documents ADD COLUMN document_type TEXT NOT NULL DEFAULT 'text'",
             "split_strategy": "ALTER TABLE documents ADD COLUMN split_strategy TEXT NOT NULL DEFAULT 'recursive'",
         }
         for column_name, statement in migrations.items():
@@ -175,7 +446,7 @@ class KnowledgeStore:
             file_size: int,
             status: str = "uploaded",
             collection_name: str = "agent",
-            document_type: str = "general",
+            document_type: str = "text",
             split_strategy: str = "recursive",
     ) -> dict[str, Any]:
         now = utc_now_text()
@@ -280,7 +551,7 @@ class KnowledgeStore:
         version = int(document["version"]) + 1 if increment_version else int(document["version"])
         final_chunk_count = int(document["chunk_count"]) if chunk_count is None else chunk_count
         final_collection_name = collection_name or document.get("collection_name") or "agent"
-        final_document_type = document_type or document.get("document_type") or "general"
+        final_document_type = document_type or document.get("document_type") or "text"
         final_split_strategy = split_strategy or document.get("split_strategy") or "recursive"
 
         with self.connect() as conn:
@@ -580,21 +851,21 @@ class KnowledgeStore:
     def delete_units(self, document_id: str) -> None:
         return None
 
-    def replace_segments_and_faqs(
+    def replace_segments_and_qas(
             self,
             document_id: str,
             segments: list[dict[str, Any]],
-            faq_items: list[dict[str, Any]],
+            qa_items: list[dict[str, Any]],
     ) -> None:
         return None
 
     def search_segments_by_keywords(self, keywords: list[str], limit: int = 20) -> list[dict[str, Any]]:
         return []
 
-    def find_faq_document(self, document_hint: str | None = None) -> dict[str, Any] | None:
+    def find_qa_document(self, document_hint: str | None = None) -> dict[str, Any] | None:
         return None
 
-    def search_faq_items_by_question(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def search_qa_items_by_question(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         return []
 
     def search_units_by_keywords(self, keywords: list[str], limit: int = 20) -> list[dict[str, Any]]:

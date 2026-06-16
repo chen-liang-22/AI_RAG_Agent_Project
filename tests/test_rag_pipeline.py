@@ -9,7 +9,7 @@ from rag.vector_store import VectorStoreService
 def test_build_metadata_filter_uses_qdrant_metadata_prefix():
     qdrant_filter = VectorStoreService.build_metadata_filter(
         {
-            "unit_type": ["faq", ""],
+            "unit_type": ["qa", ""],
             "category": ["常见问答", "选购指南"],
         }
     )
@@ -19,14 +19,14 @@ def test_build_metadata_filter_uses_qdrant_metadata_prefix():
         "metadata.unit_type",
         "metadata.category",
     ]
-    assert qdrant_filter.must[0].match.any == ["faq"]
+    assert qdrant_filter.must[0].match.any == ["qa"]
 
 
 def test_rerank_by_query_keeps_query_coverage_and_deduplicates():
     reranker = RuleBasedReranker()
     analysis = QueryAnalysis(
         original_query="扫地机器人选购和故障",
-        intents=["purchase", "troubleshooting"],
+        intents=["purchase", "problem"],
         keywords=["选购", "故障"],
     )
     shared = Document(page_content="扫地机器人选购建议", metadata={"unit_id": "u1", "_vector_score": 0.7})
@@ -193,7 +193,7 @@ def test_retrieve_one_query_skips_metadata_filter_when_disabled(monkeypatch):
     service.vector_store = FakeVectorStore()
     analysis = QueryAnalysis(
         original_query="大户型",
-        filters={"unit_type": ["guide"]},
+        filters={"unit_type": ["numbered"]},
     )
 
     _, documents = service._retrieve_one_query(0, "大户型", analysis)

@@ -31,6 +31,12 @@ from utils.qdrant_options import normalize_qdrant_collection_name
 router = APIRouter()
 
 
+def _conversation_status(item_code: str) -> str:
+    """从会话状态字典读取状态码，避免聊天路由里散落状态常量。"""
+
+    return _get_knowledge_store().normalize_dictionary_code("conversation_status", item_code)
+
+
 def _conversation_summary(row: dict) -> ConversationSummaryResponse:
     """把 SQLite 会话行转换成前端列表响应。"""
 
@@ -125,7 +131,7 @@ def get_conversation_detail(conversation_id: str) -> ConversationDetailResponse:
     logger.info("[接口] 查询聊天记录详情 会话编号=%s", conversation_id)
     store = _get_knowledge_store()
     conversation = store.get_conversation(conversation_id)
-    if conversation is None or conversation.get("status") == "deleted":
+    if conversation is None or conversation.get("status") == _conversation_status("deleted"):
         raise HTTPException(status_code=404, detail="会话不存在")
 
     messages = store.list_conversation_messages(conversation_id)
@@ -144,7 +150,7 @@ def delete_conversation(conversation_id: str) -> ConversationDeleteResponse:
     if not deleted:
         raise HTTPException(status_code=404, detail="会话不存在或已删除")
 
-    return ConversationDeleteResponse(status="deleted", conversation_id=conversation_id)
+    return ConversationDeleteResponse(status=_conversation_status("deleted"), conversation_id=conversation_id)
 
 
 @router.post("/chat", response_model=ChatResponse)

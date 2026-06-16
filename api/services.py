@@ -38,7 +38,7 @@ def _get_knowledge_store() -> KnowledgeStore:
 
 
 def _document_to_response(document: dict) -> KnowledgeFileResponse:
-    """把 SQLite 字典记录转换成 FastAPI 响应模型。
+    """把 SQLite 文档记录转换成 FastAPI 响应模型。
 
     SQLite 取出来的数字字段有时可能是字符串或兼容类型，这里统一转成 int，
     这样前端拿到的数据类型更稳定。
@@ -55,8 +55,11 @@ def _document_to_response(document: dict) -> KnowledgeFileResponse:
         version=int(document["version"]),
         chunk_count=int(document["chunk_count"]),
         collection_name=document.get("collection_name") or get_qdrant_collection_name(),
-        document_type=document.get("document_type") or "general",
-        split_strategy=document.get("split_strategy") or "recursive",
+        document_type=_normalize_document_structure_type(
+            document.get("document_type"),
+            document.get("split_strategy"),
+        ),
+        split_strategy=_normalize_split_strategy(document.get("split_strategy")),
         created_at=document["created_at"],
         updated_at=document["updated_at"],
         error_message=document.get("error_message"),
@@ -64,12 +67,7 @@ def _document_to_response(document: dict) -> KnowledgeFileResponse:
 
 
 def _sanitize_upload_filename(filename: str | None) -> str:
-    """清理上传文件名，避免用户传入带目录的路径。
-
-    浏览器正常只会上送文件名，比如 `guide.pdf`。
-    但接口调用方也可能传 `C:\\tmp\\guide.pdf` 或 `../../guide.pdf`。
-    后端只保留最后的文件名部分，避免把文件写到 uploads/ 之外。
-    """
+    """清理上传文件名，避免用户传入带目录的路径。"""
 
     raw_filename = (filename or "").strip()
     safe_filename = raw_filename.replace("\\", "/").split("/")[-1].strip()
@@ -82,11 +80,7 @@ def _sanitize_upload_filename(filename: str | None) -> str:
 
 
 def _validate_file_type(filename: str) -> str:
-    """校验上传文件后缀是否在配置允许范围内。
-
-    允许类型来自 config/qdrant.yml：
-    allow_knowledge_file_type: ["txt", "pdf"]
-    """
+    """校验上传文件后缀是否在配置允许范围内。"""
 
     file_type = os.path.splitext(filename)[1].lower().lstrip(".")
     allowed_types = {item.lower().lstrip(".") for item in qdrant_conf["allow_knowledge_file_type"]}
@@ -98,18 +92,43 @@ def _validate_file_type(filename: str) -> str:
     return file_type
 
 
-def _remove_created_upload_dir(upload_dir: str) -> None:
-    """删除本次上传刚创建的目录。
+def _normalize_split_strategy(split_strategy: str | None = None) -> str:
+    """从字典表归一化切分策略。"""
 
-    只在重复上传或保存失败时使用。
-    删除前会校验目标目录必须位于项目 uploads/ 目录内，避免误删其它路径。
-    """
+    return _get_knowledge_store().normalize_dictionary_code("split_strategy", split_strategy)
+
+
+def _normalize_document_structure_type(
+        document_type: str | None = None,
+        split_strategy: str | None = None,
+) -> str:
+    """从字典表归一化文档结构类型。"""
+
+    store = _get_knowledge_store()
+    enabled_codes = set(store.list_enabled_dictionary_codes("document_structure"))
+    default_code = store.normalize_dictionary_code("document_structure", None)
+    value = str(document_type or "").strip().lower()
+    normalized_split_strategy = _normalize_split_strategy(split_strategy)
+    if normalized_split_strategy in {"numbered_qa", "outline_qa"} and "qa" in enabled_codes:
+        return "qa"
+    if normalized_split_strategy == "numbered_segments" and "numbered" in enabled_codes:
+        return "numbered"
+    if value in enabled_codes:
+        return value
+    if not value:
+        return default_code
+    supported_text = "、".join(sorted(enabled_codes))
+    raise HTTPException(status_code=400, detail=f"文档结构类型只支持：{supported_text}")
+
+
+def _remove_created_upload_dir(upload_dir: str) -> None:
+    """删除本次上传刚创建的临时目录。"""
 
     uploads_root = os.path.abspath(get_abs_path("uploads"))
     target_dir = os.path.abspath(upload_dir)
 
     if os.path.commonpath([uploads_root, target_dir]) != uploads_root:
-        logger.warning(f"[知识库] 跳过不安全的上传目录清理 目录={target_dir}")
+        logger.warning("[知识库] 跳过不安全的上传目录清理 目录=%s", target_dir)
         return
 
     shutil.rmtree(target_dir, ignore_errors=True)
@@ -141,7 +160,7 @@ def _save_preview_file(file: UploadFile, filename: str, upload_id: str) -> tuple
                     break
                 file_size += len(chunk)
                 target.write(chunk)
-    except Exception:
+    except OSError:
         _remove_created_upload_dir(preview_dir)
         raise
 
@@ -180,7 +199,7 @@ def _slice_text_window(text: str, start: int, length: int) -> str:
 
 
 def _build_structure_sample(full_text: str, *, max_chars: int = 10000) -> str:
-    """从全文中抽取开头、中间、结尾样本，供模型判断切分方式。"""
+    """从全文中抽取开头、中间和结尾样本，供模型判断切分方式。"""
 
     clean_text = re.sub(r"\n{3,}", "\n\n", full_text).strip()
     if len(clean_text) <= max_chars:
@@ -202,14 +221,17 @@ def _build_structure_sample(full_text: str, *, max_chars: int = 10000) -> str:
         if part.strip()
     )[:max_chars]
 
-
 def _analyze_structure_text(text: str) -> dict:
     """统计样本文本中的结构特征，辅助模型判断文档切分策略。"""
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    numbered_lines = [line for line in lines if re.match(r"^\d+[.、\)]\s*", line)]
+    numbered_lines = [line for line in lines if re.match(r"^\d+[.、)]\s*", line)]
     qa_lines = [line for line in lines if re.match(r"^(Q|A|问|答)[:：]", line, re.IGNORECASE)]
-    heading_lines = [line for line in lines if re.match(r"^(#{1,6}\s+|第[一二三四五六七八九十\d]+[章节]|[一二三四五六七八九十]+[、.])", line)]
+    heading_lines = [
+        line
+        for line in lines
+        if re.match(r"^(#{1,6}\s+|第[一二三四五六七八九十\d]+[章节]|[一二三四五六七八九十]+[、.])", line)
+    ]
     return {
         "line_count": len(lines),
         "numbered_line_count": len(numbered_lines),
@@ -235,25 +257,16 @@ def _parse_model_json(content: object) -> dict:
 
 
 def _normalize_recommendation(value: dict) -> dict:
-    """校验并归一化模型推荐结果，避免非法类型进入前端。"""
+    """根据字典表校验并归一化模型推荐结果。"""
 
-    allowed_document_types = {
-        "faq",
-        "manual",
-        "troubleshooting",
-        "maintenance",
-        "policy",
-        "spec",
-        "guide",
-        "general",
-    }
-    allowed_split_strategies = {"numbered_qa", "numbered_segments", "recursive"}
-    document_type = str(value.get("document_type") or "general").strip().lower()
-    split_strategy = str(value.get("split_strategy") or "recursive").strip().lower()
-    if document_type not in allowed_document_types:
-        document_type = "general"
-    if split_strategy not in allowed_split_strategies:
-        split_strategy = "recursive"
+    store = _get_knowledge_store()
+    document_type_codes = set(store.list_enabled_dictionary_codes("document_structure"))
+    split_strategy = _normalize_split_strategy(value.get("split_strategy"))
+    raw_document_type = str(value.get("document_type") or "").strip().lower()
+    if raw_document_type in document_type_codes:
+        document_type = _normalize_document_structure_type(raw_document_type, split_strategy)
+    else:
+        document_type = _normalize_document_structure_type(None, split_strategy)
 
     try:
         confidence = float(value.get("confidence") or 0.6)
@@ -268,13 +281,37 @@ def _normalize_recommendation(value: dict) -> dict:
         reasons = [str(reason).strip() for reason in raw_reasons if str(reason).strip()]
     else:
         reasons = []
+    if raw_document_type not in document_type_codes:
+        reasons.insert(0, "模型返回了非支持结构类型，已按切分策略回退到合法文档类型")
 
     return {
         "document_type": document_type,
         "split_strategy": split_strategy,
         "confidence": confidence,
-        "reasons": reasons[:5] or ["模型根据文档结构样本给出推荐。"],
+        "reasons": reasons[:5] or ["模型根据文档结构样本给出推荐"],
     }
+
+
+def _dictionary_options_text(dictionary_code: str) -> str:
+    """把启用字典项拼成给模型看的枚举说明，避免 prompt 里散落固定可选值。"""
+
+    rows = _get_knowledge_store().list_dictionary_items(dictionary_code=dictionary_code)
+    options = [
+        f"{row['item_code']}（{row['item_name']}）"
+        for row in rows
+        if int(row.get("enabled") or 0) == 1
+    ]
+    return "、".join(options)
+
+
+def _get_recommendation_model_mode() -> str:
+    """从模型档位字典中读取用于切分推荐的小模型档位。"""
+
+    store = _get_knowledge_store()
+    return (
+        store.get_dictionary_code_by_metadata("model_mode", "recommendation", True)
+        or store.normalize_dictionary_code("model_mode", None)
+    )
 
 
 def _recommend_upload_split_strategy(upload_id: str) -> dict:
@@ -292,8 +329,10 @@ def _recommend_upload_split_strategy(upload_id: str) -> dict:
         raise HTTPException(status_code=400, detail="文件没有可用于模型推荐的文本内容")
 
     structure = _analyze_structure_text(sample_text)
-    selected_model_mode = "low"
+    selected_model_mode = _get_recommendation_model_mode()
     selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
+    document_type_options = _dictionary_options_text("document_structure")
+    split_strategy_options = _dictionary_options_text("split_strategy")
     logger.info(
         "[知识库] 模型推荐切分方式开始 上传编号=%s 文件名=%s 模型名称=%s 样本字符数=%s 结构统计=%s",
         upload_id,
@@ -315,16 +354,18 @@ def _recommend_upload_split_strategy(upload_id: str) -> dict:
             HumanMessage(
                 content=(
                     "请从以下枚举中选择：\n"
-                    "document_type: faq, manual, troubleshooting, maintenance, policy, spec, guide, general\n"
-                    "split_strategy: numbered_qa, numbered_segments, recursive\n\n"
+                    f"document_type: {document_type_options}\n"
+                    f"split_strategy: {split_strategy_options}\n\n"
                     "判断原则：\n"
-                    "- 明确题目/答案、FAQ、面试问答，优先 numbered_qa。\n"
-                    "- 大量编号条目但不是问答，优先 numbered_segments。\n"
-                    "- 结构不稳定、普通文章、长段落，使用 recursive。\n\n"
+                    "- 编号问答型：document_type=qa，split_strategy=numbered_qa。\n"
+                    "- PDF目录问答型：document_type=qa，split_strategy=outline_qa。"
+                    "只有目录或样本清楚呈现“章节 -> 问题”时才使用，不要把普通目录 PDF 误判成这种策略。\n"
+                    "- 编号条目型：document_type=numbered，split_strategy=numbered_segments。\n"
+                    "- 普通文本型：document_type=text，split_strategy=recursive。\n\n"
                     f"文件名：{filename}\n文件类型：{file_type}\n结构统计：{json.dumps(structure, ensure_ascii=False)}\n\n"
                     f"文档结构样本：\n{sample_text}\n\n"
                     "返回 JSON 格式："
-                    '{"document_type":"general","split_strategy":"recursive","confidence":0.75,"reasons":["原因1","原因2"]}'
+                    '{"document_type":"text","split_strategy":"recursive","confidence":0.75,"reasons":["原因1","原因2"]}'
                 )
             ),
         ]
@@ -367,8 +408,11 @@ def _index_document(
 
     document_id = document["document_id"]
     final_collection_name = normalize_qdrant_collection_name(collection_name or document.get("collection_name"))
-    final_document_type = document_type or document.get("document_type") or "general"
-    final_split_strategy = split_strategy or document.get("split_strategy") or "recursive"
+    final_split_strategy = _normalize_split_strategy(split_strategy or document.get("split_strategy"))
+    final_document_type = _normalize_document_structure_type(
+        document_type or document.get("document_type"),
+        final_split_strategy,
+    )
     store.update_document_status(
         document_id,
         "indexing",
@@ -406,7 +450,7 @@ def _index_document(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error(f"[知识库] 文件入库失败 文档编号={document_id} 错误={exc}", exc_info=True)
+        logger.error("[知识库] 文件入库失败 文档编号=%s 错误=%s", document_id, exc, exc_info=True)
         store.update_document_status(
             document_id,
             "failed",
@@ -444,20 +488,21 @@ def _data_manifest_entry(filename: str, manifest: dict) -> dict:
     entry = files.get(filename) or {}
     return {
         "collection_name": normalize_qdrant_collection_name(entry.get("collection_name") or defaults.get("collection_name")),
-        "document_type": entry.get("document_type") or defaults.get("document_type") or "general",
-        "split_strategy": entry.get("split_strategy") or defaults.get("split_strategy") or "recursive",
+        "document_type": _normalize_document_structure_type(
+            entry.get("document_type") or defaults.get("document_type"),
+            entry.get("split_strategy") or defaults.get("split_strategy"),
+        ),
+        "split_strategy": _normalize_split_strategy(entry.get("split_strategy") or defaults.get("split_strategy")),
     }
 
 
 def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
     """把 data/ 目录中的内置知识文件同步到 documents 表。
 
-    用户手动上传的文件会保存在 uploads/ 目录，而项目自带的示例/基础知识文件
-    通常放在 data/ 目录。为了让这两类文件都能进入 documents 管理，
-    reload 时先把 data/ 文件注册成 documents 记录，再统一走 _index_document。
+    用户手动上传的文件保存在 uploads/ 目录，项目自带的示例或基础知识文件通常放在 data/ 目录。
+    reload 时先把 data/ 文件注册成 documents 记录，再统一调用 _index_document 入库。
 
-    同一个文件内容按 MD5 去重：如果 active documents 中已有相同 MD5，就复用
-    已有记录，不重复创建。
+    同一份内容按 MD5 去重：如果 active documents 中已有相同 MD5，就复用已有记录。
     """
 
     data_path = get_abs_path(qdrant_conf["data_path"])
@@ -473,7 +518,7 @@ def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
         file_md5 = get_file_md5_hex(file_path)
 
         if not file_md5:
-            logger.warning(f"[知识库] 跳过无法计算MD5的内置知识文件 路径={file_path}")
+            logger.warning("[知识库] 跳过无法计算 MD5 的内置知识文件 路径=%s", file_path)
             continue
 
         existing_document = store.find_active_document_by_md5(
@@ -512,42 +557,27 @@ def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
 
 
 def _get_agent():
-    """获取全局 Agent 单例。
+    """获取全局 Agent 单例。"""
 
-    Agent 初始化会加载模型、工具、提示词和 RAG 检索链路，成本比较高。
-    因此这里使用懒加载：
-    - 第一次真正收到聊天请求时才创建 ReactAgent。
-    - 后续请求复用同一个 Agent 实例，避免每次请求都重新初始化。
-
-    `_agent_lock` 用于防止并发首个请求同时初始化多个 Agent。
-    """
-
-    global _agent  # 函数内部要给模块级变量 _agent 赋值，因此需要 global
+    global _agent
 
     if _agent is not None:
-        return _agent  # 已初始化过就直接复用，避免重复加载模型和工具
+        return _agent
 
     with _agent_lock:
-        # 进入锁之后再判断一次，防止两个请求排队时后一个重复初始化。
         if _agent is None:
             try:
                 from agent.react_agent import ReactAgent  # 延迟导入，避免应用启动时就加载模型和向量库
 
-                _agent = ReactAgent()  # 创建真正的 ReAct Agent 实例
+                _agent = ReactAgent()
             except Exception as exc:
-                # Agent 初始化失败时，返回 500，让前端能看到明确错误。
-                raise HTTPException(status_code=500, detail=f"Agent initialization failed: {exc}") from exc
+                raise HTTPException(status_code=500, detail=f"Agent 初始化失败：{exc}") from exc
 
-    return _agent  # 返回初始化好的 Agent
+    return _agent
 
 
 def _get_knowledge_answer_service():
-    """获取知识库直答服务单例。
-
-    普通知识问答走这条直线路径：
-    用户问题 -> Query Planner -> Qdrant -> 最终回答模型。
-    这条路径不会绑定 Agent 工具，所以不会触发“模型判断是否调用 rag_summarize”。
-    """
+    """获取知识库直答服务单例。"""
 
     global _knowledge_answer_service
 
@@ -564,8 +594,6 @@ def _get_knowledge_answer_service():
                 raise HTTPException(status_code=500, detail=f"知识库直答服务初始化失败：{exc}") from exc
 
     return _knowledge_answer_service
-
-
 def _get_chat_route_mode() -> str:
     """读取聊天路由模式；不配置时默认直连 RAG。"""
 
@@ -578,16 +606,11 @@ def _get_chat_route_mode() -> str:
 
 
 def _should_use_direct_rag(message: str) -> tuple[bool, str]:
-    """判断当前问题是否走知识库直答。
-
-    这里不再按关键词猜意图：
-    - 不配置 chat_route_mode：默认全部走直连 RAG。
-    - chat_route_mode: agent：恢复之前的 Agent 工具链。
-    """
+    """判断当前问题是否走知识库直答。"""
 
     mode = _get_chat_route_mode()
     if mode in {"agent", "react_agent", "legacy_agent"}:
-        return False, "配置 chat_route_mode=agent，使用之前的 Agent 工具链"
+        return False, "配置 chat_route_mode=agent，使用 Agent 工具链"
 
     return True, f"配置 chat_route_mode={mode}，使用直连 RAG"
 
@@ -601,25 +624,14 @@ def _build_conversation_title(message: str) -> str:
 def _prepare_chat_conversation(request: ChatRequest) -> tuple[str, list[dict]]:
     """创建或读取会话，并返回 conversation_id 和最近历史。"""
 
-    # KnowledgeStore 是 SQLite 元数据仓库，负责 documents 和 conversations 等业务表。
     store = _get_knowledge_store()
-
-    # 如果 request.conversation_id 已存在，则复用旧会话。
-    # 如果前端没有传 conversation_id，则创建新会话，并用当前问题生成一个短标题。
     conversation = store.ensure_conversation(
         conversation_id=request.conversation_id,
         user_id=request.user_id,
         title=_build_conversation_title(request.message),
     )
-
-    # 统一取出最终使用的 conversation_id；新建会话时这个值由后端生成。
     conversation_id = conversation["conversation_id"]
-
-    # 读取最近 20 条历史消息，传给后续模型做上下文。
-    # 这里不会读取整段会话，避免 prompt 越来越长。
     history = store.list_recent_messages(conversation_id, limit=20)
-
-    # 返回给路由层：conversation_id 用于响应和保存历史，history 用于 RAG/Agent 上下文。
     return conversation_id, history
 
 
@@ -642,40 +654,26 @@ def _save_chat_exchange(
         metadata=metadata,
     )
 
-
 def _stream_agent(
         message: str,
         user_id: str | None = None,
         conversation_id: str | None = None,
         history: list[dict] | None = None,
 ) -> Iterator[str]:
-    """把 Agent 的 token 流转换成浏览器能识别的 SSE 文本流。
+    """把 Agent token 流转换成浏览器能识别的 SSE 文本流。"""
 
-    SSE(Server-Sent Events) 的基础格式是：
-
-        event: 事件名
-        data: JSON 字符串
-
-    每个事件之间必须用一个空行分隔，也就是末尾的 `\n\n`。
-    前端会按空行切分事件，再解析 `data:` 后面的 JSON。
-
-    本项目约定了三类事件：
-    - chunk：正常回答片段，格式为 `{"content": "..."}`
-    - done：回答结束，格式为 `{"done": true}`
-    - error：生成失败，格式为 `{"error": "..."}`
-
-    注意：这里拿到的是 `ReactAgent.execute_stream()` 已经过滤后的内容，
-    只包含最终 AI 回答 token，不包含 RAG 工具返回的参考资料或元数据。
-    """
-
-    try:  # 流式生成期间任何异常都会转成 SSE error 事件
+    try:
         stream_start_time = time.perf_counter()
         first_token_ms: float | None = None
         selected_model_mode = normalize_chat_model_mode(None)
         selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
         logger.info(
-            f"[接口] Agent流式输出开始 用户编号={user_id} 会话编号={conversation_id} "
-            f"模型模式={selected_model_mode} 模型名称={selected_model_name} 问题={message}"
+            "[接口] Agent流式输出开始 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s 问题=%s",
+            user_id,
+            conversation_id,
+            selected_model_mode,
+            selected_model_name,
+            message,
         )
         meta_payload = json.dumps(
             {
@@ -694,15 +692,13 @@ def _stream_agent(
                 conversation_id=conversation_id,
                 history=history or [],
         ):
-            # ensure_ascii=False 可以让中文直接以 UTF-8 传给前端，
-            # 避免浏览器端看到 \u4f60\u597d 这种转义内容。
             if first_token_ms is None:
                 first_token_ms = _elapsed_ms(stream_start_time)
                 metric_payload = json.dumps({"first_token_ms": first_token_ms}, ensure_ascii=False)
                 yield f"event: metric\ndata: {metric_payload}\n\n"
             chunks.append(chunk)
-            payload = json.dumps({"content": chunk}, ensure_ascii=False)  # 把文本片段包装成 JSON
-            yield f"event: chunk\ndata: {payload}\n\n"  # yield 一次，浏览器就有机会收到一个 SSE chunk
+            payload = json.dumps({"content": chunk}, ensure_ascii=False)
+            yield f"event: chunk\ndata: {payload}\n\n"
 
         answer = "".join(chunks).strip()
         total_ms = _elapsed_ms(stream_start_time)
@@ -722,8 +718,11 @@ def _stream_agent(
             )
 
         logger.info(
-            f"[接口] Agent流式输出完成 用户编号={user_id} 会话编号={conversation_id} "
-            f"模型模式={selected_model_mode} 模型名称={selected_model_name}"
+            "[接口] Agent流式输出完成 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s",
+            user_id,
+            conversation_id,
+            selected_model_mode,
+            selected_model_name,
         )
         done_payload = json.dumps(
             {
@@ -736,13 +735,11 @@ def _stream_agent(
             },
             ensure_ascii=False,
         )
-        yield f"event: done\ndata: {done_payload}\n\n"  # 告诉前端流式回答已经结束
+        yield f"event: done\ndata: {done_payload}\n\n"
     except Exception as exc:
-        logger.error(f"[接口] Agent流式输出失败 用户编号={user_id} 错误={exc}", exc_info=True)
-        # 流式响应已经开始后，HTTP 状态码通常不能再改成 500。
-        # 因此这里用 SSE error 事件把错误发给前端，让前端显示错误消息。
-        payload = json.dumps({"error": str(exc)}, ensure_ascii=False)  # 把异常信息包装成 JSON
-        yield f"event: error\ndata: {payload}\n\n"  # 用 SSE error 事件通知前端
+        logger.error("[接口] Agent流式输出失败 用户编号=%s 错误=%s", user_id, exc, exc_info=True)
+        payload = json.dumps({"error": str(exc)}, ensure_ascii=False)
+        yield f"event: error\ndata: {payload}\n\n"
 
 
 def _stream_direct_rag(
@@ -753,11 +750,7 @@ def _stream_direct_rag(
         model_mode: str | None = None,
         collection_name: str | None = None,
 ) -> Iterator[str]:
-    """把知识库直答 token 流转换成 SSE 文本流。
-
-    这个生成器会被 FastAPI 的 StreamingResponse 消费。
-    只要这里 yield 一段文本，前端就有机会立刻收到一段内容。
-    """
+    """把知识库直答 token 流转换成 SSE 文本流。"""
 
     try:
         stream_start_time = time.perf_counter()
@@ -765,9 +758,8 @@ def _stream_direct_rag(
         selected_model_mode = normalize_chat_model_mode(model_mode)
         selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
         selected_collection_name = normalize_qdrant_collection_name(collection_name)
-        # 记录当前流式请求进入 direct_rag 链路。
         logger.info(
-            "[聊天路由] 流式接口走知识直答 用户编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 问题=%s",
+            "[聊天路由] 流式接口进入知识库直答 用户编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 问题=%s",
             user_id,
             conversation_id,
             selected_collection_name,
@@ -776,8 +768,6 @@ def _stream_direct_rag(
             message,
         )
 
-        # 先发一个 meta 事件给前端。
-        # 前端可以在收到正文前就拿到 conversation_id，并知道当前模式是 direct_rag。
         meta_payload = json.dumps(
             {
                 "conversation_id": conversation_id,
@@ -788,43 +778,26 @@ def _stream_direct_rag(
             },
             ensure_ascii=False,
         )
-
-        # SSE 格式要求：
-        # event: 事件名
-        # data: JSON 字符串
-        # 空行表示一个事件结束。
         yield f"event: meta\ndata: {meta_payload}\n\n"
 
-        # 用列表缓存所有 chunk，流式结束后拼成完整回答并保存到 SQLite。
         chunks: list[str] = []
-
-        # 调用知识库直答服务：
-        # 内部流程是 RAG 检索上下文 -> 调用最终回答模型 stream() -> 逐段返回文本。
         for chunk in _get_knowledge_answer_service().stream_answer(
             message,
             history=history or [],
             model_mode=selected_model_mode,
             collection_name=selected_collection_name,
         ):
-            # 保存当前分片，后面用于拼接完整回答。
             if first_token_ms is None:
                 first_token_ms = _elapsed_ms(stream_start_time)
                 metric_payload = json.dumps({"first_token_ms": first_token_ms}, ensure_ascii=False)
                 yield f"event: metric\ndata: {metric_payload}\n\n"
             chunks.append(chunk)
-
-            # 把文本分片包装成 JSON，ensure_ascii=False 保证中文直接输出。
             payload = json.dumps({"content": chunk}, ensure_ascii=False)
-
-            # 发给前端一个 chunk 事件。
-            # 前端收到后会把 content 追加到聊天气泡里。
             yield f"event: chunk\ndata: {payload}\n\n"
 
-        # 模型流结束后，把所有分片拼成最终回答。
         answer = "".join(chunks).strip()
         total_ms = _elapsed_ms(stream_start_time)
 
-        # 如果有会话编号且回答非空，就把“用户问题 + 助手回答”保存到 SQLite。
         if conversation_id and answer:
             _save_chat_exchange(
                 conversation_id=conversation_id,
@@ -841,7 +814,6 @@ def _stream_direct_rag(
                 },
             )
 
-        # 记录后端流式生成结束。
         logger.info(
             "[聊天路由] 知识直答流式完成 用户编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s",
             user_id,
@@ -851,7 +823,6 @@ def _stream_direct_rag(
             selected_model_name,
         )
 
-        # 通知前端本次流式回答结束。
         done_payload = json.dumps(
             {
                 "done": True,
@@ -866,14 +837,8 @@ def _stream_direct_rag(
         )
         yield f"event: done\ndata: {done_payload}\n\n"
     except Exception as exc:
-        # 流式响应开始后，HTTP 状态码通常已经发给浏览器了。
-        # 所以异常不能再改成 500，只能通过 SSE error 事件告诉前端。
         logger.error("[聊天路由] 知识直答流式失败 用户编号=%s 错误=%s", user_id, exc, exc_info=True)
-
-        # 把错误消息包装成 JSON 并推给前端。
         payload = json.dumps({"error": str(exc)}, ensure_ascii=False)
         yield f"event: error\ndata: {payload}\n\n"
-
-
 def _elapsed_ms(start_time: float) -> float:
     return (time.perf_counter() - start_time) * 1000

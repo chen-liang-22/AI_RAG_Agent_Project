@@ -29,6 +29,18 @@ def test_openapi_exposes_core_routes():
     assert "/knowledge/files/reindex-all" in paths
     assert "/knowledge/files/{document_id}/reindex" in paths
     assert "/knowledge/reload" in paths
+    assert "/dictionaries" in paths
+
+
+def test_dictionaries_return_document_structure_items():
+    client = TestClient(app)
+
+    response = client.get("/dictionaries?dictionary_code=document_structure")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data[0]["dictionary_code"] == "document_structure"
+    assert {item["item_code"] for item in data[0]["items"]} == {"qa", "numbered", "text"}
 
 
 def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch):
@@ -50,6 +62,9 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
                 "status": "indexed",
                 "version": 1,
                 "chunk_count": 3,
+                "collection_name": "agent",
+                "document_type": "text",
+                "split_strategy": "recursive",
                 "created_at": "2026-01-01T00:00:00",
                 "updated_at": "2026-01-01T00:00:00",
                 "error_message": None,

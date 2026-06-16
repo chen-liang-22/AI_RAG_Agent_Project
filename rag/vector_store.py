@@ -113,7 +113,7 @@ class VectorStoreService:
         filters 的结构来自 QueryAnalysis，例如：
 
             {
-                "unit_type": ["guide", "faq"],
+                "unit_type": ["qa", "numbered"],
                 "category": ["选购指南", "常见问答"]
             }
 
@@ -194,14 +194,15 @@ class VectorStoreService:
 
         documents = self.get_file_documents(file_path)
         sample_text = "\n\n".join(document.page_content for document in documents)[:sample_limit]
-        detection = self.document_parser.detect_document_type(filename, sample_text)
+        outline = documents[0].metadata.get("_pdf_outline") if documents else None
+        detection = self.document_parser.detect_document_type(filename, sample_text, outline=outline)
         return {
             "filename": filename,
-            "document_type": "general",
-            "split_strategy": "recursive",
-            "confidence": 1.0,
-            "reasons": ["默认使用通用递归切分；如需更精细切分，可在确认入库前手动选择或使用模型推荐。"],
-            "llm_used": False,
+            "document_type": detection.document_type,
+            "split_strategy": detection.split_strategy,
+            "confidence": detection.confidence,
+            "reasons": detection.reasons,
+            "llm_used": detection.llm_used,
             "sample_text": sample_text,
         }
 
@@ -215,9 +216,51 @@ class VectorStoreService:
             return txt_loader(read_path)
 
         if lower_read_path.endswith(".pdf"):
-            return pdf_loader(read_path)
+            documents = pdf_loader(read_path)
+            outline = VectorStoreService.read_pdf_outline(read_path)
+            if documents and outline:
+                documents[0].metadata["_pdf_outline"] = outline
+            return documents
 
         return []
+
+    @staticmethod
+    def read_pdf_outline(read_path: str) -> list[dict]:
+        """读取 PDF 书签目录，返回 level/title/page 结构。"""
+
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(read_path)
+            outline_items: list[dict] = []
+
+            def walk(items, level: int = 0) -> None:
+                for item in items:
+                    if isinstance(item, list):
+                        walk(item, level + 1)
+                        continue
+
+                    title = str(getattr(item, "title", item)).strip()
+                    if not title:
+                        continue
+                    try:
+                        page_no = reader.get_destination_page_number(item) + 1
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        page_no = None
+
+                    outline_items.append(
+                        {
+                            "level": level,
+                            "title": title,
+                            "page": page_no,
+                        }
+                    )
+
+            walk(reader.outline)
+            return outline_items
+        except (ImportError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            logger.warning("[知识库] PDF书签读取失败 文件=%s 错误=%s", read_path, exc)
+            return []
 
     def build_index_documents(
             self,
@@ -232,26 +275,26 @@ class VectorStoreService:
     ) -> list[Document]:
         """把原始 Document 切分成可写入 Qdrant 的文档。
 
-        segments / faq_items 只在内存中用于构造 Qdrant payload。
+        segments / qa_items 只在内存中用于构造 Qdrant payload。
         SQLite 不再保存知识正文或 FAQ 答案。
         """
 
-        segments, faq_items = self.document_parser.build_segments_and_faqs(
+        segments, qa_items = self.document_parser.build_segments_and_qas(
             document_id=document_id,
             documents=documents,
             document_type=document_type,
             split_strategy=split_strategy,
         )
-        faq_by_segment_id = {item.segment_id: item for item in faq_items}
+        qa_by_segment_id = {item.segment_id: item for item in qa_items}
         index_documents: list[Document] = []
 
         for segment in segments:
-            faq = faq_by_segment_id.get(segment.segment_id)
+            qa_item = qa_by_segment_id.get(segment.segment_id)
             metadata = {
                 "document_id": document_id,
                 "segment_id": segment.segment_id,
                 "chunk_id": segment.segment_id,
-                "content_type": "faq" if faq else "segment",
+                "content_type": "qa" if qa_item else "segment",
                 "document_type": document_type,
                 "unit_type": document_type,
                 "split_strategy": split_strategy,
@@ -263,11 +306,14 @@ class VectorStoreService:
                 "page_no": segment.page_no,
                 "source_page": segment.page_no,
                 "heading_path": segment.heading_path,
-                "question_no": faq.question_no if faq else segment.metadata.get("question_no"),
-                "faq_id": faq.faq_id if faq else None,
-                "question": faq.question if faq else None,
-                "category": faq.category if faq else segment.heading_path,
+                "question_no": qa_item.question_no if qa_item else segment.metadata.get("question_no"),
+                "qa_id": qa_item.qa_id if qa_item else None,
+                "question": qa_item.question if qa_item else None,
+                "category": qa_item.category if qa_item else segment.heading_path,
             }
+            metadata.update(segment.metadata)
+            if qa_item:
+                metadata.update(qa_item.metadata)
 
             index_documents.append(Document(page_content=segment.content, metadata=metadata))
 
@@ -321,7 +367,7 @@ class VectorStoreService:
         if not documents:
             raise ValueError(f"文件 {file_path} 没有有效文本内容")
 
-        document_type = document_type or document.get("document_type") or "general"
+        document_type = document_type or document.get("document_type") or "text"
         split_strategy = split_strategy or document.get("split_strategy") or "recursive"
 
         index_documents = self.build_index_documents(
