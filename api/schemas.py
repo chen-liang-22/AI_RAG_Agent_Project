@@ -84,12 +84,6 @@ class ConversationDeleteResponse(BaseModel):
     conversation_id: str  # 被删除的会话 ID
 
 
-class DebugRetrieveRequest(BaseModel):
-    """RAG 检索调试请求体。"""
-
-    query: str = Field(..., min_length=1)  # 要调试的用户问题
-
-
 class HealthResponse(BaseModel):
     """健康检查响应体，用于前端侧边栏展示服务状态。"""
 
@@ -122,6 +116,46 @@ class DictionaryGroupResponse(BaseModel):
     dictionary_code: str  # 字典编码
     dictionary_name: str  # 字典名称
     items: list[DictionaryItemResponse] = Field(default_factory=list)  # 当前字典的树形字典项
+
+
+class DictionaryGroupCreateRequest(BaseModel):
+    """新增父级字典请求体。"""
+
+    dictionary_code: str = Field(..., min_length=1, max_length=80)  # 字典编码
+    dictionary_name: str = Field(..., min_length=1, max_length=120)  # 字典名称
+
+
+class DictionaryGroupUpdateRequest(BaseModel):
+    """修改父级字典请求体。"""
+
+    dictionary_name: str = Field(..., min_length=1, max_length=120)  # 字典名称
+
+
+class DictionaryItemCreateRequest(BaseModel):
+    """新增字典项请求体。"""
+
+    dictionary_code: str = Field(..., min_length=1, max_length=80)  # 字典编码
+    dictionary_name: str = Field(..., min_length=1, max_length=120)  # 字典名称
+    item_code: str = Field(..., min_length=1, max_length=120)  # 字典项编码
+    item_name: str = Field(..., min_length=1, max_length=120)  # 字典项名称
+    parent_item_id: str | None = None  # 父级字典项 ID；为空表示一级项
+    sort_order: int = 0  # 同级排序号
+    enabled: bool = True  # 是否启用
+    description: str | None = None  # 字典项说明
+    metadata: dict = Field(default_factory=dict)  # 扩展元数据
+
+
+class DictionaryItemUpdateRequest(BaseModel):
+    """修改字典项请求体。"""
+
+    dictionary_name: str | None = Field(default=None, min_length=1, max_length=120)  # 字典名称
+    item_code: str | None = Field(default=None, min_length=1, max_length=120)  # 字典项编码
+    item_name: str | None = Field(default=None, min_length=1, max_length=120)  # 字典项名称
+    parent_item_id: str | None = None  # 父级字典项 ID；为空表示一级项
+    sort_order: int | None = None  # 同级排序号
+    enabled: bool | None = None  # 是否启用
+    description: str | None = None  # 字典项说明
+    metadata: dict | None = None  # 扩展元数据
 
 
 class KnowledgeFileResponse(BaseModel):

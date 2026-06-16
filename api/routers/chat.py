@@ -12,7 +12,6 @@ from api.schemas import (
     ConversationListResponse,
     ConversationMessageResponse,
     ConversationSummaryResponse,
-    DebugRetrieveRequest,
 )
 from api.services import (
     _get_agent,
@@ -402,28 +401,3 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
 
 def _elapsed_ms(start_time: float) -> float:
     return (time.perf_counter() - start_time) * 1000
-
-@router.post("/debug/retrieve")
-def debug_retrieve(request: DebugRetrieveRequest) -> dict:
-    """调试 RAG 检索链路。
-
-    这个接口不会生成最终回答，只展示检索阶段的信息：
-    - intent_analyze 识别到的意图
-    - query_rewrite 生成的子查询
-    - metadata filter
-    - rerank 后的候选资料和分数
-
-    开发阶段可以用它判断“为什么这个问题召回了这些资料”。
-    生产环境如果不想暴露调试信息，可以后续加开关或权限。
-    """
-
-    logger.info(f"[接口] 检索调试请求 问题={request.query}")
-
-    try:
-        from rag.rag_service import RagSummarizeService  # 延迟导入，避免普通接口启动时就初始化向量库
-
-        rag_service = RagSummarizeService()
-        return rag_service.debug_retrieve(request.query)
-    except Exception as exc:
-        logger.error(f"[接口] 检索调试失败 错误={exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"RAG retrieve debug failed: {exc}") from exc

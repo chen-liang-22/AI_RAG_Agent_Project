@@ -348,56 +348,6 @@ class RagSummarizeService(object):
         }
         return any(keyword in lowered_query for keyword in business_keywords)
 
-    def debug_retrieve(self, query: str, collection_name: str | None = None) -> dict:
-        """返回 RAG 检索调试信息。
-
-        这个方法可以给后续 `/debug/retrieve` 接口使用。
-        方便查看：
-        - 识别到的意图
-        - 生成的子查询
-        - metadata filter
-        - 精排后的资料来源和分数
-        """
-
-        analysis = self._build_neutral_analysis(query)
-        self._log_intent_analysis(query, analysis)
-        search_queries, candidate_groups = self._plan_and_retrieve(
-            query,
-            analysis,
-            collection_name=collection_name,
-        )
-        reranked_docs = self.reranker.rerank_by_query(
-            original_query=query,
-            grouped_documents=candidate_groups,
-            analysis=analysis,
-            per_query_keep=int(qdrant_conf.get("per_query_keep", 2) or 2),
-            final_context_limit=int(qdrant_conf.get("final_context_limit", 12) or 12),
-        )
-
-        return {
-            "query": query,
-            "intents": analysis.intents,
-            "sub_queries": search_queries,
-            "filters": analysis.filters,
-            "candidate_count": sum(len(documents) for _, documents in candidate_groups),
-            "groups": [
-                {
-                    "search_query": search_query,
-                    "candidate_count": len(documents),
-                }
-                for search_query, documents in candidate_groups
-            ],
-            "reranked": [
-                {
-                    "content": doc.page_content,
-                    "metadata": doc.metadata,
-                    "vector_score": doc.metadata.get("_vector_score"),
-                    "rerank_score": doc.metadata.get("_rerank_score"),
-                }
-                for doc in reranked_docs
-            ],
-        }
-
     def retrieve_for_queries(
             self,
             queries: list[str],
@@ -452,7 +402,7 @@ class RagSummarizeService(object):
         use_metadata_filter = bool(qdrant_conf.get("use_metadata_filter", False))
         documents: list[Document] = []
 
-        if use_metadata_filter and analysis.filters:
+        if analysis.filters and ("document_id" in analysis.filters or use_metadata_filter):
             documents = self._search_documents(
                 query_index,
                 search_query,

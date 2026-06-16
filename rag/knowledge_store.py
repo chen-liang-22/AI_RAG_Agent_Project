@@ -219,6 +219,16 @@ class KnowledgeStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS dictionary_groups (
+                    dictionary_code TEXT PRIMARY KEY,
+                    dictionary_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS dictionary_items (
                     dictionary_item_id TEXT PRIMARY KEY,
                     dictionary_code TEXT NOT NULL,
@@ -277,6 +287,7 @@ class KnowledgeStore:
                 """
             )
             self.seed_default_dictionaries(conn)
+            self._sync_dictionary_groups_from_items(conn)
             conn.execute("DROP TABLE IF EXISTS qa_items")
             conn.execute("DROP TABLE IF EXISTS document_segments")
             conn.execute("DROP TABLE IF EXISTS knowledge_units")
@@ -288,6 +299,18 @@ class KnowledgeStore:
         for dictionary in DEFAULT_DICTIONARY_ITEMS:
             dictionary_code = dictionary["dictionary_code"]
             dictionary_name = dictionary["dictionary_name"]
+            conn.execute(
+                """
+                INSERT INTO dictionary_groups (
+                    dictionary_code, dictionary_name, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(dictionary_code) DO UPDATE SET
+                    dictionary_name = excluded.dictionary_name,
+                    updated_at = excluded.updated_at
+                """,
+                (dictionary_code, dictionary_name, now, now),
+            )
             item_id_by_code: dict[str, str] = {}
             for item in dictionary["items"]:
                 item_code, item_name, parent_code, sort_order, description = item[:5]
@@ -353,6 +376,29 @@ class KnowledgeStore:
                     )
                 item_id_by_code[item_code] = dictionary_item_id
 
+    def _sync_dictionary_groups_from_items(self, conn: sqlite3.Connection) -> None:
+        """把旧字典项表里已有的分组同步到父级字典表。"""
+
+        now = utc_now_text()
+        rows = conn.execute(
+            """
+            SELECT dictionary_code, MIN(dictionary_name) AS dictionary_name
+            FROM dictionary_items
+            GROUP BY dictionary_code
+            """
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO dictionary_groups (
+                    dictionary_code, dictionary_name, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(dictionary_code) DO NOTHING
+                """,
+                (row["dictionary_code"], row["dictionary_name"] or row["dictionary_code"], now, now),
+            )
+
     def list_dictionary_items(self, dictionary_code: str | None = None) -> list[dict[str, Any]]:
         """查询字典项列表，支持按字典编码过滤。"""
 
@@ -377,18 +423,303 @@ class KnowledgeStore:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_dictionary_groups(self, dictionary_code: str | None = None) -> list[dict[str, Any]]:
+        """查询父级字典列表。"""
+
+        with self.connect() as conn:
+            if dictionary_code:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM dictionary_groups
+                    WHERE dictionary_code = ?
+                    ORDER BY dictionary_code
+                    """,
+                    (dictionary_code,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM dictionary_groups
+                    ORDER BY dictionary_code
+                    """
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_dictionary_group(self, dictionary_code: str, dictionary_name: str) -> dict[str, Any]:
+        """新增父级字典。"""
+
+        now = utc_now_text()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO dictionary_groups (
+                    dictionary_code, dictionary_name, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (dictionary_code, dictionary_name, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM dictionary_groups WHERE dictionary_code = ?",
+                (dictionary_code,),
+            ).fetchone()
+        return dict(row)
+
+    def update_dictionary_group(self, dictionary_code: str, dictionary_name: str) -> dict[str, Any] | None:
+        """修改父级字典名称，并同步到字典项冗余字段。"""
+
+        now = utc_now_text()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE dictionary_groups
+                SET dictionary_name = ?, updated_at = ?
+                WHERE dictionary_code = ?
+                """,
+                (dictionary_name, now, dictionary_code),
+            )
+            if cursor.rowcount == 0:
+                return None
+            conn.execute(
+                """
+                UPDATE dictionary_items
+                SET dictionary_name = ?, updated_at = ?
+                WHERE dictionary_code = ?
+                """,
+                (dictionary_name, now, dictionary_code),
+            )
+            row = conn.execute(
+                "SELECT * FROM dictionary_groups WHERE dictionary_code = ?",
+                (dictionary_code,),
+            ).fetchone()
+        return dict(row)
+
+    def get_dictionary_item(self, dictionary_item_id: str) -> dict[str, Any] | None:
+        """按 ID 查询单个字典项。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM dictionary_items
+                WHERE dictionary_item_id = ?
+                """,
+                (dictionary_item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_dictionary_item(
+            self,
+            *,
+            dictionary_code: str,
+            dictionary_name: str,
+            item_code: str,
+            item_name: str,
+            parent_item_id: str | None = None,
+            sort_order: int = 0,
+            enabled: bool = True,
+            description: str | None = None,
+            metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """新增字典项，并根据父级自动计算层级。"""
+
+        dictionary_item_id = f"dict_{uuid.uuid4().hex}"
+        now = utc_now_text()
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False) if metadata else None
+        with self.connect() as conn:
+            group = conn.execute(
+                "SELECT dictionary_name FROM dictionary_groups WHERE dictionary_code = ?",
+                (dictionary_code,),
+            ).fetchone()
+            if group is None:
+                raise ValueError("父级字典不存在，请先新增父级字典")
+            dictionary_name = str(group["dictionary_name"])
+            parent_level = self._get_dictionary_parent_level(conn, dictionary_code, parent_item_id)
+            conn.execute(
+                """
+                INSERT INTO dictionary_items (
+                    dictionary_item_id, dictionary_code, dictionary_name,
+                    item_code, item_name, parent_item_id, item_level,
+                    sort_order, enabled, description, metadata_json,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    dictionary_item_id,
+                    dictionary_code,
+                    dictionary_name,
+                    item_code,
+                    item_name,
+                    parent_item_id,
+                    parent_level + 1,
+                    sort_order,
+                    1 if enabled else 0,
+                    description,
+                    metadata_json,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM dictionary_items WHERE dictionary_item_id = ?",
+                (dictionary_item_id,),
+            ).fetchone()
+        return dict(row)
+
+    def update_dictionary_item(
+            self,
+            dictionary_item_id: str,
+            *,
+            dictionary_name: str | None = None,
+            item_code: str | None = None,
+            item_name: str | None = None,
+            parent_item_id: str | None = None,
+            sort_order: int | None = None,
+            enabled: bool | None = None,
+            description: str | None = None,
+            metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """修改字典项。"""
+
+        now = utc_now_text()
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False) if metadata is not None else None
+        with self.connect() as conn:
+            current = conn.execute(
+                "SELECT * FROM dictionary_items WHERE dictionary_item_id = ?",
+                (dictionary_item_id,),
+            ).fetchone()
+            if current is None:
+                return None
+
+            current_dict = dict(current)
+            target_parent_item_id = parent_item_id
+            if target_parent_item_id == dictionary_item_id:
+                raise ValueError("字典项不能选择自己作为父级")
+            parent_level = self._get_dictionary_parent_level(
+                conn,
+                current_dict["dictionary_code"],
+                target_parent_item_id,
+            )
+            conn.execute(
+                """
+                UPDATE dictionary_items
+                SET dictionary_name = ?, item_code = ?, item_name = ?, parent_item_id = ?,
+                    item_level = ?, sort_order = ?, enabled = ?, description = ?,
+                    metadata_json = ?, updated_at = ?
+                WHERE dictionary_item_id = ?
+                """,
+                (
+                    dictionary_name if dictionary_name is not None else current_dict["dictionary_name"],
+                    item_code if item_code is not None else current_dict["item_code"],
+                    item_name if item_name is not None else current_dict["item_name"],
+                    target_parent_item_id,
+                    parent_level + 1,
+                    sort_order if sort_order is not None else current_dict["sort_order"],
+                    1 if (enabled if enabled is not None else bool(current_dict["enabled"])) else 0,
+                    description,
+                    metadata_json if metadata is not None else current_dict.get("metadata_json"),
+                    now,
+                    dictionary_item_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM dictionary_items WHERE dictionary_item_id = ?",
+                (dictionary_item_id,),
+            ).fetchone()
+        return dict(row)
+
+    def set_dictionary_item_enabled(self, dictionary_item_id: str, enabled: bool) -> dict[str, Any] | None:
+        """启用或禁用字典项。"""
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE dictionary_items
+                SET enabled = ?, updated_at = ?
+                WHERE dictionary_item_id = ?
+                """,
+                (1 if enabled else 0, utc_now_text(), dictionary_item_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM dictionary_items WHERE dictionary_item_id = ?",
+                (dictionary_item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_dictionary_item(self, dictionary_item_id: str) -> bool:
+        """删除没有子级的字典项。"""
+
+        with self.connect() as conn:
+            child_count = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM dictionary_items
+                WHERE parent_item_id = ?
+                """,
+                (dictionary_item_id,),
+            ).fetchone()["total"]
+            if int(child_count) > 0:
+                raise ValueError("当前字典项存在子级，请先删除子级")
+            cursor = conn.execute(
+                "DELETE FROM dictionary_items WHERE dictionary_item_id = ?",
+                (dictionary_item_id,),
+            )
+        return cursor.rowcount > 0
+
+    def delete_dictionary_group(self, dictionary_code: str) -> int:
+        """删除某个父级字典分组下的全部字典项。"""
+
+        with self.connect() as conn:
+            group_cursor = conn.execute(
+                "DELETE FROM dictionary_groups WHERE dictionary_code = ?",
+                (dictionary_code,),
+            )
+            item_cursor = conn.execute(
+                "DELETE FROM dictionary_items WHERE dictionary_code = ?",
+                (dictionary_code,),
+            )
+        return int(group_cursor.rowcount) + int(item_cursor.rowcount)
+
+    def _get_dictionary_parent_level(
+            self,
+            conn: sqlite3.Connection,
+            dictionary_code: str,
+            parent_item_id: str | None,
+    ) -> int:
+        """查询父级层级；没有父级时返回 0。"""
+
+        if parent_item_id is None:
+            return 0
+        parent = conn.execute(
+            """
+            SELECT item_level
+            FROM dictionary_items
+            WHERE dictionary_item_id = ? AND dictionary_code = ?
+            """,
+            (parent_item_id, dictionary_code),
+        ).fetchone()
+        if parent is None:
+            raise ValueError("父级字典项不存在或不属于当前字典")
+        return int(parent["item_level"])
+
     def list_enabled_dictionary_codes(self, dictionary_code: str) -> list[str]:
         """查询某个字典下已启用的字典项编码。"""
 
         rows = self.list_dictionary_items(dictionary_code=dictionary_code)
+        # 遍历该字典下的所有字典项，只保留 enabled=1 的项，并返回它们的 item_code 列表。
         return [str(row["item_code"]) for row in rows if int(row.get("enabled") or 0) == 1]
 
     def get_default_dictionary_code(self, dictionary_code: str) -> str:
         """查询某个字典的默认编码，默认取启用且排序最靠前的字典项。"""
 
+        # list_enabled_dictionary_codes 返回的是已按 sort_order 排好的启用编码列表。
         codes = self.list_enabled_dictionary_codes(dictionary_code)
         if not codes:
             raise ValueError(f"字典没有可用项：{dictionary_code}")
+        # codes[0] 表示取列表中的第一项，也就是默认字典项。
         return codes[0]
 
     def get_dictionary_code_by_metadata(self, dictionary_code: str, metadata_key: str, metadata_value: Any) -> str | None:
@@ -412,11 +743,17 @@ class KnowledgeStore:
     def normalize_dictionary_code(self, dictionary_code: str, value: str | None = None) -> str:
         """按字典表归一化编码；非法或空值时返回该字典的默认编码。"""
 
+        # 查询当前字典中所有启用编码，并转成 set，方便后续快速判断传入值是否合法。
         enabled_codes = set(self.list_enabled_dictionary_codes(dictionary_code))
+        # 获取当前字典的默认编码；通常是启用且排序最靠前的字典项。
         default_code = self.get_default_dictionary_code(dictionary_code)
+        # 优先使用传入 value；如果 value 为空，则使用默认编码。
+        # 然后统一转字符串、去掉前后空格、转成小写，避免大小写或空格导致匹配失败。
         normalized_value = str(value or default_code).strip().lower()
+        # 如果规范化后的值存在于启用编码集合中，说明传入值合法，直接返回该值。
         if normalized_value in enabled_codes:
             return normalized_value
+        # 如果传入值为空或不合法，则兜底返回默认编码。
         return default_code
 
     @staticmethod

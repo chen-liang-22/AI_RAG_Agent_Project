@@ -307,9 +307,12 @@ def _dictionary_options_text(dictionary_code: str) -> str:
 def _get_recommendation_model_mode() -> str:
     """从模型档位字典中读取用于切分推荐的小模型档位。"""
 
+    # 获取 SQLite 字典表访问对象，用它读取 model_mode 字典配置。
     store = _get_knowledge_store()
+    # 优先查找 metadata_json 中标记 recommendation=true 的模型档位。
+    # 如果字典里没有配置推荐档位，则回退到 model_mode 字典的默认编码。
     return (
-        store.get_dictionary_code_by_metadata("model_mode", "recommendation", True)
+        store.get_dictionary_code_by_metadata("model_mode", "default", True)
         or store.normalize_dictionary_code("model_mode", None)
     )
 
