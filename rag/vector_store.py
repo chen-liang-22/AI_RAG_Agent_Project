@@ -20,6 +20,7 @@ from utils.qdrant_options import (
     get_qdrant_client_options,  # 读取 Qdrant 连接参数，如 url/host/port/grpc_port
     get_qdrant_collection_name,  # 读取当前 collection 名称
     get_qdrant_distance,  # 读取向量距离算法，如 COSINE
+    normalize_qdrant_collection_name,
 )
 
 
@@ -52,7 +53,7 @@ class VectorStoreService:
     - MD5 只能避免重复加载同一份文件，不能自动删除旧版本分片。
     """
 
-    def __init__(self, *, force_recreate: bool | None = None):
+    def __init__(self, *, force_recreate: bool | None = None, collection_name: str | None = None):
         """初始化向量库连接和文本切分器。
 
         这里只是准备好 QdrantVectorStore 和 splitter。
@@ -60,10 +61,11 @@ class VectorStoreService:
         """
 
         recreate_collection = qdrant_conf.get("force_recreate", False) if force_recreate is None else force_recreate
+        self.collection_name = normalize_qdrant_collection_name(collection_name)
 
         self.vector_store = QdrantVectorStore.construct_instance(
             embedding=embed_model,  # 文本转向量时使用的 embedding 模型
-            collection_name=get_qdrant_collection_name(),  # Qdrant collection 名称
+            collection_name=self.collection_name,  # Qdrant collection 名称
             client_options=get_qdrant_client_options(),  # Qdrant 连接配置
             distance=get_qdrant_distance(),  # 向量相似度距离算法
             force_recreate=recreate_collection,  # 是否强制重建 collection
@@ -78,14 +80,14 @@ class VectorStoreService:
         self.document_parser = DocumentParser(self.spliter)  # 通用文档解析器；支持上传预览、通用片段和 FAQ 抽取
 
     @classmethod
-    def recreate_collection_service(cls) -> "VectorStoreService":
+    def recreate_collection_service(cls, collection_name: str | None = None) -> "VectorStoreService":
         """删除并重建当前 Qdrant collection，然后返回新的向量库服务实例。
 
         这个方法只给“全量重建索引”使用。
         它可以清理历史遗留的旧 points，尤其是没有 document_id 的旧数据。
         """
 
-        return cls(force_recreate=True)
+        return cls(force_recreate=True, collection_name=collection_name)
 
     def get_retriever(self):
         """获取 LangChain retriever。
@@ -195,11 +197,11 @@ class VectorStoreService:
         detection = self.document_parser.detect_document_type(filename, sample_text)
         return {
             "filename": filename,
-            "document_type": detection.document_type,
-            "split_strategy": detection.split_strategy,
-            "confidence": detection.confidence,
-            "reasons": detection.reasons,
-            "llm_used": detection.llm_used,
+            "document_type": "general",
+            "split_strategy": "recursive",
+            "confidence": 1.0,
+            "reasons": ["默认使用通用递归切分；如需更精细切分，可在确认入库前手动选择或使用模型推荐。"],
+            "llm_used": False,
             "sample_text": sample_text,
         }
 
@@ -272,12 +274,12 @@ class VectorStoreService:
         return index_documents
 
     @staticmethod
-    def delete_document_vectors(document_id: str) -> None:
+    def delete_document_vectors(document_id: str, collection_name: str | None = None) -> None:
         """按 document_id 删除 Qdrant 中属于某个文件的所有向量。"""
 
         client = QdrantClient(**get_qdrant_client_options())
         client.delete(
-            collection_name=get_qdrant_collection_name(),
+            collection_name=normalize_qdrant_collection_name(collection_name),
             points_selector=models.FilterSelector(
                 filter=models.Filter(
                     must=[
@@ -290,6 +292,11 @@ class VectorStoreService:
             ),
             wait=True,
         )
+
+    @staticmethod
+    def list_collections() -> list[str]:
+        client = QdrantClient(**get_qdrant_client_options())
+        return [collection.name for collection in client.get_collections().collections]
 
     def index_file(
             self,
@@ -314,10 +321,8 @@ class VectorStoreService:
         if not documents:
             raise ValueError(f"文件 {file_path} 没有有效文本内容")
 
-        if not document_type or not split_strategy:
-            preview = self.preview_file(filename=filename, file_path=file_path)
-            document_type = document_type or preview["document_type"]
-            split_strategy = split_strategy or preview["split_strategy"]
+        document_type = document_type or document.get("document_type") or "general"
+        split_strategy = split_strategy or document.get("split_strategy") or "recursive"
 
         index_documents = self.build_index_documents(
             document_id=document_id,
@@ -332,7 +337,7 @@ class VectorStoreService:
         if not index_documents:
             raise ValueError(f"文件 {file_path} 分片后没有有效文本内容")
 
-        self.delete_document_vectors(document_id)
+        self.delete_document_vectors(document_id, collection_name=self.collection_name)
         self.vector_store.add_documents(index_documents)
 
         return len(index_documents)

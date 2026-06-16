@@ -1,3 +1,4 @@
+import json
 import os
 import uuid
 
@@ -11,13 +12,17 @@ from api.schemas import (
     KnowledgeReindexResult,
     KnowledgeUploadConfirmRequest,
     KnowledgeUploadPreviewResponse,
+    KnowledgeUploadRecommendRequest,
+    KnowledgeUploadRecommendResponse,
     KnowledgeUploadResponse,
 )
 from api.services import (
     _document_to_response,
+    _get_preview_file,
     _get_knowledge_store,
     _index_document,
     _move_upload_file,
+    _recommend_upload_split_strategy,
     _remove_created_upload_dir,
     _sanitize_upload_filename,
     _save_preview_file,
@@ -28,6 +33,7 @@ from utils.file_handler import get_file_md5_hex, pdf_loader
 from utils.logger_handler import logger
 from utils.path_tool import get_abs_path
 from utils.qdrant_options import get_qdrant_collection_name
+from utils.qdrant_options import normalize_qdrant_collection_name
 
 router = APIRouter()
 
@@ -187,23 +193,6 @@ def preview_knowledge_file(file: UploadFile = File(...)) -> KnowledgeUploadPrevi
 
     store = _get_knowledge_store()
     duplicate_document = store.find_active_document_by_md5(file_md5)
-    if duplicate_document is not None:
-        _remove_created_upload_dir(os.path.dirname(file_path))
-        return KnowledgeUploadPreviewResponse(
-            upload_id=upload_id,
-            filename=filename,
-            file_type=file_type,
-            file_size=file_size,
-            file_md5=file_md5,
-            duplicate=True,
-            duplicate_document=_document_to_response(duplicate_document),
-            detected_type="duplicate",
-            split_strategy="duplicate",
-            confidence=1.0,
-            reasons=["相同内容的文件已经存在"],
-            llm_used=False,
-            sample_text="",
-        )
 
     try:
         from rag.vector_store import VectorStoreService
@@ -231,29 +220,35 @@ def preview_knowledge_file(file: UploadFile = File(...)) -> KnowledgeUploadPrevi
     )
 
 
+@router.post("/knowledge/upload/recommend", response_model=KnowledgeUploadRecommendResponse)
+def recommend_knowledge_upload(request: KnowledgeUploadRecommendRequest) -> KnowledgeUploadRecommendResponse:
+    """对临时上传文件调用模型推荐文档类型和切分策略。"""
+
+    try:
+        recommendation = _recommend_upload_split_strategy(request.upload_id)
+    except HTTPException:
+        raise
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+        logger.error(f"[知识库] 模型推荐切分方式失败 上传编号={request.upload_id} 错误={exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"模型推荐失败：{exc}") from exc
+
+    return KnowledgeUploadRecommendResponse(**recommendation)
+
+
 @router.post("/knowledge/upload/confirm", response_model=KnowledgeUploadResponse)
 def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeUploadResponse:
     """确认预览结果，并正式写入 SQLite 和 Qdrant。"""
 
     upload_id = request.upload_id.strip()
-    preview_dir = os.path.abspath(os.path.join(get_abs_path("uploads"), "_preview", upload_id))
-    preview_root = os.path.abspath(os.path.join(get_abs_path("uploads"), "_preview"))
-
-    if os.path.commonpath([preview_root, preview_dir]) != preview_root or not os.path.isdir(preview_dir):
-        raise HTTPException(status_code=404, detail=f"临时上传不存在：{upload_id}")
-
-    files = [name for name in os.listdir(preview_dir) if os.path.isfile(os.path.join(preview_dir, name))]
-    if len(files) != 1:
-        raise HTTPException(status_code=400, detail="临时上传文件状态异常")
-
-    filename = _sanitize_upload_filename(files[0])
+    preview_dir, preview_path = _get_preview_file(upload_id)
+    filename = _sanitize_upload_filename(os.path.basename(preview_path))
     file_type = _validate_file_type(filename)
-    preview_path = os.path.join(preview_dir, filename)
     file_md5 = get_file_md5_hex(preview_path)
     file_size = os.path.getsize(preview_path)
 
     store = _get_knowledge_store()
-    duplicate_document = store.find_active_document_by_md5(file_md5)
+    collection_name = normalize_qdrant_collection_name(request.collection_name)
+    duplicate_document = store.find_active_document_by_md5(file_md5, collection_name=collection_name)
     if duplicate_document is not None:
         _remove_created_upload_dir(preview_dir)
         return KnowledgeUploadResponse(
@@ -278,6 +273,9 @@ def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeU
         file_md5=file_md5,
         file_size=file_size,
         status="uploaded",
+        collection_name=collection_name,
+        document_type=request.document_type,
+        split_strategy=request.split_strategy,
     )
 
     indexed_document = _index_document(
@@ -285,6 +283,7 @@ def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeU
         document,
         document_type=request.document_type,
         split_strategy=request.split_strategy,
+        collection_name=collection_name,
     )
 
     return KnowledgeUploadResponse(
@@ -385,7 +384,7 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
     try:
         from rag.vector_store import VectorStoreService  # 延迟导入，只在删除 Qdrant points 时加载
 
-        VectorStoreService.delete_document_vectors(document_id)
+        VectorStoreService.delete_document_vectors(document_id, collection_name=document.get("collection_name"))
         store.mark_document_deleted(document_id)
     except Exception as exc:
         logger.error(f"[知识库] 删除文件失败 文档编号={document_id} 错误={exc}", exc_info=True)
@@ -416,7 +415,7 @@ def reindex_all_knowledge_files() -> KnowledgeBulkReindexResponse:
     try:
         from rag.vector_store import VectorStoreService
 
-        vector_store = VectorStoreService.recreate_collection_service()
+        vector_stores: dict[str, VectorStoreService] = {}
     except Exception as exc:
         logger.error(f"[知识库] 重建向量集合失败 错误={exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Qdrant collection 重建失败：{exc}") from exc
@@ -426,11 +425,16 @@ def reindex_all_knowledge_files() -> KnowledgeBulkReindexResponse:
         filename = document["filename"]
 
         try:
+            collection_name = normalize_qdrant_collection_name(document.get("collection_name"))
+            if collection_name not in vector_stores:
+                vector_stores[collection_name] = VectorStoreService.recreate_collection_service(collection_name)
+
             indexed_document = _index_document(
                 store,
                 document,
                 increment_version=True,
-                vector_store=vector_store,
+                vector_store=vector_stores[collection_name],
+                collection_name=collection_name,
             )
             succeeded += 1
             results.append(
@@ -504,18 +508,23 @@ def reload_knowledge() -> dict:
 
         _sync_data_files_to_documents(store)
         documents = store.list_documents()
-        vector_store = VectorStoreService.recreate_collection_service()
+        vector_stores: dict[str, VectorStoreService] = {}
 
         results: list[dict] = []
         succeeded = 0
         failed = 0
         for document in documents:
             try:
+                collection_name = normalize_qdrant_collection_name(document.get("collection_name"))
+                if collection_name not in vector_stores:
+                    vector_stores[collection_name] = VectorStoreService.recreate_collection_service(collection_name)
+
                 indexed_document = _index_document(
                     store,
                     document,
                     increment_version=True,
-                    vector_store=vector_store,
+                    vector_store=vector_stores[collection_name],
+                    collection_name=collection_name,
                 )
                 succeeded += 1
                 results.append(

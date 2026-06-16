@@ -15,6 +15,8 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)  # 用户输入的问题；不能为空字符串
     user_id: str | None = None  # 当前会话用户 ID；可为空，工具层会兜底随机用户
     conversation_id: str | None = None  # 当前会话 ID；为空时后端创建新会话
+    model_mode: str | None = Field(default="high", pattern="^(low|medium|high)$")  # 回答模型档位：low/medium/high
+    collection_name: str | None = None  # 本次聊天要检索的 Qdrant collection；为空时使用默认 collection
 
 
 class ChatResponse(BaseModel):
@@ -113,6 +115,9 @@ class KnowledgeFileResponse(BaseModel):
     status: str  # uploaded/indexing/indexed/failed/deleted
     version: int  # 文件索引版本；每次 reindex 会递增
     chunk_count: int  # 当前版本写入 Qdrant 的知识单元数量
+    collection_name: str = "agent"  # 文件写入的 Qdrant collection
+    document_type: str = "general"  # 文件的业务/通用分类，仅作为 metadata
+    split_strategy: str = "recursive"  # 文件入库时使用的切分策略
     created_at: str  # 文件记录创建时间
     updated_at: str  # 文件记录最后更新时间
     error_message: str | None = None  # 入库失败时保存错误原因
@@ -166,12 +171,30 @@ class KnowledgeUploadPreviewResponse(BaseModel):
     sample_text: str = ""  # 抽样文本，给前端预览
 
 
+class KnowledgeUploadRecommendRequest(BaseModel):
+    """上传文件模型推荐请求体。"""
+
+    upload_id: str = Field(..., min_length=1)  # 预览阶段返回的 upload_id
+
+
+class KnowledgeUploadRecommendResponse(BaseModel):
+    """上传文件模型推荐响应体。"""
+
+    document_type: str  # 模型推荐的文档类型
+    split_strategy: str  # 模型推荐的切分策略
+    confidence: float  # 模型推荐置信度，范围 0 到 1
+    reasons: list[str] = Field(default_factory=list)  # 模型推荐原因
+    sample_chars: int  # 实际发送给模型的样本文本字符数
+    model_name: str  # 本次用于推荐的模型名称
+
+
 class KnowledgeUploadConfirmRequest(BaseModel):
     """上传确认请求体。"""
 
     upload_id: str = Field(..., min_length=1)  # 预览阶段返回的 upload_id
     document_type: str = Field(..., min_length=1)  # 用户确认后的文档类型
     split_strategy: str = Field(..., min_length=1)  # 用户确认后的切分策略
+    collection_name: str | None = None  # 用户选择或输入的 Qdrant collection；为空时使用默认 collection
 
 
 class KnowledgeDeleteResponse(BaseModel):

@@ -5,6 +5,13 @@ from qdrant_client import models
 from utils.config_handler import qdrant_conf
 
 
+def normalize_qdrant_collection_name(collection_name: str | None = None) -> str:
+    name = (collection_name or get_qdrant_collection_name()).strip()
+    if not name:
+        name = str(qdrant_conf["collection_name"]).strip()
+    return name
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None or value == "":

@@ -24,7 +24,9 @@ from api.services import (
     _stream_agent,
     _stream_direct_rag,
 )
+from model.factory import get_chat_model_name_for_mode, normalize_chat_model_mode
 from utils.logger_handler import logger
+from utils.qdrant_options import normalize_qdrant_collection_name
 
 router = APIRouter()
 
@@ -161,42 +163,61 @@ def chat(request: ChatRequest) -> ChatResponse:
 
     request_start_time = time.perf_counter()
     conversation_id, history = _prepare_chat_conversation(request)
+    selected_model_mode = normalize_chat_model_mode(request.model_mode)
+    selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
+    selected_collection_name = normalize_qdrant_collection_name(request.collection_name)
     logger.info(
-        "[性能] 聊天请求准备完成 模式=非流式 会话编号=%s 耗时毫秒=%.2f 历史消息数=%s",
+        "[性能] 聊天请求准备完成 模式=非流式 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f 历史消息数=%s",
         conversation_id,
+        selected_collection_name,
+        selected_model_mode,
+        selected_model_name,
         _elapsed_ms(request_start_time),
         len(history),
     )
     logger.info(
         f"[接口] 非流式聊天请求 用户编号={request.user_id} "
-        f"会话编号={conversation_id} 问题={request.message}"
+        f"会话编号={conversation_id} 模型模式={selected_model_mode} 模型名称={selected_model_name} 问题={request.message}"
     )  # 标记本次调用的是一次性接口
 
     use_direct_rag, route_reason = _should_use_direct_rag(request.message)
     if use_direct_rag:
         logger.info(
-            "[聊天路由] 非流式接口路由结果=知识直答 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+            "[聊天路由] 非流式接口路由结果=知识直答 原因=%s 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s 问题=%s",
             route_reason,
             request.user_id,
             conversation_id,
+            selected_model_mode,
+            selected_model_name,
             request.message,
         )
-        answer = _get_knowledge_answer_service().answer(request.message, history=history)
+        answer = _get_knowledge_answer_service().answer(
+            request.message,
+            history=history,
+            model_mode=request.model_mode,
+            collection_name=selected_collection_name,
+        )
         total_ms = _elapsed_ms(request_start_time)
         _save_chat_exchange(
             conversation_id=conversation_id,
             message=request.message,
             answer=answer,
+            model_name=selected_model_name,
             metadata={
                 "mode": "direct_rag_once",
+                "model_mode": selected_model_mode,
+                "model_name": selected_model_name,
+                "collection_name": selected_collection_name,
                 "route_reason": route_reason,
                 "first_token_ms": total_ms,
                 "total_ms": total_ms,
             },
         )
         logger.info(
-            "[性能] 聊天请求完成 模式=非流式 路由=知识直答 会话编号=%s 耗时毫秒=%.2f",
+            "[性能] 聊天请求完成 模式=非流式 路由=知识直答 会话编号=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f",
             conversation_id,
+            selected_model_mode,
+            selected_model_name,
             total_ms,
         )
         return ChatResponse(
@@ -207,10 +228,12 @@ def chat(request: ChatRequest) -> ChatResponse:
         )
 
     logger.info(
-        "[聊天路由] 非流式接口路由结果=Agent工具链 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+        "[聊天路由] 非流式接口路由结果=Agent工具链 原因=%s 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s 问题=%s",
         route_reason,
         request.user_id,
         conversation_id,
+        selected_model_mode,
+        selected_model_name,
         request.message,
     )
     answer = _get_agent().execute(
@@ -224,16 +247,21 @@ def chat(request: ChatRequest) -> ChatResponse:
         conversation_id=conversation_id,
         message=request.message,
         answer=answer,
+        model_name=selected_model_name,
         metadata={
             "mode": "agent_once",
+            "model_mode": selected_model_mode,
+            "model_name": selected_model_name,
             "route_reason": route_reason,
             "first_token_ms": total_ms,
             "total_ms": total_ms,
         },
     )
     logger.info(
-        "[性能] 聊天请求完成 模式=非流式 路由=Agent工具链 会话编号=%s 耗时毫秒=%.2f",
+        "[性能] 聊天请求完成 模式=非流式 路由=Agent工具链 会话编号=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f",
         conversation_id,
+        selected_model_mode,
+        selected_model_name,
         total_ms,
     )
     return ChatResponse(
@@ -274,17 +302,23 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
     # 确保本次聊天有 conversation_id，并从 SQLite 读取最近的历史消息。
     # 如果前端没有传 conversation_id，这里会创建一个新的会话。
     conversation_id, history = _prepare_chat_conversation(request)
+    selected_model_mode = normalize_chat_model_mode(request.model_mode)
+    selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
+    selected_collection_name = normalize_qdrant_collection_name(request.collection_name)
 
     # 打印接口准备耗时和历史消息数量，方便判断慢点是否出现在会话读取阶段。
     logger.info(
-        "[性能] 聊天请求准备完成 模式=流式 会话编号=%s 耗时毫秒=%.2f 历史消息数=%s",
+        "[性能] 聊天请求准备完成 模式=流式 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f 历史消息数=%s",
         conversation_id,
+        selected_collection_name,
+        selected_model_mode,
+        selected_model_name,
         _elapsed_ms(request_start_time),
         len(history),
     )
     logger.info(
         f"[接口] 流式聊天请求 用户编号={request.user_id} "
-        f"会话编号={conversation_id} 问题={request.message}"
+        f"会话编号={conversation_id} 模型模式={selected_model_mode} 模型名称={selected_model_name} 问题={request.message}"
     )  # 标记本次调用的是流式接口
 
     # 根据配置决定走哪条聊天链路：
@@ -295,10 +329,12 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
     # 当前项目默认走 direct_rag，这条链路更短，首 token 更快。
     if use_direct_rag:
         logger.info(
-            "[聊天路由] 流式接口路由结果=知识直答 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+            "[聊天路由] 流式接口路由结果=知识直答 原因=%s 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s 问题=%s",
             route_reason,
             request.user_id,
             conversation_id,
+            selected_model_mode,
+            selected_model_name,
             request.message,
         )
 
@@ -310,6 +346,8 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
                 user_id=request.user_id,  # 用户编号，后续工具或画像逻辑可能会用到。
                 conversation_id=conversation_id,  # 当前会话编号，用于保存聊天历史。
                 history=history,  # 最近历史消息，会传给 RAG 最终回答模型做上下文参考。
+                model_mode=selected_model_mode,  # 当前回答模型档位。
+                collection_name=selected_collection_name,  # 当前聊天检索的 Qdrant collection。
             ),
             media_type="text/event-stream",  # 告诉浏览器这是 SSE 文本流，不是普通 JSON。
             headers={
@@ -325,10 +363,12 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
     # 如果配置为 agent 模式，会走到这里。
     # Agent 链路更灵活，但通常比 direct_rag 慢，因为模型需要判断工具调用。
     logger.info(
-        "[聊天路由] 流式接口路由结果=Agent工具链 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+        "[聊天路由] 流式接口路由结果=Agent工具链 原因=%s 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s 问题=%s",
         route_reason,
         request.user_id,
         conversation_id,
+        selected_model_mode,
+        selected_model_name,
         request.message,
     )
 

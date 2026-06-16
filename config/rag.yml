@@ -12,6 +12,14 @@ chat_provider: openai_compatible
 # 注意：模型名必须和 chat_provider 对应的接口兼容。
 chat_model_name: deepseek-v4-flash
 
+# 聊天模型档位映射。
+# low：低延迟模式，适合日常快速问答。
+# medium：平衡模式，适合稍复杂但仍希望响应较快的问题。
+# high：高质量模式，适合复杂问题或更看重回答质量的场景。
+chat_model_low: qwen-turbo
+chat_model_medium: qwen3.6-flash
+chat_model_high: deepseek-v4-flash
+
 # OpenAI 兼容接口地址。
 # 仅 chat_provider=openai_compatible/openai 时使用。
 openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -56,3 +64,35 @@ adaptive_retrieve_min_docs: 3
 # adaptive 模式下，首次召回 top3 平均分阈值。
 # 低于该值说明整体相关性不稳定，会触发 LLM Query Planner。
 adaptive_retrieve_top3_avg_score: 0.68
+
+# adaptive 模式下，是否启用“极低分跳过 Query Planner”。
+# 作用：乱码、闲聊、无关问题的首次召回分数很低时，不再调用 LLM 改写，减少无效等待。
+adaptive_skip_planner_on_very_low_score: true
+
+# 极低分跳过 Query Planner 的最高分阈值。
+# 只有 top1 分数低于该值，并且没有命中业务关键词时，才会跳过模型改写。
+adaptive_skip_planner_max_score: 0.55
+
+# 极低分跳过 Query Planner 的前三平均分阈值。
+# 只有 top3 平均分低于该值，并且没有命中业务关键词时，才会跳过模型改写。
+adaptive_skip_planner_top3_avg_score: 0.50
+
+# 启动预热总开关。
+# 作用：服务启动时提前初始化 RAG 关键依赖，减少第一次聊天的冷启动等待。
+startup_warmup_enabled: true
+
+# 是否预热 Qdrant 向量库连接。
+# 作用：提前检查 collection 是否存在，并建立 Qdrant 客户端连接。
+warmup_qdrant: true
+
+# 是否预热 embedding 模型。
+# 作用：启动时用短文本调用一次向量模型，提前完成鉴权、网络连接和模型侧初始化。
+warmup_embedding: true
+
+# 是否预热最终回答模型。
+# 注意：开启后启动时会真实调用一次聊天模型，会消耗少量 token/额度；默认关闭。
+warmup_chat_model: false
+
+# 预热失败时是否中断应用启动。
+# false：只打印错误日志，应用继续启动；true：预热失败则启动失败。
+warmup_fail_fast: false

@@ -1,19 +1,25 @@
 import json
 import os
+import re
 import shutil
 import threading
 import time
 import uuid
 from collections.abc import Iterator
 
+import yaml
 from fastapi import HTTPException, UploadFile
 
 from api.schemas import ChatRequest, KnowledgeFileResponse
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from model.factory import get_chat_model, get_chat_model_name_for_mode, normalize_chat_model_mode
 from rag.knowledge_store import KnowledgeStore
 from utils.config_handler import qdrant_conf, rag_conf
 from utils.file_handler import get_file_md5_hex, listdir_with_allowed_type
 from utils.logger_handler import logger
 from utils.path_tool import get_abs_path
+from utils.qdrant_options import get_qdrant_collection_name, normalize_qdrant_collection_name
 
 
 _agent = None  # 全局 Agent 单例；第一次聊天请求进来时才真正初始化
@@ -48,6 +54,9 @@ def _document_to_response(document: dict) -> KnowledgeFileResponse:
         status=document["status"],
         version=int(document["version"]),
         chunk_count=int(document["chunk_count"]),
+        collection_name=document.get("collection_name") or get_qdrant_collection_name(),
+        document_type=document.get("document_type") or "general",
+        split_strategy=document.get("split_strategy") or "recursive",
         created_at=document["created_at"],
         updated_at=document["updated_at"],
         error_message=document.get("error_message"),
@@ -143,6 +152,197 @@ def _save_preview_file(file: UploadFile, filename: str, upload_id: str) -> tuple
     return file_path, file_size
 
 
+def _get_preview_file(upload_id: str) -> tuple[str, str]:
+    """根据上传编号找到临时预览文件，并返回预览目录和文件路径。"""
+
+    clean_upload_id = upload_id.strip()
+    preview_root = os.path.abspath(os.path.join(get_abs_path("uploads"), "_preview"))
+    preview_dir = os.path.abspath(os.path.join(preview_root, clean_upload_id))
+
+    if os.path.commonpath([preview_root, preview_dir]) != preview_root or not os.path.isdir(preview_dir):
+        raise HTTPException(status_code=404, detail=f"临时上传不存在：{clean_upload_id}")
+
+    files = [name for name in os.listdir(preview_dir) if os.path.isfile(os.path.join(preview_dir, name))]
+    if len(files) != 1:
+        raise HTTPException(status_code=400, detail="临时上传文件状态异常")
+
+    filename = _sanitize_upload_filename(files[0])
+    return preview_dir, os.path.join(preview_dir, filename)
+
+
+def _slice_text_window(text: str, start: int, length: int) -> str:
+    """从文本中截取一个窗口，并清理首尾空白。"""
+
+    if not text or length <= 0:
+        return ""
+    safe_start = max(0, min(start, len(text)))
+    return text[safe_start:safe_start + length].strip()
+
+
+def _build_structure_sample(full_text: str, *, max_chars: int = 10000) -> str:
+    """从全文中抽取开头、中间、结尾样本，供模型判断切分方式。"""
+
+    clean_text = re.sub(r"\n{3,}", "\n\n", full_text).strip()
+    if len(clean_text) <= max_chars:
+        return clean_text
+
+    head_chars = min(3800, max_chars // 3 + 500)
+    middle_chars = min(3600, max_chars // 3 + 300)
+    tail_chars = max(1200, max_chars - head_chars - middle_chars)
+    middle_start = max(0, len(clean_text) // 2 - middle_chars // 2)
+    tail_start = max(0, len(clean_text) - tail_chars)
+
+    return "\n\n".join(
+        part
+        for part in [
+            "【开头样本】\n" + _slice_text_window(clean_text, 0, head_chars),
+            "【中间样本】\n" + _slice_text_window(clean_text, middle_start, middle_chars),
+            "【结尾样本】\n" + _slice_text_window(clean_text, tail_start, tail_chars),
+        ]
+        if part.strip()
+    )[:max_chars]
+
+
+def _analyze_structure_text(text: str) -> dict:
+    """统计样本文本中的结构特征，辅助模型判断文档切分策略。"""
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    numbered_lines = [line for line in lines if re.match(r"^\d+[.、\)]\s*", line)]
+    qa_lines = [line for line in lines if re.match(r"^(Q|A|问|答)[:：]", line, re.IGNORECASE)]
+    heading_lines = [line for line in lines if re.match(r"^(#{1,6}\s+|第[一二三四五六七八九十\d]+[章节]|[一二三四五六七八九十]+[、.])", line)]
+    return {
+        "line_count": len(lines),
+        "numbered_line_count": len(numbered_lines),
+        "qa_marker_count": len(qa_lines),
+        "heading_line_count": len(heading_lines),
+    }
+
+
+def _parse_model_json(content: object) -> dict:
+    """从模型返回内容中解析 JSON 对象。"""
+
+    text = content if isinstance(content, str) else str(content)
+    text = text.strip()
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1)
+    else:
+        object_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if object_match:
+            text = object_match.group(0)
+
+    return json.loads(text)
+
+
+def _normalize_recommendation(value: dict) -> dict:
+    """校验并归一化模型推荐结果，避免非法类型进入前端。"""
+
+    allowed_document_types = {
+        "faq",
+        "manual",
+        "troubleshooting",
+        "maintenance",
+        "policy",
+        "spec",
+        "guide",
+        "general",
+    }
+    allowed_split_strategies = {"numbered_qa", "numbered_segments", "recursive"}
+    document_type = str(value.get("document_type") or "general").strip().lower()
+    split_strategy = str(value.get("split_strategy") or "recursive").strip().lower()
+    if document_type not in allowed_document_types:
+        document_type = "general"
+    if split_strategy not in allowed_split_strategies:
+        split_strategy = "recursive"
+
+    try:
+        confidence = float(value.get("confidence") or 0.6)
+    except (TypeError, ValueError):
+        confidence = 0.6
+    confidence = max(0.0, min(confidence, 1.0))
+
+    raw_reasons = value.get("reasons") or []
+    if isinstance(raw_reasons, str):
+        reasons = [raw_reasons]
+    elif isinstance(raw_reasons, list):
+        reasons = [str(reason).strip() for reason in raw_reasons if str(reason).strip()]
+    else:
+        reasons = []
+
+    return {
+        "document_type": document_type,
+        "split_strategy": split_strategy,
+        "confidence": confidence,
+        "reasons": reasons[:5] or ["模型根据文档结构样本给出推荐。"],
+    }
+
+
+def _recommend_upload_split_strategy(upload_id: str) -> dict:
+    """读取临时上传文件样本，并调用低延迟模型推荐文档类型和切分策略。"""
+
+    _, file_path = _get_preview_file(upload_id)
+    filename = os.path.basename(file_path)
+    file_type = _validate_file_type(filename)
+    from rag.vector_store import VectorStoreService
+
+    documents = VectorStoreService().get_file_documents(file_path)
+    full_text = "\n\n".join(document.page_content for document in documents)
+    sample_text = _build_structure_sample(full_text, max_chars=10000)
+    if not sample_text:
+        raise HTTPException(status_code=400, detail="文件没有可用于模型推荐的文本内容")
+
+    structure = _analyze_structure_text(sample_text)
+    selected_model_mode = "low"
+    selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
+    logger.info(
+        "[知识库] 模型推荐切分方式开始 上传编号=%s 文件名=%s 模型名称=%s 样本字符数=%s 结构统计=%s",
+        upload_id,
+        filename,
+        selected_model_name,
+        len(sample_text),
+        structure,
+    )
+
+    model = get_chat_model(selected_model_mode)
+    response = model.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "你是知识库文档切分策略推荐器。只根据文档结构推荐，不总结正文。"
+                    "必须只返回 JSON，不要返回 Markdown。"
+                )
+            ),
+            HumanMessage(
+                content=(
+                    "请从以下枚举中选择：\n"
+                    "document_type: faq, manual, troubleshooting, maintenance, policy, spec, guide, general\n"
+                    "split_strategy: numbered_qa, numbered_segments, recursive\n\n"
+                    "判断原则：\n"
+                    "- 明确题目/答案、FAQ、面试问答，优先 numbered_qa。\n"
+                    "- 大量编号条目但不是问答，优先 numbered_segments。\n"
+                    "- 结构不稳定、普通文章、长段落，使用 recursive。\n\n"
+                    f"文件名：{filename}\n文件类型：{file_type}\n结构统计：{json.dumps(structure, ensure_ascii=False)}\n\n"
+                    f"文档结构样本：\n{sample_text}\n\n"
+                    "返回 JSON 格式："
+                    '{"document_type":"general","split_strategy":"recursive","confidence":0.75,"reasons":["原因1","原因2"]}'
+                )
+            ),
+        ]
+    )
+    recommendation = _normalize_recommendation(_parse_model_json(response.content))
+    logger.info(
+        "[知识库] 模型推荐切分方式完成 上传编号=%s 文件名=%s 推荐=%s",
+        upload_id,
+        filename,
+        recommendation,
+    )
+    return {
+        **recommendation,
+        "sample_chars": len(sample_text),
+        "model_name": selected_model_name,
+    }
+
+
 def _index_document(
         store: KnowledgeStore,
         document: dict,
@@ -151,6 +351,7 @@ def _index_document(
         vector_store=None,
         document_type: str | None = None,
         split_strategy: str | None = None,
+        collection_name: str | None = None,
 ) -> dict:
     """把 documents 表中的文件解析、分片、向量化并写入 Qdrant。
 
@@ -165,11 +366,17 @@ def _index_document(
     """
 
     document_id = document["document_id"]
+    final_collection_name = normalize_qdrant_collection_name(collection_name or document.get("collection_name"))
+    final_document_type = document_type or document.get("document_type") or "general"
+    final_split_strategy = split_strategy or document.get("split_strategy") or "recursive"
     store.update_document_status(
         document_id,
         "indexing",
         error_message=None,
         increment_version=increment_version,
+        collection_name=final_collection_name,
+        document_type=final_document_type,
+        split_strategy=final_split_strategy,
     )
 
     indexing_document = store.get_document(document_id)
@@ -180,19 +387,34 @@ def _index_document(
         if vector_store is None:
             from rag.vector_store import VectorStoreService  # 延迟导入，只有真正入库时才加载向量库和 embedding 模型
 
-            vector_store = VectorStoreService()
+            vector_store = VectorStoreService(collection_name=final_collection_name)
 
         chunk_count = vector_store.index_file(
             indexing_document,
-            document_type=document_type,
-            split_strategy=split_strategy,
+            document_type=final_document_type,
+            split_strategy=final_split_strategy,
         )
-        store.update_document_status(document_id, "indexed", chunk_count=chunk_count, error_message=None)
+        store.update_document_status(
+            document_id,
+            "indexed",
+            chunk_count=chunk_count,
+            error_message=None,
+            collection_name=final_collection_name,
+            document_type=final_document_type,
+            split_strategy=final_split_strategy,
+        )
     except HTTPException:
         raise
     except Exception as exc:
         logger.error(f"[知识库] 文件入库失败 文档编号={document_id} 错误={exc}", exc_info=True)
-        store.update_document_status(document_id, "failed", error_message=str(exc))
+        store.update_document_status(
+            document_id,
+            "failed",
+            error_message=str(exc),
+            collection_name=final_collection_name,
+            document_type=final_document_type,
+            split_strategy=final_split_strategy,
+        )
         raise HTTPException(status_code=500, detail=f"知识库入库失败：{exc}") from exc
 
     indexed_document = store.get_document(document_id)
@@ -200,6 +422,31 @@ def _index_document(
         raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
     return indexed_document
+
+
+def _load_data_manifest() -> dict:
+    manifest_path = get_abs_path(os.path.join(qdrant_conf["data_path"], "knowledge_manifest.yml"))
+    if not os.path.exists(manifest_path):
+        return {"defaults": {}, "files": {}}
+
+    with open(manifest_path, "r", encoding="utf-8") as file:
+        data = yaml.safe_load(file) or {}
+
+    return {
+        "defaults": data.get("defaults") or {},
+        "files": data.get("files") or {},
+    }
+
+
+def _data_manifest_entry(filename: str, manifest: dict) -> dict:
+    defaults = manifest.get("defaults") or {}
+    files = manifest.get("files") or {}
+    entry = files.get(filename) or {}
+    return {
+        "collection_name": normalize_qdrant_collection_name(entry.get("collection_name") or defaults.get("collection_name")),
+        "document_type": entry.get("document_type") or defaults.get("document_type") or "general",
+        "split_strategy": entry.get("split_strategy") or defaults.get("split_strategy") or "recursive",
+    }
 
 
 def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
@@ -216,10 +463,12 @@ def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
     data_path = get_abs_path(qdrant_conf["data_path"])
     allowed_types = tuple(qdrant_conf["allow_knowledge_file_type"])
     file_paths = listdir_with_allowed_type(data_path, allowed_types)
+    manifest = _load_data_manifest()
     documents: list[dict] = []
 
     for file_path in file_paths:
         filename = os.path.basename(file_path)
+        manifest_entry = _data_manifest_entry(filename, manifest)
         file_type = os.path.splitext(filename)[1].lower().lstrip(".")
         file_md5 = get_file_md5_hex(file_path)
 
@@ -227,8 +476,19 @@ def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
             logger.warning(f"[知识库] 跳过无法计算MD5的内置知识文件 路径={file_path}")
             continue
 
-        existing_document = store.find_active_document_by_md5(file_md5)
+        existing_document = store.find_active_document_by_md5(
+            file_md5,
+            collection_name=manifest_entry["collection_name"],
+        )
         if existing_document is not None:
+            store.update_document_status(
+                existing_document["document_id"],
+                existing_document["status"],
+                collection_name=manifest_entry["collection_name"],
+                document_type=manifest_entry["document_type"],
+                split_strategy=manifest_entry["split_strategy"],
+            )
+            existing_document = store.get_document(existing_document["document_id"]) or existing_document
             documents.append(existing_document)
             continue
 
@@ -242,6 +502,9 @@ def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
                 file_md5=file_md5,
                 file_size=os.path.getsize(file_path),
                 status="uploaded",
+                collection_name=manifest_entry["collection_name"],
+                document_type=manifest_entry["document_type"],
+                split_strategy=manifest_entry["split_strategy"],
             )
         )
 
@@ -365,6 +628,7 @@ def _save_chat_exchange(
         conversation_id: str,
         message: str,
         answer: str,
+        model_name: str | None = None,
         metadata: dict | None = None,
 ) -> None:
     """把一轮用户问题和助手回答保存到 SQLite 会话历史。"""
@@ -374,6 +638,7 @@ def _save_chat_exchange(
         conversation_id=conversation_id,
         user_message=message,
         assistant_message=answer,
+        model_name=model_name,
         metadata=metadata,
     )
 
@@ -406,11 +671,20 @@ def _stream_agent(
     try:  # 流式生成期间任何异常都会转成 SSE error 事件
         stream_start_time = time.perf_counter()
         first_token_ms: float | None = None
+        selected_model_mode = normalize_chat_model_mode(None)
+        selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
         logger.info(
-            f"[接口] Agent流式输出开始 用户编号={user_id} "
-            f"会话编号={conversation_id} 问题={message}"
+            f"[接口] Agent流式输出开始 用户编号={user_id} 会话编号={conversation_id} "
+            f"模型模式={selected_model_mode} 模型名称={selected_model_name} 问题={message}"
         )
-        meta_payload = json.dumps({"conversation_id": conversation_id}, ensure_ascii=False)
+        meta_payload = json.dumps(
+            {
+                "conversation_id": conversation_id,
+                "model_mode": selected_model_mode,
+                "model_name": selected_model_name,
+            },
+            ensure_ascii=False,
+        )
         yield f"event: meta\ndata: {meta_payload}\n\n"
 
         chunks: list[str] = []
@@ -437,18 +711,26 @@ def _stream_agent(
                 conversation_id=conversation_id,
                 message=message,
                 answer=answer,
+                model_name=selected_model_name,
                 metadata={
                     "mode": "stream",
+                    "model_mode": selected_model_mode,
+                    "model_name": selected_model_name,
                     "first_token_ms": first_token_ms,
                     "total_ms": total_ms,
                 },
             )
 
-        logger.info(f"[接口] Agent流式输出完成 用户编号={user_id} 会话编号={conversation_id}")
+        logger.info(
+            f"[接口] Agent流式输出完成 用户编号={user_id} 会话编号={conversation_id} "
+            f"模型模式={selected_model_mode} 模型名称={selected_model_name}"
+        )
         done_payload = json.dumps(
             {
                 "done": True,
                 "conversation_id": conversation_id,
+                "model_mode": selected_model_mode,
+                "model_name": selected_model_name,
                 "first_token_ms": first_token_ms,
                 "total_ms": total_ms,
             },
@@ -468,6 +750,8 @@ def _stream_direct_rag(
         user_id: str | None = None,
         conversation_id: str | None = None,
         history: list[dict] | None = None,
+        model_mode: str | None = None,
+        collection_name: str | None = None,
 ) -> Iterator[str]:
     """把知识库直答 token 流转换成 SSE 文本流。
 
@@ -478,18 +762,30 @@ def _stream_direct_rag(
     try:
         stream_start_time = time.perf_counter()
         first_token_ms: float | None = None
+        selected_model_mode = normalize_chat_model_mode(model_mode)
+        selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
+        selected_collection_name = normalize_qdrant_collection_name(collection_name)
         # 记录当前流式请求进入 direct_rag 链路。
         logger.info(
-            "[聊天路由] 流式接口走知识直答 用户编号=%s 会话编号=%s 问题=%s",
+            "[聊天路由] 流式接口走知识直答 用户编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 问题=%s",
             user_id,
             conversation_id,
+            selected_collection_name,
+            selected_model_mode,
+            selected_model_name,
             message,
         )
 
         # 先发一个 meta 事件给前端。
         # 前端可以在收到正文前就拿到 conversation_id，并知道当前模式是 direct_rag。
         meta_payload = json.dumps(
-            {"conversation_id": conversation_id, "mode": "direct_rag"},
+            {
+                "conversation_id": conversation_id,
+                "mode": "direct_rag",
+                "collection_name": selected_collection_name,
+                "model_mode": selected_model_mode,
+                "model_name": selected_model_name,
+            },
             ensure_ascii=False,
         )
 
@@ -504,7 +800,12 @@ def _stream_direct_rag(
 
         # 调用知识库直答服务：
         # 内部流程是 RAG 检索上下文 -> 调用最终回答模型 stream() -> 逐段返回文本。
-        for chunk in _get_knowledge_answer_service().stream_answer(message, history=history or []):
+        for chunk in _get_knowledge_answer_service().stream_answer(
+            message,
+            history=history or [],
+            model_mode=selected_model_mode,
+            collection_name=selected_collection_name,
+        ):
             # 保存当前分片，后面用于拼接完整回答。
             if first_token_ms is None:
                 first_token_ms = _elapsed_ms(stream_start_time)
@@ -529,21 +830,35 @@ def _stream_direct_rag(
                 conversation_id=conversation_id,
                 message=message,
                 answer=answer,
+                model_name=selected_model_name,
                 metadata={
                     "mode": "direct_rag_stream",
+                    "model_mode": selected_model_mode,
+                    "model_name": selected_model_name,
+                    "collection_name": selected_collection_name,
                     "first_token_ms": first_token_ms,
                     "total_ms": total_ms,
                 },
             )
 
         # 记录后端流式生成结束。
-        logger.info("[聊天路由] 知识直答流式完成 用户编号=%s 会话编号=%s", user_id, conversation_id)
+        logger.info(
+            "[聊天路由] 知识直答流式完成 用户编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s",
+            user_id,
+            conversation_id,
+            selected_collection_name,
+            selected_model_mode,
+            selected_model_name,
+        )
 
         # 通知前端本次流式回答结束。
         done_payload = json.dumps(
             {
                 "done": True,
                 "conversation_id": conversation_id,
+                "collection_name": selected_collection_name,
+                "model_mode": selected_model_mode,
+                "model_name": selected_model_name,
                 "first_token_ms": first_token_ms,
                 "total_ms": total_ms,
             },

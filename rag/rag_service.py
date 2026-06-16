@@ -27,6 +27,7 @@ from rag.reranker import RuleBasedReranker
 from rag.vector_store import VectorStoreService
 from utils.config_handler import qdrant_conf, rag_conf
 from utils.logger_handler import logger
+from utils.qdrant_options import normalize_qdrant_collection_name
 
 
 @dataclass
@@ -45,10 +46,11 @@ class RagSummarizeService(object):
 
     def __init__(self):
         self.vector_store: VectorStoreService | None = None  # Qdrant 向量库服务，懒加载，避免 Qdrant 不可用时整个 RAG 初始化失败
+        self.vector_stores: dict[str, VectorStoreService] = {}  # 按 collection 缓存向量库服务，避免多知识库互相串用
         self.query_planner = QueryPlannerService()  # LLM Query Planner，负责把复杂问题拆成多个 search_query
         self.reranker = RuleBasedReranker()  # 规则版精排器
 
-    def _get_vector_store(self) -> VectorStoreService:
+    def _get_vector_store(self, collection_name: str | None = None) -> VectorStoreService:
         """懒加载 Qdrant 向量库服务。
 
         Qdrant 是外部服务，可能在开发时暂时没启动。
@@ -58,10 +60,19 @@ class RagSummarizeService(object):
         - Qdrant 不可用时，异常会被检索流程捕获并返回空候选。
         """
 
-        if self.vector_store is None:
+        normalized_collection_name = normalize_qdrant_collection_name(collection_name)
+        if collection_name is None and self.vector_store is None:
             self.vector_store = VectorStoreService()
+            self.vector_stores[normalized_collection_name] = self.vector_store
 
-        return self.vector_store
+        if collection_name is None and self.vector_store is not None:
+            self.vector_stores[normalized_collection_name] = self.vector_store
+            return self.vector_store
+
+        if normalized_collection_name not in self.vector_stores:
+            self.vector_stores[normalized_collection_name] = VectorStoreService(collection_name=normalized_collection_name)
+
+        return self.vector_stores[normalized_collection_name]
 
     def retriever_docs(
             self,
@@ -69,6 +80,7 @@ class RagSummarizeService(object):
             *,
             history: list[dict] | None = None,
             trace_id: str | None = None,
+            collection_name: str | None = None,
     ) -> list[Document]:
         """检索并精排用户问题相关资料。
 
@@ -95,6 +107,7 @@ class RagSummarizeService(object):
             analysis,
             history=history,
             trace_id=trace_id,
+            collection_name=collection_name,
         )
         logger.info(
             "[性能] RAG召回完成 追踪编号=%s 耗时毫秒=%.2f 检索问题数=%s 候选资料数=%s",
@@ -142,11 +155,18 @@ class RagSummarizeService(object):
             *,
             history: list[dict] | None = None,
             trace_id: str | None = None,
+            collection_name: str | None = None,
     ) -> tuple[list[str], list[tuple[str, list[Document]]]]:
         planner_mode = str(rag_conf.get("query_planner_mode") or "adaptive").strip().lower()
 
         if planner_mode == "adaptive":
-            return self._adaptive_plan_and_retrieve(query, analysis, history=history, trace_id=trace_id)
+            return self._adaptive_plan_and_retrieve(
+                query,
+                analysis,
+                history=history,
+                trace_id=trace_id,
+                collection_name=collection_name,
+            )
 
         search_queries = self.query_planner.plan(query, history=history, trace_id=trace_id)
         logger.info(
@@ -156,7 +176,12 @@ class RagSummarizeService(object):
             len(search_queries),
             self._format_query_lines(search_queries),
         )
-        return search_queries, self.retrieve_for_queries(search_queries, analysis, trace_id=trace_id)
+        return search_queries, self.retrieve_for_queries(
+            search_queries,
+            analysis,
+            trace_id=trace_id,
+            collection_name=collection_name,
+        )
 
     def _adaptive_plan_and_retrieve(
             self,
@@ -165,9 +190,18 @@ class RagSummarizeService(object):
             *,
             history: list[dict] | None = None,
             trace_id: str | None = None,
+            collection_name: str | None = None,
     ) -> tuple[list[str], list[tuple[str, list[Document]]]]:
         first_queries = self.query_planner.plan_initial(query, trace_id=trace_id)
-        first_groups = self.retrieve_for_queries(first_queries, analysis, trace_id=trace_id)
+        if collection_name is None:
+            first_groups = self.retrieve_for_queries(first_queries, analysis, trace_id=trace_id)
+        else:
+            first_groups = self.retrieve_for_queries(
+                first_queries,
+                analysis,
+                trace_id=trace_id,
+                collection_name=collection_name,
+            )
         first_documents = [document for _, documents in first_groups for document in documents]
         quality = self.evaluate_retrieval_quality(first_documents)
         logger.info(
@@ -184,6 +218,17 @@ class RagSummarizeService(object):
             logger.info("[查询规划] adaptive模式跳过模型拆分 追踪编号=%s", trace_id)
             return first_queries, first_groups
 
+        if self._should_skip_planner_for_low_quality(query, analysis, quality):
+            logger.info(
+                "[查询规划] adaptive模式跳过模型改写 追踪编号=%s 原因=首次召回分数极低且未命中业务关键词 "
+                "最高分=%.4f 前三平均分=%.4f 检索问题数=%s",
+                trace_id,
+                quality.top1_score,
+                quality.top3_avg_score,
+                len(first_queries),
+            )
+            return first_queries, first_groups
+
         planned_queries = self.query_planner.plan_with_config(query, history=history, trace_id=trace_id)
         search_queries = self.query_planner.merge_queries(first_queries, planned_queries)
         if search_queries == first_queries:
@@ -198,7 +243,15 @@ class RagSummarizeService(object):
             self._format_query_lines(search_queries),
         )
         logger.info("[查询规划] adaptive模式复用首次原问题召回结果 追踪编号=%s", trace_id)
-        additional_groups = self.retrieve_for_queries(additional_queries, analysis, trace_id=trace_id)
+        if collection_name is None:
+            additional_groups = self.retrieve_for_queries(additional_queries, analysis, trace_id=trace_id)
+        else:
+            additional_groups = self.retrieve_for_queries(
+                additional_queries,
+                analysis,
+                trace_id=trace_id,
+                collection_name=collection_name,
+            )
         return search_queries, [*first_groups, *additional_groups]
 
     @staticmethod
@@ -232,7 +285,70 @@ class RagSummarizeService(object):
             reason="；".join(reasons) or "召回质量达标",
         )
 
-    def debug_retrieve(self, query: str) -> dict:
+    @staticmethod
+    def _should_skip_planner_for_low_quality(
+            query: str,
+            analysis: QueryAnalysis,
+            quality: RetrievalQuality,
+    ) -> bool:
+        if not bool(rag_conf.get("adaptive_skip_planner_on_very_low_score", True)):
+            return False
+
+        if analysis.intents or analysis.filters:
+            return False
+
+        if RagSummarizeService._has_business_keyword(query):
+            return False
+
+        max_score = float(rag_conf.get("adaptive_skip_planner_max_score", 0.45) or 0.45)
+        max_top3_avg = float(rag_conf.get("adaptive_skip_planner_top3_avg_score", 0.42) or 0.42)
+        return quality.top1_score < max_score and quality.top3_avg_score < max_top3_avg
+
+    @staticmethod
+    def _has_business_keyword(query: str) -> bool:
+        lowered_query = query.lower()
+        business_keywords = {
+            "app",
+            "扫地",
+            "扫拖",
+            "机器人",
+            "清扫",
+            "拖地",
+            "吸力",
+            "地毯",
+            "宠物",
+            "猫",
+            "狗",
+            "毛发",
+            "猫砂",
+            "狗砂",
+            "充电",
+            "回充",
+            "基站",
+            "电池",
+            "没电",
+            "地图",
+            "建图",
+            "避障",
+            "尘盒",
+            "拖布",
+            "滚刷",
+            "边刷",
+            "滤网",
+            "耗材",
+            "故障",
+            "报错",
+            "联网",
+            "网络",
+            "续航",
+            "水箱",
+            "噪音",
+            "漏扫",
+            "卡住",
+        }
+        return any(keyword in lowered_query for keyword in business_keywords)
+
+    def debug_retrieve(self, query: str, collection_name: str | None = None) -> dict:
         """返回 RAG 检索调试信息。
 
         这个方法可以给后续 `/debug/retrieve` 接口使用。
@@ -245,7 +361,11 @@ class RagSummarizeService(object):
 
         analysis = self._build_neutral_analysis(query)
         self._log_intent_analysis(query, analysis)
-        search_queries, candidate_groups = self._plan_and_retrieve(query, analysis)
+        search_queries, candidate_groups = self._plan_and_retrieve(
+            query,
+            analysis,
+            collection_name=collection_name,
+        )
         reranked_docs = self.reranker.rerank_by_query(
             original_query=query,
             grouped_documents=candidate_groups,
@@ -284,6 +404,7 @@ class RagSummarizeService(object):
             analysis: QueryAnalysis,
             *,
             trace_id: str | None = None,
+            collection_name: str | None = None,
     ) -> list[tuple[str, list[Document]]]:
         """每个 search_query 单独召回 Qdrant top5。"""
 
@@ -292,13 +413,28 @@ class RagSummarizeService(object):
             return []
 
         if len(safe_queries) == 1:
-            return [self._retrieve_one_query(0, safe_queries[0], analysis, trace_id=trace_id)]
+            return [
+                self._retrieve_one_query(
+                    0,
+                    safe_queries[0],
+                    analysis,
+                    trace_id=trace_id,
+                    collection_name=collection_name,
+                )
+            ]
 
-        self._get_vector_store()
+        self._get_vector_store(collection_name)
         max_workers = min(len(safe_queries), int(qdrant_conf.get("parallel_query_workers", 4) or 4))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(self._retrieve_one_query, query_index, search_query, analysis, trace_id=trace_id)
+                executor.submit(
+                    self._retrieve_one_query,
+                    query_index,
+                    search_query,
+                    analysis,
+                    trace_id=trace_id,
+                    collection_name=collection_name,
+                )
                 for query_index, search_query in enumerate(safe_queries)
             ]
             return [future.result() for future in futures]
@@ -310,6 +446,7 @@ class RagSummarizeService(object):
             analysis: QueryAnalysis,
             *,
             trace_id: str | None = None,
+            collection_name: str | None = None,
     ) -> tuple[str, list[Document]]:
         per_query_top_k = int(qdrant_conf.get("per_query_top_k", 5) or 5)
         use_metadata_filter = bool(qdrant_conf.get("use_metadata_filter", False))
@@ -323,6 +460,7 @@ class RagSummarizeService(object):
                 filters=analysis.filters,
                 filter_label="元数据",
                 trace_id=trace_id,
+                collection_name=collection_name,
             )
 
         if not documents:
@@ -333,6 +471,7 @@ class RagSummarizeService(object):
                 filters=None,
                 filter_label="无",
                 trace_id=trace_id,
+                collection_name=collection_name,
             )
 
         logger.info(
@@ -360,6 +499,7 @@ class RagSummarizeService(object):
             filters: dict[str, list[str]] | None,
             filter_label: str,
             trace_id: str | None = None,
+            collection_name: str | None = None,
     ) -> list[Document]:
         try:
             retrieve_start_time = time.perf_counter()
@@ -370,7 +510,7 @@ class RagSummarizeService(object):
                 filters or "无",
                 k,
             )
-            documents = self._get_vector_store().search_documents(
+            documents = self._get_vector_store(collection_name).search_documents(
                 search_query,
                 k=k,
                 filters=filters,
@@ -513,6 +653,7 @@ class RagSummarizeService(object):
             *,
             history: list[dict] | None = None,
             trace_id: str | None = None,
+            collection_name: str | None = None,
     ) -> str:
         """返回给 Agent 的 RAG 参考资料文本。
 
@@ -521,7 +662,12 @@ class RagSummarizeService(object):
         """
 
         start_time = time.perf_counter()
-        context_docs = self.retriever_docs(query, history=history, trace_id=trace_id)
+        context_docs = self.retriever_docs(
+            query,
+            history=history,
+            trace_id=trace_id,
+            collection_name=collection_name,
+        )
 
         context = ""
         for counter, doc in enumerate(context_docs, start=1):

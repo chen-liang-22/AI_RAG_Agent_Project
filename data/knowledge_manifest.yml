@@ -1,0 +1,30 @@
+defaults:
+  collection_name: agent
+  document_type: general
+  split_strategy: recursive
+
+files:
+  扫地机器人100问.pdf:
+    collection_name: agent
+    document_type: faq
+    split_strategy: numbered_qa
+  扫地机器人100问2.txt:
+    collection_name: agent
+    document_type: faq
+    split_strategy: numbered_qa
+  扫拖一体机器人100问.txt:
+    collection_name: agent
+    document_type: faq
+    split_strategy: numbered_qa
+  故障排除.txt:
+    collection_name: agent
+    document_type: troubleshooting
+    split_strategy: numbered_segments
+  维护保养.txt:
+    collection_name: agent
+    document_type: maintenance
+    split_strategy: numbered_segments
+  选购指南.txt:
+    collection_name: agent
+    document_type: guide
+    split_strategy: numbered_segments

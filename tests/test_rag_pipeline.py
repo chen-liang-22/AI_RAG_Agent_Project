@@ -135,6 +135,52 @@ def test_adaptive_plan_calls_llm_when_initial_retrieval_is_weak(monkeypatch):
     assert len(groups) == 3
 
 
+def test_adaptive_plan_skips_llm_when_score_is_very_low_without_business_keyword(monkeypatch):
+    service = RagSummarizeService()
+    analysis = QueryAnalysis(original_query="reacjhnio")
+    weak_documents = [
+        Document(page_content="unrelated one", metadata={"_vector_score": 0.38}),
+        Document(page_content="unrelated two", metadata={"_vector_score": 0.37}),
+        Document(page_content="unrelated three", metadata={"_vector_score": 0.36}),
+    ]
+
+    monkeypatch.setattr(service, "retrieve_for_queries", lambda queries, analysis, trace_id=None: [(queries[0], weak_documents)])
+    monkeypatch.setattr(
+        service.query_planner,
+        "plan_with_config",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("planner should be skipped")),
+    )
+
+    queries, groups = service._adaptive_plan_and_retrieve("reacjhnio", analysis)
+
+    assert queries == ["reacjhnio"]
+    assert groups == [("reacjhnio", weak_documents)]
+
+
+def test_adaptive_plan_keeps_llm_for_business_keyword_even_when_score_is_low(monkeypatch):
+    service = RagSummarizeService()
+    analysis = QueryAnalysis(original_query="没电还能跑吗")
+    weak_documents = [
+        Document(page_content="weak one", metadata={"_vector_score": 0.38}),
+        Document(page_content="weak two", metadata={"_vector_score": 0.37}),
+        Document(page_content="weak three", metadata={"_vector_score": 0.36}),
+    ]
+    calls: list[list[str]] = []
+
+    def fake_retrieve(queries, analysis, trace_id=None):
+        calls.append(list(queries))
+        return [(query, weak_documents) for query in queries]
+
+    monkeypatch.setattr(service, "retrieve_for_queries", fake_retrieve)
+    monkeypatch.setattr(service.query_planner, "plan_with_config", lambda *args, **kwargs: ["低电量清扫能力"])
+
+    queries, groups = service._adaptive_plan_and_retrieve("没电还能跑吗", analysis)
+
+    assert queries == ["没电还能跑吗", "低电量清扫能力"]
+    assert len(calls) == 2
+    assert len(groups) == 2
+
+
 def test_retrieve_one_query_skips_metadata_filter_when_disabled(monkeypatch):
     service = RagSummarizeService()
     calls = []

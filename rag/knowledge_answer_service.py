@@ -13,7 +13,7 @@ from collections.abc import Iterator
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 
-from model.factory import chat_model
+from model.factory import get_chat_model, get_chat_model_name_for_mode, normalize_chat_model_mode
 from rag.rag_service import RagSummarizeService
 from utils.logger_handler import logger
 
@@ -24,23 +24,42 @@ class KnowledgeAnswerService:
     def __init__(self):
         self.rag = RagSummarizeService()
 
-    def answer(self, query: str, *, history: list[dict] | None = None) -> str:
+    def answer(
+            self,
+            query: str,
+            *,
+            history: list[dict] | None = None,
+            model_mode: str | None = None,
+            collection_name: str | None = None,
+    ) -> str:
         """一次性生成知识库问答结果。"""
 
         trace_id = self._new_trace_id()
         total_start_time = time.perf_counter()
-        context = self._retrieve_context(query, history=history, trace_id=trace_id)
+        selected_model = get_chat_model(model_mode)
+        selected_model_mode = normalize_chat_model_mode(model_mode)
+        selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
+        context = self._retrieve_context(
+            query,
+            history=history,
+            trace_id=trace_id,
+            collection_name=collection_name,
+        )
         logger.info(
-            "[知识直答] 非流式回答开始 追踪编号=%s 问题=%s 参考资料字符数=%s",
+            "[知识直答] 非流式回答开始 追踪编号=%s 问题=%s 参考资料字符数=%s 模型模式=%s 模型名称=%s",
             trace_id,
             query,
             len(context),
+            selected_model_mode,
+            selected_model_name,
         )
         llm_start_time = time.perf_counter()
-        response = chat_model.invoke(self._build_messages(query, context, history=history))
+        response = selected_model.invoke(self._build_messages(query, context, history=history))
         logger.info(
-            "[性能] 最终模型调用完成 追踪编号=%s 模式=非流式 耗时毫秒=%.2f",
+            "[性能] 最终模型调用完成 追踪编号=%s 模式=非流式 模型模式=%s 模型名称=%s 耗时毫秒=%.2f",
             trace_id,
+            selected_model_mode,
+            selected_model_name,
             self._elapsed_ms(llm_start_time),
         )
         answer = self._message_content_to_text(response.content).strip()
@@ -53,31 +72,50 @@ class KnowledgeAnswerService:
         logger.info("[知识直答] 非流式回答完成 追踪编号=%s 问题=%s 回答字符数=%s", trace_id, query, len(answer))
         return answer
 
-    def stream_answer(self, query: str, *, history: list[dict] | None = None) -> Iterator[str]:
+    def stream_answer(
+            self,
+            query: str,
+            *,
+            history: list[dict] | None = None,
+            model_mode: str | None = None,
+            collection_name: str | None = None,
+    ) -> Iterator[str]:
         """流式生成知识库问答结果。"""
 
         trace_id = self._new_trace_id()
         total_start_time = time.perf_counter()
-        context = self._retrieve_context(query, history=history, trace_id=trace_id)
+        selected_model = get_chat_model(model_mode)
+        selected_model_mode = normalize_chat_model_mode(model_mode)
+        selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
+        context = self._retrieve_context(
+            query,
+            history=history,
+            trace_id=trace_id,
+            collection_name=collection_name,
+        )
         logger.info(
-            "[知识直答] 流式回答开始 追踪编号=%s 问题=%s 参考资料字符数=%s",
+            "[知识直答] 流式回答开始 追踪编号=%s 问题=%s 参考资料字符数=%s 模型模式=%s 模型名称=%s",
             trace_id,
             query,
             len(context),
+            selected_model_mode,
+            selected_model_name,
         )
         total_chars = 0
         chunk_count = 0
         llm_start_time = time.perf_counter()
         first_chunk_time: float | None = None
-        for chunk in chat_model.stream(self._build_messages(query, context, history=history)):
+        for chunk in selected_model.stream(self._build_messages(query, context, history=history)):
             content = self._message_content_to_text(chunk.content)
             if not content:
                 continue
             if first_chunk_time is None:
                 first_chunk_time = time.perf_counter()
                 logger.info(
-                    "[性能] 首个回答分片到达 追踪编号=%s 耗时毫秒=%.2f 上下文字符数=%s",
+                    "[性能] 首个回答分片到达 追踪编号=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f 上下文字符数=%s",
                     trace_id,
+                    selected_model_mode,
+                    selected_model_name,
                     self._elapsed_ms(llm_start_time),
                     len(context),
                 )
@@ -85,8 +123,10 @@ class KnowledgeAnswerService:
             chunk_count += 1
             yield content
         logger.info(
-            "[性能] 流式模型输出完成 追踪编号=%s 耗时毫秒=%.2f 分片数=%s 回答字符数=%s",
+            "[性能] 流式模型输出完成 追踪编号=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f 分片数=%s 回答字符数=%s",
             trace_id,
+            selected_model_mode,
+            selected_model_name,
             self._elapsed_ms(llm_start_time),
             chunk_count,
             total_chars,
@@ -104,11 +144,17 @@ class KnowledgeAnswerService:
             *,
             history: list[dict] | None = None,
             trace_id: str | None = None,
+            collection_name: str | None = None,
     ) -> str:
         """统一走普通多意图 RAG 检索，不再做 FAQ 编号/列表特殊分支。"""
 
         start_time = time.perf_counter()
-        context = self.rag.rag_summarize(query, history=history, trace_id=trace_id)
+        context = self.rag.rag_summarize(
+            query,
+            history=history,
+            trace_id=trace_id,
+            collection_name=collection_name,
+        )
         logger.info(
             "[性能] 知识直答上下文准备完成 追踪编号=%s 耗时毫秒=%.2f 上下文字符数=%s",
             trace_id,
@@ -170,7 +216,7 @@ class KnowledgeAnswerService:
     @staticmethod
     def _system_prompt() -> str:
         return (
-            "你是扫地/扫拖机器人客服。"
+            "你是扫地/扫拖机器人客服,叫阿良。"
             "优先根据参考资料回答。"
             "如果问题属于基础常识，可以直接简洁回答。"
             "不要编造具体品牌型号、价格、参数、APP路径、售后政策或故障代码。"

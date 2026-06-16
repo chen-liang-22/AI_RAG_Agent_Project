@@ -1,52 +1,66 @@
-import os  # 读取 OpenAI-compatible API key
-from abc import ABC, abstractmethod  # 定义抽象工厂基类，约束子类必须实现 generator
-from typing import Optional  # 标注 generator 可能返回模型对象，也可能返回 None
-from langchain_core.embeddings import Embeddings  # 向量模型的通用类型
-from langchain_community.chat_models.tongyi import BaseChatModel  # 聊天模型的通用类型
-from langchain_community.embeddings import DashScopeEmbeddings  # 通义 DashScope embedding 模型
-from langchain_community.chat_models.tongyi import ChatTongyi  # 通义聊天模型
-from langchain_openai import ChatOpenAI  # OpenAI-compatible 聊天模型，支持百炼兼容模式
-from utils.config_handler import rag_conf  # 读取 config 下的 RAG/模型配置
+import os
+from abc import ABC, abstractmethod
+from functools import lru_cache
+from typing import Optional
+
+from langchain_community.chat_models.tongyi import BaseChatModel, ChatTongyi
+from langchain_community.embeddings import DashScopeEmbeddings
+from langchain_core.embeddings import Embeddings
+from langchain_openai import ChatOpenAI
+
+from utils.config_handler import rag_conf
 
 
 class BaseModelFactory(ABC):
     @abstractmethod
     def generator(self) -> Optional[Embeddings | BaseChatModel]:
-        pass  # 抽象方法，具体子类负责创建聊天模型或向量模型
+        pass
 
 
 class ChatModelFactory(BaseModelFactory):
-    def generator(self) -> Optional[Embeddings | BaseChatModel]:
-        # streaming=True 是真实流式输出的模型层开关。
-        #
-        # 如果这里不开启：
-        # - Agent 的 stream 接口仍然可以被调用；
-        # - 但底层模型不会边生成边吐 token；
-        # - 前端最终看到的仍可能接近“一次性返回”。
-        #
-        # 开启后，ChatTongyi 会把模型生成过程拆成多个 AIMessageChunk，
-        # ReactAgent.execute_stream() 才能逐段 yield 给 FastAPI 的 SSE 接口。
+    def generator(self, model_name: str | None = None) -> Optional[Embeddings | BaseChatModel]:
         provider = str(rag_conf.get("chat_provider") or "tongyi").strip().lower()
-        model_name = rag_conf["chat_model_name"]
+        selected_model_name = model_name or rag_conf["chat_model_name"]
 
         if provider in {"openai_compatible", "openai-compatible", "openai"}:
             return ChatOpenAI(
-                model=model_name,
+                model=selected_model_name,
                 base_url=rag_conf.get("openai_base_url"),
                 api_key=os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY") or "empty",
                 streaming=True,
             )
 
         if provider == "tongyi":
-            return ChatTongyi(model=model_name, streaming=True)  # 创建聊天模型，并打开真实流式输出
+            return ChatTongyi(model=selected_model_name, streaming=True)
 
         raise ValueError(f"不支持的 chat_provider：{provider}")
 
 
+def normalize_chat_model_mode(model_mode: str | None) -> str:
+    mode = str(model_mode or "high").strip().lower()
+    if mode in {"low", "medium", "high"}:
+        return mode
+    return "high"
+
+
+def get_chat_model_name_for_mode(model_mode: str | None = None) -> str:
+    mode = normalize_chat_model_mode(model_mode)
+    return str(rag_conf.get(f"chat_model_{mode}") or rag_conf["chat_model_name"]).strip()
+
+
+@lru_cache(maxsize=8)
+def _cached_chat_model(model_name: str) -> Optional[Embeddings | BaseChatModel]:
+    return ChatModelFactory().generator(model_name=model_name)
+
+
+def get_chat_model(model_mode: str | None = None) -> Optional[Embeddings | BaseChatModel]:
+    return _cached_chat_model(get_chat_model_name_for_mode(model_mode))
+
+
 class EmbeddingsFactory(BaseModelFactory):
     def generator(self) -> Optional[Embeddings | BaseChatModel]:
-        return DashScopeEmbeddings(model=rag_conf["embedding_model_name"])  # 创建 embedding 模型，用于文档向量化和检索
+        return DashScopeEmbeddings(model=rag_conf["embedding_model_name"])
 
 
-chat_model = ChatModelFactory().generator()  # 全局聊天模型实例，Agent 会复用它
-embed_model = EmbeddingsFactory().generator()  # 全局向量模型实例，RAG 向量库会复用它
+chat_model = get_chat_model()
+embed_model = EmbeddingsFactory().generator()

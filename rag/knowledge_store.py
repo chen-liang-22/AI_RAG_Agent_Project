@@ -62,6 +62,9 @@ class KnowledgeStore:
                     status TEXT NOT NULL,
                     version INTEGER NOT NULL DEFAULT 1,
                     chunk_count INTEGER NOT NULL DEFAULT 0,
+                    collection_name TEXT NOT NULL DEFAULT 'agent',
+                    document_type TEXT NOT NULL DEFAULT 'general',
+                    split_strategy TEXT NOT NULL DEFAULT 'recursive',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     error_message TEXT
@@ -108,6 +111,13 @@ class KnowledgeStore:
                 ON documents(file_md5)
                 """
             )
+            self._ensure_document_columns(conn)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_documents_collection
+                ON documents(collection_name)
+                """
+            )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_conversations_user_updated
@@ -139,6 +149,18 @@ class KnowledgeStore:
             conn.execute("DROP TABLE IF EXISTS knowledge_units")
 
     @staticmethod
+    def _ensure_document_columns(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+        migrations = {
+            "collection_name": "ALTER TABLE documents ADD COLUMN collection_name TEXT NOT NULL DEFAULT 'agent'",
+            "document_type": "ALTER TABLE documents ADD COLUMN document_type TEXT NOT NULL DEFAULT 'general'",
+            "split_strategy": "ALTER TABLE documents ADD COLUMN split_strategy TEXT NOT NULL DEFAULT 'recursive'",
+        }
+        for column_name, statement in migrations.items():
+            if column_name not in columns:
+                conn.execute(statement)
+
+    @staticmethod
     def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return dict(row) if row else None
 
@@ -152,6 +174,9 @@ class KnowledgeStore:
             file_md5: str,
             file_size: int,
             status: str = "uploaded",
+            collection_name: str = "agent",
+            document_type: str = "general",
+            split_strategy: str = "recursive",
     ) -> dict[str, Any]:
         now = utc_now_text()
         with self.connect() as conn:
@@ -159,11 +184,25 @@ class KnowledgeStore:
                 """
                 INSERT INTO documents (
                     document_id, filename, file_path, file_type, file_md5,
-                    file_size, status, version, chunk_count, created_at, updated_at
+                    file_size, status, version, chunk_count, collection_name,
+                    document_type, split_strategy, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?)
                 """,
-                (document_id, filename, file_path, file_type, file_md5, file_size, status, now, now),
+                (
+                    document_id,
+                    filename,
+                    file_path,
+                    file_type,
+                    file_md5,
+                    file_size,
+                    status,
+                    collection_name,
+                    document_type,
+                    split_strategy,
+                    now,
+                    now,
+                ),
             )
 
         document = self.get_document(document_id)
@@ -171,7 +210,26 @@ class KnowledgeStore:
             raise RuntimeError(f"Document {document_id} was not created")
         return document
 
-    def find_active_document_by_md5(self, file_md5: str) -> dict[str, Any] | None:
+    def find_active_document_by_md5(
+            self,
+            file_md5: str,
+            collection_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """按文件 MD5 查找未删除文档；传入 collection 时只在该 collection 内去重。"""
+
+        if collection_name:
+            with self.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT * FROM documents
+                    WHERE file_md5 = ? AND collection_name = ? AND status != 'deleted'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (file_md5, collection_name),
+                ).fetchone()
+            return self.row_to_dict(row)
+
         with self.connect() as conn:
             row = conn.execute(
                 """
@@ -211,6 +269,9 @@ class KnowledgeStore:
             chunk_count: int | None = None,
             error_message: str | None = None,
             increment_version: bool = False,
+            collection_name: str | None = None,
+            document_type: str | None = None,
+            split_strategy: str | None = None,
     ) -> None:
         document = self.get_document(document_id)
         if document is None:
@@ -218,15 +279,29 @@ class KnowledgeStore:
 
         version = int(document["version"]) + 1 if increment_version else int(document["version"])
         final_chunk_count = int(document["chunk_count"]) if chunk_count is None else chunk_count
+        final_collection_name = collection_name or document.get("collection_name") or "agent"
+        final_document_type = document_type or document.get("document_type") or "general"
+        final_split_strategy = split_strategy or document.get("split_strategy") or "recursive"
 
         with self.connect() as conn:
             conn.execute(
                 """
                 UPDATE documents
-                SET status = ?, chunk_count = ?, error_message = ?, version = ?, updated_at = ?
+                SET status = ?, chunk_count = ?, error_message = ?, version = ?,
+                    collection_name = ?, document_type = ?, split_strategy = ?, updated_at = ?
                 WHERE document_id = ?
                 """,
-                (status, final_chunk_count, error_message, version, utc_now_text(), document_id),
+                (
+                    status,
+                    final_chunk_count,
+                    error_message,
+                    version,
+                    final_collection_name,
+                    final_document_type,
+                    final_split_strategy,
+                    utc_now_text(),
+                    document_id,
+                ),
             )
 
     def mark_document_deleted(self, document_id: str) -> None:

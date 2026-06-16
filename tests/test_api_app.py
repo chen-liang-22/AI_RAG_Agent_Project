@@ -21,6 +21,7 @@ def test_openapi_exposes_core_routes():
     assert "/conversations/{conversation_id}" in paths
     assert "/debug/retrieve" in paths
     assert "/knowledge/upload/preview" in paths
+    assert "/knowledge/upload/recommend" in paths
     assert "/knowledge/upload/confirm" in paths
     assert "/knowledge/files" in paths
     assert "/knowledge/files/{document_id}" in paths
