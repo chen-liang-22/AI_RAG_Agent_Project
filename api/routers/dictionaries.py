@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
-from api.schemas import DictionaryGroupResponse, DictionaryItemResponse
+from api.schemas import DictionaryGroupResponse, DictionaryItemResponse, DictionaryItemUpsertRequest
 from rag.knowledge_store import KnowledgeStore
 from utils.logger_handler import logger
 
@@ -86,3 +86,33 @@ def list_dictionaries(
 
     logger.info("[字典表] 查询字典完成 字典编码=%s 字典数量=%s", dictionary_code or "全部", len(result))
     return result
+
+
+@router.post("/dictionaries/items", response_model=DictionaryItemResponse)
+def upsert_dictionary_item(request: DictionaryItemUpsertRequest) -> DictionaryItemResponse:
+    """新增或更新字典项。"""
+
+    store = _get_knowledge_store()
+    try:
+        item = store.upsert_dictionary_item(
+            dictionary_code=request.dictionary_code,
+            dictionary_name=request.dictionary_name,
+            item_code=request.item_code,
+            item_name=request.item_name,
+            parent_item_id=request.parent_item_id,
+            parent_item_code=request.parent_item_code,
+            sort_order=request.sort_order,
+            enabled=request.enabled,
+            description=request.description,
+            metadata=request.metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    logger.info(
+        "[字典表] 保存字典项完成 字典编码=%s 字典项编码=%s 启用=%s",
+        request.dictionary_code,
+        request.item_code,
+        request.enabled,
+    )
+    return _item_to_response(item)

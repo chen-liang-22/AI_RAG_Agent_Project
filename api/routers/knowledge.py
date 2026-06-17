@@ -16,17 +16,15 @@ from api.schemas import (
     KnowledgeUploadRecommendResponse,
     KnowledgeUploadResponse,
 )
-from api.services import (
-    _document_to_response,
+from api.common_services import _document_to_response, _get_knowledge_store
+from api.indexing_services import _index_document, _sync_data_files_to_documents
+from api.upload_services import (
     _get_preview_file,
-    _get_knowledge_store,
-    _index_document,
     _move_upload_file,
     _recommend_upload_split_strategy,
     _remove_created_upload_dir,
     _sanitize_upload_filename,
     _save_preview_file,
-    _sync_data_files_to_documents,
     _validate_file_type,
 )
 from utils.file_handler import get_file_md5_hex, pdf_loader

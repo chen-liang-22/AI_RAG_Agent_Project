@@ -116,6 +116,21 @@ class DictionaryItemResponse(BaseModel):
     children: list["DictionaryItemResponse"] = Field(default_factory=list)  # 子级字典项
 
 
+class DictionaryItemUpsertRequest(BaseModel):
+    """字典项新增或更新请求体。"""
+
+    dictionary_code: str = Field(..., min_length=1)  # 字典编码，例如 collection_domain_keyword
+    dictionary_name: str = Field(..., min_length=1)  # 字典名称，例如 Collection 领域关键词
+    item_code: str = Field(..., min_length=1)  # 字典项编码，同一字典下唯一
+    item_name: str = Field(..., min_length=1)  # 字典项展示名称
+    parent_item_id: str | None = None  # 父级字典项 ID；为空表示一级项
+    parent_item_code: str | None = None  # 父级字典项编码；创建子项时可用编码定位父级
+    sort_order: int = 0  # 同级排序号
+    enabled: bool = True  # 是否启用
+    description: str | None = None  # 字典项说明
+    metadata: dict = Field(default_factory=dict)  # 业务扩展元数据，例如 collection_name/keyword
+
+
 class DictionaryGroupResponse(BaseModel):
     """单个字典分组响应体。"""
 

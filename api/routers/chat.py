@@ -14,16 +14,16 @@ from api.schemas import (
     ConversationSummaryResponse,
     DebugRetrieveRequest,
 )
-from api.services import (
+from api.chat_services import (
     _get_agent,
     _get_knowledge_answer_service,
-    _get_knowledge_store,
     _prepare_chat_conversation,
     _save_chat_exchange,
     _should_use_direct_rag,
     _stream_agent,
     _stream_direct_rag,
 )
+from api.common_services import _get_knowledge_store
 from model.factory import get_chat_model_name_for_mode, normalize_chat_model_mode
 from utils.logger_handler import logger
 from utils.qdrant_options import normalize_qdrant_collection_name

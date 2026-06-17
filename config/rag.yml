@@ -35,7 +35,7 @@ embedding_model_name: text-embedding-v4
 # - agent：走 LangGraph Agent 工具链，会让模型判断是否调用工具，适合复杂工具编排但更慢。
 # - react_agent：agent 的等价别名。
 # - legacy_agent：agent 的等价别名，保留给旧配置兼容。
-chat_route_mode: direct_rag
+chat_route_mode: agent
 
 # Query Planner 模式。
 # 枚举：
@@ -70,11 +70,11 @@ adaptive_retrieve_top3_avg_score: 0.68
 adaptive_skip_planner_on_very_low_score: true
 
 # 极低分跳过 Query Planner 的最高分阈值。
-# 只有 top1 分数低于该值，并且没有命中业务关键词时，才会跳过模型改写。
+# 只有 top1 分数低于该值，并且没有命中当前 Collection 领域关键词时，才会跳过模型改写。
 adaptive_skip_planner_max_score: 0.55
 
 # 极低分跳过 Query Planner 的前三平均分阈值。
-# 只有 top3 平均分低于该值，并且没有命中业务关键词时，才会跳过模型改写。
+# 只有 top3 平均分低于该值，并且没有命中当前 Collection 领域关键词时，才会跳过模型改写。
 adaptive_skip_planner_top3_avg_score: 0.50
 
 # 启动预热总开关。

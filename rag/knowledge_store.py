@@ -7,7 +7,60 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
+import yaml
+
 from utils.path_tool import get_abs_path
+
+
+def build_collection_domain_keyword_items(collection_name: str, keywords: list[str]) -> list[tuple]:
+    """生成 Collection 领域关键词默认字典项。"""
+
+    group_item = (
+        collection_name,
+        collection_name,
+        None,
+        1,
+        "默认 Collection 的领域关键词分组",
+        {"collection_name": collection_name},
+    )
+    keyword_items = [
+        (
+            f"{collection_name}_keyword_{index}",
+            keyword,
+            collection_name,
+            index,
+            "命中后认为问题可能属于该 Collection 领域",
+            {"collection_name": collection_name, "keyword": keyword},
+        )
+        for index, keyword in enumerate(keywords, start=1)
+    ]
+    return [group_item, *keyword_items]
+
+
+def load_collection_domain_keyword_items() -> list[tuple]:
+    """从配置文件读取 Collection 领域关键词种子项。"""
+
+    config_path = get_abs_path("config/collection_domain_keywords.yml")
+    if not os.path.exists(config_path):
+        return []
+
+    with open(config_path, "r", encoding="utf-8") as file:
+        data = yaml.safe_load(file) or {}
+
+    collections = data.get("collections") or {}
+    if not isinstance(collections, dict):
+        return []
+
+    items: list[tuple] = []
+    for collection_name, keywords in collections.items():
+        if not isinstance(keywords, list):
+            continue
+
+        clean_keywords = [str(keyword).strip() for keyword in keywords if str(keyword).strip()]
+        if clean_keywords:
+            items.extend(build_collection_domain_keyword_items(str(collection_name).strip(), clean_keywords))
+
+    return items
 
 
 DEFAULT_DICTIONARY_ITEMS = [
@@ -112,6 +165,11 @@ DEFAULT_DICTIONARY_ITEMS = [
             ("pdf_text", "PDF 文本", None, 2, "PDF 提取文本预览"),
             ("unsupported", "不支持", None, 3, "暂不支持预览"),
         ],
+    },
+    {
+        "dictionary_code": "collection_domain_keyword",
+        "dictionary_name": "Collection 领域关键词",
+        "items": load_collection_domain_keyword_items(),
     },
 ]
 
@@ -377,6 +435,170 @@ class KnowledgeStore:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_dictionary_item_by_code(self, dictionary_code: str, item_code: str) -> dict[str, Any] | None:
+        """按字典编码和字典项编码查询单个字典项。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM dictionary_items
+                WHERE dictionary_code = ? AND item_code = ?
+                """,
+                (dictionary_code, item_code),
+            ).fetchone()
+        return self.row_to_dict(row)
+
+    def upsert_dictionary_item(
+            self,
+            *,
+            dictionary_code: str,
+            dictionary_name: str,
+            item_code: str,
+            item_name: str,
+            parent_item_id: str | None = None,
+            parent_item_code: str | None = None,
+            sort_order: int = 0,
+            enabled: bool = True,
+            description: str | None = None,
+            metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """新增或更新字典项。"""
+
+        clean_dictionary_code = dictionary_code.strip()
+        clean_item_code = item_code.strip()
+        clean_dictionary_name = dictionary_name.strip()
+        clean_item_name = item_name.strip()
+        if not clean_dictionary_code or not clean_item_code or not clean_dictionary_name or not clean_item_name:
+            raise ValueError("字典编码、字典名称、字典项编码和字典项名称不能为空")
+
+        with self.connect() as conn:
+            final_parent_item_id = self._resolve_dictionary_parent_id(
+                conn,
+                clean_dictionary_code,
+                parent_item_id,
+                parent_item_code,
+            )
+            item_level = self._resolve_dictionary_item_level(conn, final_parent_item_id)
+            metadata_json = json.dumps(metadata or {}, ensure_ascii=False) if metadata else None
+            now = utc_now_text()
+            existing = conn.execute(
+                """
+                SELECT dictionary_item_id
+                FROM dictionary_items
+                WHERE dictionary_code = ? AND item_code = ?
+                """,
+                (clean_dictionary_code, clean_item_code),
+            ).fetchone()
+            if existing:
+                dictionary_item_id = existing["dictionary_item_id"]
+                conn.execute(
+                    """
+                    UPDATE dictionary_items
+                    SET dictionary_name = ?, item_name = ?, parent_item_id = ?,
+                        item_level = ?, sort_order = ?, enabled = ?, description = ?,
+                        metadata_json = ?, updated_at = ?
+                    WHERE dictionary_item_id = ?
+                    """,
+                    (
+                        clean_dictionary_name,
+                        clean_item_name,
+                        final_parent_item_id,
+                        item_level,
+                        sort_order,
+                        1 if enabled else 0,
+                        description,
+                        metadata_json,
+                        now,
+                        dictionary_item_id,
+                    ),
+                )
+            else:
+                dictionary_item_id = f"dict_{uuid.uuid4().hex}"
+                conn.execute(
+                    """
+                    INSERT INTO dictionary_items (
+                        dictionary_item_id, dictionary_code, dictionary_name,
+                        item_code, item_name, parent_item_id, item_level,
+                        sort_order, enabled, description, metadata_json,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        dictionary_item_id,
+                        clean_dictionary_code,
+                        clean_dictionary_name,
+                        clean_item_code,
+                        clean_item_name,
+                        final_parent_item_id,
+                        item_level,
+                        sort_order,
+                        1 if enabled else 0,
+                        description,
+                        metadata_json,
+                        now,
+                        now,
+                    ),
+                )
+
+        return self.get_dictionary_item_by_code(clean_dictionary_code, clean_item_code) or {}
+
+    @staticmethod
+    def _resolve_dictionary_parent_id(
+            conn: sqlite3.Connection,
+            dictionary_code: str,
+            parent_item_id: str | None,
+            parent_item_code: str | None,
+    ) -> str | None:
+        """解析字典父级 ID，支持直接传 ID 或传父级编码。"""
+
+        if parent_item_id:
+            row = conn.execute(
+                """
+                SELECT dictionary_item_id
+                FROM dictionary_items
+                WHERE dictionary_item_id = ? AND dictionary_code = ?
+                """,
+                (parent_item_id, dictionary_code),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"父级字典项不存在或不属于当前字典：{parent_item_id}")
+            return str(row["dictionary_item_id"])
+        if not parent_item_code:
+            return None
+
+        row = conn.execute(
+            """
+            SELECT dictionary_item_id
+            FROM dictionary_items
+            WHERE dictionary_code = ? AND item_code = ?
+            """,
+            (dictionary_code, parent_item_code),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"父级字典项不存在：{parent_item_code}")
+        return str(row["dictionary_item_id"])
+
+    @staticmethod
+    def _resolve_dictionary_item_level(conn: sqlite3.Connection, parent_item_id: str | None) -> int:
+        """根据父级字典项计算当前字典项层级。"""
+
+        if not parent_item_id:
+            return 1
+
+        row = conn.execute(
+            """
+            SELECT item_level
+            FROM dictionary_items
+            WHERE dictionary_item_id = ?
+            """,
+            (parent_item_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"父级字典项不存在：{parent_item_id}")
+        return int(row["item_level"]) + 1
+
     def list_enabled_dictionary_codes(self, dictionary_code: str) -> list[str]:
         """查询某个字典下已启用的字典项编码。"""
 
@@ -398,16 +620,46 @@ class KnowledgeStore:
         for row in rows:
             if int(row.get("enabled") or 0) != 1:
                 continue
-            raw_metadata = row.get("metadata_json")
-            if not raw_metadata:
-                continue
-            try:
-                metadata = json.loads(str(raw_metadata))
-            except json.JSONDecodeError:
-                continue
+            metadata = self.parse_metadata(row.get("metadata_json"))
             if metadata.get(metadata_key) == metadata_value:
                 return str(row["item_code"])
         return None
+
+    @staticmethod
+    def parse_metadata(metadata_json: str | None) -> dict[str, Any]:
+        """安全解析字典项 metadata_json。"""
+
+        if not metadata_json:
+            return {}
+        try:
+            metadata = json.loads(str(metadata_json))
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return metadata if isinstance(metadata, dict) else {}
+
+    def list_collection_domain_keywords(self, collection_name: str | None = None) -> list[str]:
+        """按 Collection 查询启用的领域关键词。"""
+
+        normalized_collection = str(collection_name or "agent").strip().lower()
+        keywords: list[str] = []
+        seen_keywords: set[str] = set()
+        for row in self.list_dictionary_items(dictionary_code="collection_domain_keyword"):
+            if int(row.get("enabled") or 0) != 1:
+                continue
+
+            metadata = self.parse_metadata(row.get("metadata_json"))
+            keyword = str(metadata.get("keyword") or "").strip()
+            keyword_collection = str(metadata.get("collection_name") or "").strip().lower()
+            if not keyword or keyword_collection not in {normalized_collection, "*", "all"}:
+                continue
+
+            lowered_keyword = keyword.lower()
+            if lowered_keyword in seen_keywords:
+                continue
+            seen_keywords.add(lowered_keyword)
+            keywords.append(keyword)
+
+        return keywords
 
     def normalize_dictionary_code(self, dictionary_code: str, value: str | None = None) -> str:
         """按字典表归一化编码；非法或空值时返回该字典的默认编码。"""
@@ -843,30 +1095,3 @@ class KnowledgeStore:
             model_name=model_name,
             metadata=metadata,
         )
-
-    # 下面这些方法是旧知识表接口的兼容壳。知识检索和知识答案不再访问 SQLite。
-    def replace_units(self, document_id: str, units: list[dict[str, Any]]) -> None:
-        return None
-
-    def delete_units(self, document_id: str) -> None:
-        return None
-
-    def replace_segments_and_qas(
-            self,
-            document_id: str,
-            segments: list[dict[str, Any]],
-            qa_items: list[dict[str, Any]],
-    ) -> None:
-        return None
-
-    def search_segments_by_keywords(self, keywords: list[str], limit: int = 20) -> list[dict[str, Any]]:
-        return []
-
-    def find_qa_document(self, document_hint: str | None = None) -> dict[str, Any] | None:
-        return None
-
-    def search_qa_items_by_question(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        return []
-
-    def search_units_by_keywords(self, keywords: list[str], limit: int = 20) -> list[dict[str, Any]]:
-        return []

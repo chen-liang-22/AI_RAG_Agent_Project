@@ -30,6 +30,9 @@ def test_openapi_exposes_core_routes():
     assert "/knowledge/files/{document_id}/reindex" in paths
     assert "/knowledge/reload" in paths
     assert "/dictionaries" in paths
+    assert "/dictionaries/items" in paths
+    assert "/exam/generate" in paths
+    assert "/exam/grade" in paths
 
 
 def test_dictionaries_return_document_structure_items():

@@ -61,10 +61,6 @@ parallel_query_workers: 4
 # /knowledge/reload 会扫描该目录下允许类型的文件。
 data_path: data
 
-# 旧版 data/ 自动加载的 MD5 记录文件。
-# 用于避免重复导入相同文件，主要保留兼容。
-md5_hex_store: qdrant_md5.text
-
 # 允许入库的知识文件类型。
 # 枚举：
 # - txt：纯文本知识文件。
