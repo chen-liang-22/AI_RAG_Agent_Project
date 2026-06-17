@@ -1,0 +1,46 @@
+# Collection 领域关键词种子配置。
+#
+# 作用：
+# - 启动时同步到 dictionary_items 字典表的 collection_domain_keyword 字典。
+# - RAG adaptive 极低分跳过 Query Planner 时，会按当前 collection_name 读取这些领域词。
+# - 换知识领域时，可以在这里新增 collection 分组，或通过 /dictionaries/items 接口维护。
+
+collections:
+  agent:
+    - app
+    - 扫地
+    - 扫拖
+    - 机器人
+    - 清扫
+    - 拖地
+    - 吸力
+    - 地毯
+    - 宠物
+    - 猫
+    - 狗
+    - 毛发
+    - 猫砂
+    - 狗砂
+    - 充电
+    - 回充
+    - 基站
+    - 电池
+    - 没电
+    - 地图
+    - 建图
+    - 避障
+    - 尘盒
+    - 拖布
+    - 滚刷
+    - 边刷
+    - 滤网
+    - 耗材
+    - 故障
+    - 报错
+    - 联网
+    - 网络
+    - 续航
+    - 水箱
+    - 噪音
+    - 漏扫
+    - 卡住
