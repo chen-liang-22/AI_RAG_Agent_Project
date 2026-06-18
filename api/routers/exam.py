@@ -10,10 +10,11 @@
 import json
 import random
 import re
+import sqlite3
 import time
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from langchain_core.messages import HumanMessage, SystemMessage
 from qdrant_client import QdrantClient, models
 
@@ -272,6 +273,111 @@ def _question_from_row(row: dict[str, Any]) -> ExamConversationQuestion:
     )
 
 
+def _choice_label(index: int) -> str:
+    """把选项下标转换成 A/B/C/D 这类展示编号。"""
+
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if index < len(labels):
+        return labels[index]
+    return str(index + 1)
+
+
+def _display_choice_options(options: list[str]) -> list[str]:
+    """给选择题选项加编号，避免页面只展示一组裸答案文本。"""
+
+    result: list[str] = []
+    for index, option in enumerate(options):
+        text = str(option).strip()
+        if not text:
+            continue
+        label = _choice_label(index)
+        if re.match(r"^[A-Z][.、．]\s*", text):
+            result.append(text)
+        else:
+            result.append(f"{label}. {text}")
+    return result
+
+
+def _option_label_map(options: list[str]) -> dict[str, str]:
+    """建立选项编号到完整选项文本的映射。"""
+
+    return {
+        _choice_label(index): option
+        for index, option in enumerate(options)
+    }
+
+
+def _normalize_choice_answer(answer: str | list[str], options: list[str]) -> str | list[str]:
+    """把模型返回的选择题正确答案转换成前端实际提交的选项编号。"""
+
+    label_by_option = {option: _choice_label(index) for index, option in enumerate(options)}
+    display_by_option = {
+        display_option: _choice_label(index)
+        for index, display_option in enumerate(_display_choice_options(options))
+    }
+
+    def normalize_one(value: object) -> str:
+        clean_value = str(value or "").strip()
+        if clean_value in label_by_option:
+            return label_by_option[clean_value]
+        if clean_value in display_by_option:
+            return display_by_option[clean_value]
+        label_match = re.match(r"^([A-Z])(?:[.、．]|\s|$)", clean_value, flags=re.IGNORECASE)
+        if label_match:
+            label = label_match.group(1).upper()
+            if label in _option_label_map(options):
+                return label
+        return clean_value
+
+    if isinstance(answer, list):
+        return [normalize_one(item) for item in answer]
+    return normalize_one(answer)
+
+
+def _prepare_objective_question_for_display(question_type: str, options: list[str], correct_answer: Any) -> tuple[list[str], Any]:
+    """把客观题选项转成编号展示，并同步转换标准答案。"""
+
+    if question_type not in {"single_choice", "multiple_choice"} or not options:
+        return options, correct_answer
+    return _display_choice_options(options), _normalize_choice_answer(correct_answer, options)
+
+
+def _is_all_select_multiple_choice(question_type: str, options: list[str], correct_answer: Any) -> bool:
+    """判断多选题的正确答案是否覆盖了全部选项。"""
+
+    if question_type != "multiple_choice" or not options:
+        return False
+    option_labels = {_choice_label(index) for index, _ in enumerate(options)}
+    if isinstance(correct_answer, list):
+        answer_labels = {str(item).strip().upper() for item in correct_answer if str(item).strip()}
+    else:
+        answer_labels = {
+            item.strip().upper()
+            for item in re.split(r"[、,，;；\n]+", str(correct_answer or ""))
+            if item.strip()
+        }
+    return bool(option_labels) and option_labels.issubset(answer_labels)
+
+
+def _previous_multiple_choice_questions_all_select(session_id: str, round_no: int) -> bool:
+    """判断当前轮之前已经保存的多选题是否全部都是全选答案。"""
+
+    previous_multiple_choice_questions = [
+        question
+        for question in _store().list_exam_questions(session_id)
+        if question.get("question_type") == "multiple_choice" and int(question.get("round_no") or 0) < round_no
+    ]
+    if not previous_multiple_choice_questions:
+        return False
+
+    for question in previous_multiple_choice_questions:
+        options = _parse_json_field(question.get("options_json"), [])
+        correct_answer = _parse_json_field(question.get("correct_answer_json"), None)
+        if not _is_all_select_multiple_choice("multiple_choice", options, correct_answer):
+            return False
+    return True
+
+
 def _analysis_from_row(row: dict[str, Any]) -> ExamAnswerAnalysis | None:
     """把 SQLite 题目分析字段转换成响应模型。"""
 
@@ -297,6 +403,38 @@ def _normalize_answer_value(answer: str | list[str]) -> str:
     if isinstance(answer, list):
         return "、".join(str(item).strip() for item in answer if str(item).strip())
     return str(answer or "").strip()
+
+
+def _normalize_answer_value_for_question(question: dict[str, Any], answer: str | list[str]) -> str:
+    """按题型把前端答案统一成后端阅卷使用的答案格式。"""
+
+    question_type = question.get("question_type")
+    if question_type not in {"single_choice", "multiple_choice"}:
+        return _normalize_answer_value(answer)
+
+    options = _parse_json_field(question.get("options_json"), [])
+    display_to_label = {
+        option: _choice_label(index)
+        for index, option in enumerate(options)
+    }
+
+    def normalize_one(value: object) -> str:
+        clean_value = str(value or "").strip()
+        if clean_value in display_to_label:
+            return display_to_label[clean_value]
+        label_match = re.match(r"^([A-Z])(?:[.、．]|\s|$)", clean_value, flags=re.IGNORECASE)
+        if label_match:
+            return label_match.group(1).upper()
+        return clean_value
+
+    if isinstance(answer, list):
+        return "、".join(normalize_one(item) for item in answer if str(item).strip())
+
+    clean_answer = str(answer or "").strip()
+    if question_type == "multiple_choice":
+        parts = [part for part in re.split(r"[、,，;；\n]+", clean_answer) if part.strip()]
+        return "、".join(normalize_one(part) for part in parts)
+    return normalize_one(clean_answer)
 
 
 def _split_answer_points(answer: str) -> list[str]:
@@ -368,18 +506,28 @@ def _make_multiple_choice(
     return f"{question}\n请选择所有正确选项。", options, correct_points
 
 
-def _make_true_false(question: str, answer: str, random_generator: random.Random) -> tuple[str, list[str], str]:
+def _target_true_false_answer(random_generator: random.Random) -> str:
+    """为判断题生成目标答案，让正确/错误分布更均衡。"""
+
+    return "正确" if random_generator.random() >= 0.5 else "错误"
+
+
+def _make_true_false(
+        question: str,
+        answer: str,
+        random_generator: random.Random,
+        *,
+        target_answer: str | None = None,
+) -> tuple[str, list[str], str]:
     """把原始问答改造成判断题。"""
 
-    # 规则兜底时随机生成正误说法，避免判断题永远都是“正确”。
-    correct_is_true = random_generator.random() >= 0.35
-    if correct_is_true:
+    # 规则兜底时按目标答案生成正误说法，避免判断题长期偏向“正确”。
+    final_answer = target_answer if target_answer in {"正确", "错误"} else _target_true_false_answer(random_generator)
+    if final_answer == "正确":
         statement = f"{question}：{_split_answer_points(answer)[0] if _split_answer_points(answer) else answer[:80]}"
-        correct_answer = "正确"
     else:
         statement = f"{question}：以上说法不完整或不准确"
-        correct_answer = "错误"
-    return f"判断正误：{statement}", ["正确", "错误"], correct_answer
+    return f"判断正误：{statement}", ["正确", "错误"], final_answer
 
 
 def _make_fill_blank(question: str, answer: str) -> tuple[str, list[str], str] | None:
@@ -471,11 +619,15 @@ def _generate_question_with_model(
         reference_answer: str,
         question_type: str,
         model_mode: str | None,
+        target_answer: str | None = None,
 ) -> tuple[str, list[str], Any]:
     """调用模型把原始问答润色成正式考试题。"""
 
     # 所有题型都先经过 LLM 命题，使题干、选项和标准答案看起来像真正的考试题。
     model = get_chat_model(model_mode)
+    extra_requirement = ""
+    if question_type == "true_false" and target_answer in {"正确", "错误"}:
+        extra_requirement = f"本题必须设计成答案为“{target_answer}”的判断题。"
     response = model.invoke(
         [
             SystemMessage(
@@ -500,10 +652,11 @@ def _generate_question_with_model(
                     "}\n"
                     "要求："
                     "单选题提供 4 个选项且只有 1 个正确答案；"
-                    "多选题提供 4 到 6 个选项且至少 2 个正确答案；"
+                    "多选题提供 4 到 6 个选项，正确答案至少 2 个；"
                     "判断题 options 固定为 [\"正确\",\"错误\"]，correct_answer 只能是 正确 或 错误；"
                     "填空题题干必须自然出现空缺，不要把原始问句原样当题干；"
                     "简答题不需要 options。"
+                    f"{extra_requirement}"
                 )
             ),
         ]
@@ -525,6 +678,11 @@ def _build_fallback_conversation_question(
     metadata = item["metadata"]
     question = str(metadata.get("question") or "").strip()
     reference_answer = _extract_reference_answer(item["content"], question)
+    target_true_false_answer = (
+        _target_true_false_answer(random_generator)
+        if question_type == "true_false"
+        else None
+    )
     final_type = question_type
     prompt = question
     options: list[str] = []
@@ -543,7 +701,12 @@ def _build_fallback_conversation_question(
         else:
             final_type = "short_answer"
     elif question_type == "true_false":
-        prompt, options, correct_answer = _make_true_false(question, reference_answer, random_generator)
+        prompt, options, correct_answer = _make_true_false(
+            question,
+            reference_answer,
+            random_generator,
+            target_answer=target_true_false_answer,
+        )
     elif question_type == "fill_blank":
         generated = _make_fill_blank(question, reference_answer)
         if generated:
@@ -551,6 +714,7 @@ def _build_fallback_conversation_question(
         else:
             final_type = "short_answer"
 
+    options, correct_answer = _prepare_objective_question_for_display(final_type, options, correct_answer)
     return {
         "source_question_id": _optional_text(metadata.get("question_id") or metadata.get("qa_id") or metadata.get("segment_id")),
         "source_document_id": _optional_text(metadata.get("document_id")),
@@ -591,15 +755,23 @@ def _build_conversation_question(
             reference_answer=fallback_question["reference_answer"],
             question_type=question_type,
             model_mode=model_mode,
+            target_answer=(
+                str(fallback_question["correct_answer"])
+                if question_type == "true_false"
+                else None
+            ),
         )
+        options, correct_answer = _prepare_objective_question_for_display(question_type, options, correct_answer)
         fallback_question["question_type"] = question_type
         fallback_question["prompt"] = prompt
         fallback_question["options"] = options
         fallback_question["correct_answer"] = correct_answer
         logger.info(
-            "[考试] 题目润色完成 题型=%s 来源题目编号=%s",
+            "[考试] 题目润色完成 题型=%s 来源题目编号=%s 标准答案=%s 选项数=%s",
             fallback_question["question_type"],
             fallback_question["source_question_id"],
+            fallback_question["correct_answer"],
+            len(fallback_question["options"]),
         )
         return fallback_question
     except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError, RuntimeError) as exc:
@@ -754,6 +926,158 @@ def _analysis_to_metadata(analysis: ExamAnswerAnalysis) -> dict[str, Any]:
     }
 
 
+def _build_exam_question_rows(
+        *,
+        session_id: str,
+        selected_items: list[dict[str, Any]],
+        candidates: list[dict[str, Any]],
+        question_types: list[str],
+        model_mode: str | None,
+        seed: int | None,
+        max_score: float,
+        start_round: int = 1,
+) -> None:
+    """按轮次生成并保存考试题目，已存在的轮次会自动跳过。"""
+
+    question_type_random = random.Random(f"{seed}:question_type")
+    for round_no, item in enumerate(selected_items, start=1):
+        question_type = question_type_random.choice(question_types)
+        if round_no < start_round or _store().get_exam_question(session_id=session_id, round_no=round_no):
+            continue
+        question_random = random.Random(f"{seed}:question:{round_no}")
+        question_data = _build_conversation_question(
+            item=item,
+            candidates=candidates,
+            question_type=question_type,
+            random_generator=question_random,
+            max_score=max_score,
+            model_mode=model_mode,
+        )
+        if (
+                _is_all_select_multiple_choice(
+                    question_data["question_type"],
+                    question_data["options"],
+                    question_data["correct_answer"],
+                )
+                and _previous_multiple_choice_questions_all_select(session_id, round_no)
+        ):
+            logger.warning(
+                "[考试] 多选题全选过于集中，改用规则重新生成 会话编号=%s 轮次=%s",
+                session_id,
+                round_no,
+            )
+            question_data = _build_fallback_conversation_question(
+                item=item,
+                candidates=candidates,
+                question_type="multiple_choice",
+                random_generator=random.Random(f"{seed}:question:{round_no}:fallback"),
+                max_score=max_score,
+            )
+        try:
+            _store().add_exam_question(session_id=session_id, round_no=round_no, **question_data)
+        except sqlite3.IntegrityError:
+            logger.info("[考试] 题目已由其他任务生成，跳过重复写入 会话编号=%s 轮次=%s", session_id, round_no)
+
+
+def _rebuild_exam_context_from_session(
+        session: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], int | None, float]:
+    """从会话记录重新构造可补题的上下文。"""
+
+    metadata = _parse_json_field(session.get("metadata_json"), {})
+    candidates = _scroll_candidate_questions(
+        collection_name=session.get("collection_name"),
+        document_id=session.get("document_id"),
+        section_path=session.get("section_path"),
+    )
+    if not candidates:
+        raise RuntimeError("当前考试题源已无可用候选题")
+
+    seed = metadata.get("seed")
+    try:
+        clean_seed = int(seed) if seed is not None else None
+    except (TypeError, ValueError):
+        clean_seed = None
+
+    shuffle_random_generator = random.Random(clean_seed)
+    shuffle_random_generator.shuffle(candidates)
+    selected_items = candidates[:int(session["round_count"])]
+    question_types = _parse_json_field(session.get("question_types_json"), ALL_QUESTION_TYPES)
+    question_types = [item for item in question_types if item in ALL_QUESTION_TYPES] or ALL_QUESTION_TYPES
+    max_score = round(100 / int(session["round_count"]), 4)
+    return candidates, selected_items, question_types, clean_seed, max_score
+
+
+def _ensure_exam_question_ready(session: dict[str, Any], round_no: int) -> dict[str, Any]:
+    """确保指定轮次题目已经生成，后台未完成时同步补题。"""
+
+    question = _store().get_exam_question(session_id=session["session_id"], round_no=round_no)
+    if question is not None:
+        return question
+
+    candidates, selected_items, question_types, seed, max_score = _rebuild_exam_context_from_session(session)
+    if len(selected_items) < round_no:
+        raise RuntimeError(f"当前题源只有 {len(selected_items)} 道题，不足第 {round_no} 轮")
+
+    logger.warning("[考试] 当前轮题目未预生成，开始同步补题 会话编号=%s 轮次=%s", session["session_id"], round_no)
+    _build_exam_question_rows(
+        session_id=session["session_id"],
+        selected_items=selected_items,
+        candidates=candidates,
+        question_types=question_types,
+        model_mode=session.get("model_mode"),
+        seed=seed,
+        max_score=max_score,
+        start_round=round_no,
+    )
+    question = _store().get_exam_question(session_id=session["session_id"], round_no=round_no)
+    if question is None:
+        raise RuntimeError(f"第 {round_no} 轮题目生成失败")
+    return question
+
+
+def _build_remaining_exam_questions_background(
+        *,
+        session_id: str,
+        selected_items: list[dict[str, Any]],
+        candidates: list[dict[str, Any]],
+        question_types: list[str],
+        model_mode: str | None,
+        seed: int | None,
+        max_score: float,
+) -> None:
+    """后台补齐第 2 轮之后的考试题，避免开始测评等待所有题目生成。"""
+
+    start_time = time.perf_counter()
+    try:
+        _build_exam_question_rows(
+            session_id=session_id,
+            selected_items=selected_items,
+            candidates=candidates,
+            question_types=question_types,
+            model_mode=model_mode,
+            seed=seed,
+            max_score=max_score,
+            start_round=2,
+        )
+        logger.info(
+            "[考试] 后台题目生成完成 会话编号=%s 总轮数=%s 耗时毫秒=%.2f",
+            session_id,
+            len(selected_items),
+            _elapsed_ms(start_time),
+        )
+    except (
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            AttributeError,
+            RuntimeError,
+            OSError,
+    ) as exc:
+        logger.error("[考试] 后台题目生成失败 会话编号=%s 错误=%s", session_id, exc, exc_info=True)
+
+
 def _store() -> KnowledgeStore:
     """获取知识库元数据仓库。"""
 
@@ -786,12 +1110,13 @@ def list_exam_sections(
 
 
 @router.post("/exam/sessions", response_model=ExamStartResponse)
-def start_exam_session(request: ExamStartRequest) -> ExamStartResponse:
+def start_exam_session(request: ExamStartRequest, background_tasks: BackgroundTasks) -> ExamStartResponse:
     """开始一场对话式随机考试。"""
 
     start_time = time.perf_counter()
     final_collection_name = normalize_qdrant_collection_name(request.collection_name)
     question_types = [item for item in request.question_types if item in ALL_QUESTION_TYPES] or ALL_QUESTION_TYPES
+    exam_seed = request.seed if request.seed is not None else random.SystemRandom().randint(1, 2_147_483_647)
     candidates = _scroll_candidate_questions(
         collection_name=final_collection_name,
         document_id=request.document_id,
@@ -800,8 +1125,8 @@ def start_exam_session(request: ExamStartRequest) -> ExamStartResponse:
     if not candidates:
         raise HTTPException(status_code=404, detail="当前题源范围内没有可用于考试的结构化问答题")
 
-    random_generator = random.Random(request.seed)
-    random_generator.shuffle(candidates)
+    shuffle_random_generator = random.Random(exam_seed)
+    shuffle_random_generator.shuffle(candidates)
     # 先随机抽出本场考试需要的原始 QA，再逐题命题并持久化。
     selected_items = candidates[:request.round_count]
     if len(selected_items) < request.round_count:
@@ -811,7 +1136,7 @@ def start_exam_session(request: ExamStartRequest) -> ExamStartResponse:
     max_score = round(100 / request.round_count, 4)
     session = _store().create_exam_session(
         user_id=request.user_id,
-        title="对话式知识测评",
+        title=request.title,
         collection_name=final_collection_name,
         document_id=request.document_id,
         filename=document.get("filename") if document else None,
@@ -819,21 +1144,31 @@ def start_exam_session(request: ExamStartRequest) -> ExamStartResponse:
         round_count=request.round_count,
         question_types=question_types,
         model_mode=request.model_mode,
-        metadata={"seed": request.seed},
+        metadata={"seed": exam_seed, "user_seed": request.seed},
     )
 
-    for index, item in enumerate(selected_items, start=1):
-        question_type = random_generator.choice(question_types)
-        # 每一轮题目在开始考试时生成并保存，后续查看历史时可以完整复现当时的题目。
-        question_data = _build_conversation_question(
-            item=item,
-            candidates=candidates,
-            question_type=question_type,
-            random_generator=random_generator,
-            max_score=max_score,
-            model_mode=request.model_mode,
-        )
-        _store().add_exam_question(session_id=session["session_id"], round_no=index, **question_data)
+    # 第一轮同步生成，接口可以尽快把第一题返回给前端。
+    _build_exam_question_rows(
+        session_id=session["session_id"],
+        selected_items=selected_items[:1],
+        candidates=candidates,
+        question_types=question_types,
+        model_mode=request.model_mode,
+        seed=exam_seed,
+        max_score=max_score,
+        start_round=1,
+    )
+    # 第 2 轮之后放到后台继续生成，减少“开始测评”的等待时间。
+    background_tasks.add_task(
+        _build_remaining_exam_questions_background,
+        session_id=session["session_id"],
+        selected_items=selected_items,
+        candidates=candidates,
+        question_types=question_types,
+        model_mode=request.model_mode,
+        seed=exam_seed,
+        max_score=max_score,
+    )
 
     refreshed_session = _store().get_exam_session(session["session_id"])
     current_question = _store().get_exam_question(session_id=session["session_id"], round_no=1)
@@ -841,7 +1176,7 @@ def start_exam_session(request: ExamStartRequest) -> ExamStartResponse:
         raise HTTPException(status_code=500, detail="考试会话创建后读取失败")
 
     logger.info(
-        "[考试] 对话式考试开始 会话编号=%s Collection=%s 文件编号=%s 目录=%s 轮数=%s 耗时毫秒=%.2f",
+        "[考试] 对话式考试开始 会话编号=%s Collection=%s 文件编号=%s 目录=%s 轮数=%s 首题已返回=true 耗时毫秒=%.2f",
         session["session_id"],
         final_collection_name,
         request.document_id,
@@ -863,13 +1198,14 @@ def answer_exam_session(session_id: str, request: ExamAnswerRequest) -> ExamAnsw
         raise HTTPException(status_code=400, detail="考试已完成，不能继续提交答案")
 
     current_round = int(session.get("answered_count") or 0) + 1
-    question = _store().get_exam_question(session_id=session_id, round_no=current_round)
-    if question is None:
-        raise HTTPException(status_code=404, detail="当前轮题目不存在")
+    try:
+        question = _ensure_exam_question_ready(session, current_round)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     if question["status"] == "answered":
         raise HTTPException(status_code=400, detail="当前轮题目已经作答")
 
-    user_answer = _normalize_answer_value(request.answer)
+    user_answer = _normalize_answer_value_for_question(question, request.answer)
     # 所有题型都走同一套模型阅卷逻辑，模型失败时内部自动回退到规则评分。
     analysis = _model_answer_analysis(question, user_answer, session.get("model_mode"))
 
@@ -887,11 +1223,13 @@ def answer_exam_session(session_id: str, request: ExamAnswerRequest) -> ExamAnsw
 
     next_question = None
     if refreshed_session["status"] != "completed":
-        next_row = _store().get_exam_question(
-            session_id=session_id,
-            round_no=int(refreshed_session["answered_count"]) + 1,
-        )
-        next_question = _question_from_row(next_row) if next_row else None
+        next_round = int(refreshed_session["answered_count"]) + 1
+        try:
+            next_row = _ensure_exam_question_ready(refreshed_session, next_round)
+            next_question = _question_from_row(next_row)
+        except RuntimeError as exc:
+            logger.error("[考试] 下一轮题目生成失败 会话编号=%s 轮次=%s 错误=%s", session_id, next_round, exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"下一轮题目生成失败：{exc}") from exc
 
     logger.info(
         "[考试] 单轮作答完成 会话编号=%s 轮次=%s 题型=%s 得分=%.2f 状态=%s",

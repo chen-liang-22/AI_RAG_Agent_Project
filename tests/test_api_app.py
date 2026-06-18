@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 import api.routers.knowledge as knowledge_router
 import api.routers.exam as exam_router
 from api.main import app
+from rag.knowledge_store import KnowledgeStore
 from utils.path_tool import get_abs_path
 
 
@@ -171,14 +172,228 @@ def test_exam_question_generation_and_grading_use_model_polishing(monkeypatch):
             "reference_answer": question["reference_answer"],
             "max_score": question["max_score"],
         },
-        "负责运行 Java 字节码",
+        "A",
         "low",
     )
 
     assert question["prompt"] == "关于 JVM 的作用，下列说法正确的是哪一项？"
-    assert question["options"] == ["负责运行 Java 字节码", "负责管理浏览器缓存", "负责生成 SQL 索引", "负责压缩图片"]
-    assert question["correct_answer"] == "负责运行 Java 字节码"
+    assert question["options"] == ["A. 负责运行 Java 字节码", "B. 负责管理浏览器缓存", "C. 负责生成 SQL 索引", "D. 负责压缩图片"]
+    assert question["correct_answer"] == "A"
     assert analysis.score == 100
     assert analysis.correct_answer == "JVM 的核心作用是加载并执行 Java 字节码，同时提供运行时环境。"
     assert "正式考试题" in model_calls[0]
     assert "阅卷老师" in model_calls[1] or "用户答案" in model_calls[1]
+
+
+def test_exam_question_rows_can_generate_first_question_before_remaining(monkeypatch, tmp_path):
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    session = store.create_exam_session(
+        session_id="exam_fast_start",
+        user_id="user_exam",
+        title="快速开始测评",
+        collection_name="agent",
+        document_id=None,
+        filename=None,
+        section_path=None,
+        round_count=3,
+        question_types=["short_answer"],
+        model_mode="low",
+        metadata={"seed": 11},
+    )
+    candidates = [
+        {
+            "metadata": {
+                "question": f"第 {index} 题是什么？",
+                "question_id": f"qa_{index}",
+                "document_id": "doc_java",
+                "source_file": "Java面试题.pdf",
+            },
+            "content": f"问题：第 {index} 题是什么？\n答案：第 {index} 题答案。",
+        }
+        for index in range(1, 4)
+    ]
+
+    class FakeModel:
+        def invoke(self, messages):
+            text = messages[-1].content
+            question_match = __import__("re").search(r"原始问题：(.*?)\n\n参考答案", text, flags=__import__("re").DOTALL)
+            question_text = question_match.group(1).strip() if question_match else "题目"
+            return SimpleNamespace(
+                content=(
+                    '{"prompt":"正式题：'
+                    f'{question_text}",'
+                    '"options":[],'
+                    '"correct_answer":"标准答案"}'
+                )
+            )
+
+    monkeypatch.setattr(exam_router, "_store", lambda: store)
+    monkeypatch.setattr(exam_router, "get_chat_model", lambda model_mode=None: FakeModel())
+
+    exam_router._build_exam_question_rows(
+        session_id=session["session_id"],
+        selected_items=candidates[:1],
+        candidates=candidates,
+        question_types=["short_answer"],
+        model_mode="low",
+        seed=11,
+        max_score=33.3333,
+        start_round=1,
+    )
+    first_batch = store.list_exam_questions(session["session_id"])
+
+    exam_router._build_exam_question_rows(
+        session_id=session["session_id"],
+        selected_items=candidates,
+        candidates=candidates,
+        question_types=["short_answer"],
+        model_mode="low",
+        seed=11,
+        max_score=33.3333,
+        start_round=2,
+    )
+    all_questions = store.list_exam_questions(session["session_id"])
+
+    assert [item["round_no"] for item in first_batch] == [1]
+    assert [item["round_no"] for item in all_questions] == [1, 2, 3]
+
+
+def test_choice_answer_value_is_normalized_to_label(tmp_path):
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    session = store.create_exam_session(
+        session_id="exam_choice_label",
+        user_id="user_exam",
+        title="选择题测评",
+        collection_name="agent",
+        round_count=1,
+        question_types=["single_choice"],
+        metadata={"seed": 3},
+    )
+    question = store.add_exam_question(
+        session_id=session["session_id"],
+        round_no=1,
+        source_question_id="qa_001",
+        source_document_id="doc_java",
+        source_filename="Java面试题.pdf",
+        source_page=1,
+        section_path="Java 基础",
+        question_type="single_choice",
+        prompt="JVM 的作用是什么？",
+        options=["A. 运行 Java 字节码", "B. 管理浏览器缓存"],
+        correct_answer="A",
+        reference_answer="JVM 负责运行 Java 字节码。",
+        max_score=100,
+    )
+
+    user_answer = exam_router._normalize_answer_value_for_question(question, "A. 运行 Java 字节码")
+
+    assert user_answer == "A"
+
+
+def test_multiple_choice_allows_all_options_when_single_question_needs_it():
+    raw_result = {
+        "prompt": "以下哪些属于 JVM 的职责？",
+        "options": ["加载字节码", "执行字节码", "提供运行时环境", "管理浏览器缓存"],
+        "correct_answer": ["加载字节码", "执行字节码", "提供运行时环境", "管理浏览器缓存"],
+    }
+
+    prompt, options, correct_answer = exam_router._validate_generated_question(raw_result, "multiple_choice")
+
+    assert prompt == "以下哪些属于 JVM 的职责？"
+    assert len(options) == 4
+    assert len(correct_answer) == 4
+
+
+def test_true_false_generation_passes_target_answer_to_model(monkeypatch):
+    model_calls: list[str] = []
+
+    class FakeModel:
+        def invoke(self, messages):
+            text = messages[-1].content
+            model_calls.append(text)
+            return SimpleNamespace(
+                content='{"prompt":"判断正误：JVM 只负责编译 Java 源码。","options":["正确","错误"],"correct_answer":"错误"}'
+            )
+
+    monkeypatch.setattr(exam_router, "get_chat_model", lambda model_mode=None: FakeModel())
+
+    prompt, options, correct_answer = exam_router._generate_question_with_model(
+        question="JVM 的作用是什么？",
+        reference_answer="JVM 负责加载并运行 Java 字节码。",
+        question_type="true_false",
+        model_mode="low",
+        target_answer="错误",
+    )
+
+    assert prompt == "判断正误：JVM 只负责编译 Java 源码。"
+    assert options == ["正确", "错误"]
+    assert correct_answer == "错误"
+    assert "答案为“错误”" in model_calls[0]
+
+
+def test_exam_start_request_requires_title():
+    from pydantic import ValidationError
+
+    from api.exam_schemas import ExamStartRequest
+
+    try:
+        ExamStartRequest(title="", round_count=1)
+    except ValidationError as exc:
+        assert "title" in str(exc)
+    else:
+        raise AssertionError("开始测评请求必须要求测评名称")
+
+
+def test_multiple_choice_distribution_breaks_repeated_all_select(monkeypatch, tmp_path):
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    session = store.create_exam_session(
+        session_id="exam_multi_distribution",
+        user_id="user_exam",
+        title="多选分布测评",
+        collection_name="agent",
+        round_count=2,
+        question_types=["multiple_choice"],
+        metadata={"seed": 5},
+    )
+    candidates = [
+        {
+            "metadata": {
+                "question": f"第 {index} 道多选题？",
+                "question_id": f"qa_multi_{index}",
+                "document_id": "doc_java",
+                "source_file": "Java面试题.pdf",
+            },
+            "content": f"问题：第 {index} 道多选题？\n答案：要点一；要点二；要点三；要点四。",
+        }
+        for index in range(1, 3)
+    ]
+
+    class FakeModel:
+        def invoke(self, messages):
+            return SimpleNamespace(
+                content=(
+                    '{"prompt":"以下说法哪些正确？",'
+                    '"options":["要点一","要点二","要点三","要点四"],'
+                    '"correct_answer":["要点一","要点二","要点三","要点四"]}'
+                )
+            )
+
+    monkeypatch.setattr(exam_router, "_store", lambda: store)
+    monkeypatch.setattr(exam_router, "get_chat_model", lambda model_mode=None: FakeModel())
+
+    exam_router._build_exam_question_rows(
+        session_id=session["session_id"],
+        selected_items=candidates,
+        candidates=candidates,
+        question_types=["multiple_choice"],
+        model_mode="low",
+        seed=5,
+        max_score=50,
+        start_round=1,
+    )
+    questions = store.list_exam_questions(session["session_id"])
+    first_correct = __import__("json").loads(questions[0]["correct_answer_json"])
+    second_correct = __import__("json").loads(questions[1]["correct_answer_json"])
+
+    assert set(first_correct) == {"A", "B", "C", "D"}
+    assert set(second_correct) != {"A", "B", "C", "D"}

@@ -35,6 +35,7 @@ class ExamSectionsResponse(BaseModel):
 class ExamStartRequest(BaseModel):
     """开始对话式考试请求体。"""
 
+    title: str = Field(..., min_length=1, max_length=120)  # 本场测评名称；历史记录中展示
     collection_name: str | None = None  # 题源所在 Qdrant collection；为空时使用默认 collection
     document_id: str | None = None  # 指定题源文件；为空时从整个 collection 抽题
     section_path: str | None = None  # 指定目录路径；为空时不按目录过滤
