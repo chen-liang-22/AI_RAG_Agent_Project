@@ -7,6 +7,10 @@ from typing import Any
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from rag.split_strategies.base import SplitContext
+from rag.split_strategies.factory import SplitStrategyFactory
+from utils.logger_handler import logger
+
 
 @dataclass
 class DocumentTypeDetection:
@@ -44,6 +48,15 @@ class QaItem:
     category: str | None
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _TitleMatch:
+    """PDF 目录标题在原文中的定位结果。"""
+
+    start: int
+    end: int
+    method: str
 
 
 class DocumentParser:
@@ -144,21 +157,16 @@ class DocumentParser:
         """按用户确认后的结构类型和切分策略生成 segment/qa。"""
 
         normalized_type = self._normalize_document_type(document_type, split_strategy)
-        if normalized_type == "qa" and split_strategy == "outline_qa":
-            segments, qa_items = self._build_outline_qa_segments(document_id, documents)
-            if segments:
-                return segments, qa_items
-            return self._build_qa_segments(document_id, documents)
-
-        if normalized_type == "qa" and split_strategy == "numbered_qa":
-            return self._build_qa_segments(document_id, documents)
-
-        if normalized_type == "numbered" and split_strategy == "numbered_segments":
-            segments = self._build_numbered_segments(document_id, documents, document_type=normalized_type)
-            if segments:
-                return segments, []
-
-        return self._build_recursive_segments(document_id, documents, document_type=normalized_type), []
+        strategy = SplitStrategyFactory.get_strategy(split_strategy)
+        return strategy.split(
+            SplitContext(
+                document_id=document_id,
+                documents=documents,
+                document_type=normalized_type,
+                split_strategy=split_strategy,
+                parser=self,
+            )
+        )
 
     def build_segments_and_faqs(
             self,
@@ -248,6 +256,7 @@ class DocumentParser:
 
         located_questions = self._locate_outline_questions(outline_questions, full_text, page_offsets)
         if not located_questions:
+            logger.warning("[文档解析] PDF目录问答定位失败 目录题数=%s", len(outline_questions))
             return [], []
 
         segments: list[DocumentSegment] = []
@@ -261,6 +270,17 @@ class DocumentParser:
             )
             answer = full_text[item["end"]:next_start].strip()
             answer = self._remove_leading_repeated_title(answer, item["raw_title"])
+            answer = self._clean_outline_answer(answer)
+            if self._is_invalid_outline_answer(answer):
+                logger.warning(
+                    "[文档解析] PDF目录问答跳过异常答案 标题=%s 页码=%s 匹配方式=%s 答案预览=%s",
+                    item["raw_title"],
+                    item.get("page"),
+                    item.get("match_method"),
+                    answer[:80],
+                )
+                continue
+
             question = self._clean_question_title(item["raw_title"])
             question_no = self._extract_question_no(item["raw_title"])
             category = item["category"]
@@ -281,6 +301,7 @@ class DocumentParser:
                     "section_title": category,
                     "section_path": section_path,
                     "structure_source": "pdf_outline",
+                    "outline_match_method": item.get("match_method"),
                     "part_index": part_index,
                     "part_count": len(content_parts),
                 }
@@ -308,6 +329,7 @@ class DocumentParser:
                             "source_page": source_page,
                             "question_id": question_id,
                             "section_path": section_path,
+                            "outline_match_method": item.get("match_method"),
                             "part_index": part_index,
                             "part_count": len(content_parts),
                         },
@@ -466,7 +488,9 @@ class DocumentParser:
             for item in level1_items[: min(20, len(level1_items))]:
                 title = str(item.get("title") or "").strip()
                 clean_title = cls._clean_question_title(title)
-                if title and (title in sample_text or clean_title in sample_text):
+                raw_match = cls._find_title_match(sample_text, title, 0)
+                clean_match = cls._find_title_match(sample_text, clean_title, 0, expand_prefix=True)
+                if title and (raw_match or clean_match):
                     sample_hits += 1
             return sample_hits >= 1
 
@@ -565,49 +589,154 @@ class DocumentParser:
         for item in outline_questions:
             raw_title = item["raw_title"]
             page = item.get("page")
-            page_start = page_offsets.get(int(page), search_start) if page else search_start
-            start = cls._find_title_position(full_text, raw_title, max(search_start, page_start - 300))
-            if start < 0:
-                start = cls._find_title_position(full_text, cls._clean_question_title(raw_title), max(search_start, page_start - 300))
-            if start < 0:
+            search_from, search_to = cls._outline_title_search_range(
+                page,
+                page_offsets,
+                len(full_text),
+                search_start,
+            )
+            match = cls._find_outline_title_match(full_text, raw_title, search_from, search_to)
+            if match is None and search_to < len(full_text):
+                match = cls._find_outline_title_match(full_text, raw_title, search_from, len(full_text))
+            if match is None:
+                logger.warning(
+                    "[文档解析] PDF目录标题定位失败 标题=%s 页码=%s 搜索范围=%s-%s",
+                    raw_title,
+                    page,
+                    search_from,
+                    search_to,
+                )
                 continue
 
-            end = start + len(raw_title)
-            clean_title = cls._clean_question_title(raw_title)
-            if full_text[start:start + len(clean_title)] == clean_title:
-                end = start + len(clean_title)
-
-            located.append({**item, "start": start, "end": end})
-            search_start = max(end, start + 1)
+            located.append(
+                {
+                    **item,
+                    "start": match.start,
+                    "end": match.end,
+                    "match_method": match.method,
+                }
+            )
+            search_start = max(match.end, match.start + 1)
 
         return located
 
-    @staticmethod
-    def _find_title_position(full_text: str, title: str, start: int) -> int:
+    @classmethod
+    def _find_title_position(cls, full_text: str, title: str, start: int) -> int:
         """在全文中从指定位置开始查找标题。"""
+
+        match = cls._find_title_match(full_text, title, start)
+        return match.start if match else -1
+
+    @classmethod
+    def _find_outline_title_match(
+            cls,
+            full_text: str,
+            raw_title: str,
+            start: int,
+            end: int | None = None,
+    ) -> _TitleMatch | None:
+        """按原始标题和清洗标题两种方式定位目录题目。"""
+
+        raw_match = cls._find_title_match(full_text, raw_title, start, end)
+        if raw_match:
+            return raw_match
+
+        clean_title = cls._clean_question_title(raw_title)
+        return cls._find_title_match(full_text, clean_title, start, end, expand_prefix=True)
+
+    @classmethod
+    def _find_title_match(
+            cls,
+            full_text: str,
+            title: str,
+            start: int,
+            end: int | None = None,
+            *,
+            expand_prefix: bool = False,
+    ) -> _TitleMatch | None:
+        """在原文中查找标题，并返回原文坐标中的标题起止位置。"""
 
         clean_title = title.strip()
         if not clean_title:
-            return -1
+            return None
 
-        position = full_text.find(clean_title, max(0, start))
+        search_start = max(0, start)
+        search_end = min(len(full_text), len(full_text) if end is None else end)
+        if search_start >= search_end:
+            return None
+
+        position = full_text.find(clean_title, search_start, search_end)
         if position >= 0:
-            return position
+            match_start = cls._expand_match_start_to_number_prefix(full_text, position, search_start)
+            method = "exact_with_prefix" if expand_prefix and match_start != position else "exact"
+            return _TitleMatch(match_start, position + len(clean_title), method)
 
-        compact_text = re.sub(r"\s+", "", full_text)
+        compact_text, compact_offsets = cls._build_compact_text_offsets(full_text, search_start, search_end)
         compact_title = re.sub(r"\s+", "", clean_title)
-        compact_position = compact_text.find(compact_title, max(0, start))
-        if compact_position < 0:
-            return -1
+        if not compact_title:
+            return None
 
-        non_space_count = 0
-        for index, char in enumerate(full_text):
+        compact_position = compact_text.find(compact_title)
+        if compact_position < 0:
+            return None
+
+        original_start = compact_offsets[compact_position]
+        original_end = compact_offsets[compact_position + len(compact_title) - 1] + 1
+        match_start = cls._expand_match_start_to_number_prefix(full_text, original_start, search_start)
+        method = "compact_with_prefix" if expand_prefix and match_start != original_start else "compact"
+        return _TitleMatch(match_start, original_end, method)
+
+    @staticmethod
+    def _outline_title_search_range(
+            page: Any,
+            page_offsets: dict[int, int],
+            full_text_length: int,
+            search_start: int,
+    ) -> tuple[int, int]:
+        """根据 PDF 书签页码给标题定位限定搜索范围，避免误匹配目录页。"""
+
+        try:
+            page_no = int(page) if page else None
+        except (TypeError, ValueError):
+            page_no = None
+
+        if page_no is None or page_no not in page_offsets:
+            return max(0, search_start), full_text_length
+
+        page_start = page_offsets[page_no]
+        next_page_start = full_text_length
+        for candidate_page, candidate_offset in sorted(page_offsets.items()):
+            if candidate_page > page_no:
+                next_page_start = candidate_offset
+                break
+
+        search_from = max(search_start, page_start)
+        search_to = min(full_text_length, next_page_start + 800)
+        return search_from, search_to
+
+    @staticmethod
+    def _build_compact_text_offsets(text: str, start: int, end: int) -> tuple[str, list[int]]:
+        """生成去空白文本，并记录每个压缩字符对应的原文位置。"""
+
+        compact_chars: list[str] = []
+        offsets: list[int] = []
+        for index in range(start, end):
+            char = text[index]
             if char.isspace():
                 continue
-            if non_space_count == compact_position:
-                return index
-            non_space_count += 1
-        return -1
+            compact_chars.append(char)
+            offsets.append(index)
+        return "".join(compact_chars), offsets
+
+    @staticmethod
+    def _expand_match_start_to_number_prefix(full_text: str, match_start: int, min_start: int) -> int:
+        """清洗标题命中时，把同一行前面的题号前缀一起纳入标题范围。"""
+
+        line_start = full_text.rfind("\n", max(0, min_start), match_start) + 1
+        prefix = full_text[line_start:match_start]
+        if re.fullmatch(r"\s*\d+\s*[.、]\s*", prefix):
+            return line_start
+        return match_start
 
     @classmethod
     def _is_question_like_title(cls, title: str) -> bool:
@@ -644,9 +773,51 @@ class DocumentParser:
         clean_answer = answer.strip()
         for candidate in (raw_title, DocumentParser._clean_question_title(raw_title)):
             candidate = candidate.strip()
-            if candidate and clean_answer.startswith(candidate):
-                clean_answer = clean_answer[len(candidate):].strip()
+            clean_answer = DocumentParser._remove_leading_text_variant(clean_answer, candidate)
         return clean_answer
+
+    @staticmethod
+    def _remove_leading_text_variant(text: str, candidate: str) -> str:
+        """按原样或去空白后的写法移除答案开头重复文本。"""
+
+        clean_text = text.strip()
+        clean_candidate = candidate.strip()
+        if not clean_text or not clean_candidate:
+            return clean_text
+
+        if clean_text.startswith(clean_candidate):
+            return clean_text[len(clean_candidate):].strip()
+
+        compact_text = re.sub(r"\s+", "", clean_text)
+        compact_candidate = re.sub(r"\s+", "", clean_candidate)
+        if not compact_candidate or not compact_text.startswith(compact_candidate):
+            return clean_text
+
+        matched_count = 0
+        for index, char in enumerate(clean_text):
+            if char.isspace():
+                continue
+            matched_count += 1
+            if matched_count == len(compact_candidate):
+                return clean_text[index + 1:].strip()
+
+        return clean_text
+
+    @staticmethod
+    def _clean_outline_answer(answer: str) -> str:
+        """清理目录问答答案开头常见的答案标签。"""
+
+        clean_answer = answer.strip()
+        return re.sub(r"^(?:答案|答|A)[:：]\s*", "", clean_answer, count=1, flags=re.IGNORECASE).strip()
+
+    @staticmethod
+    def _is_invalid_outline_answer(answer: str) -> bool:
+        """判断目录问答切出来的答案是否明显无效。"""
+
+        compact_answer = re.sub(r"\s+", "", answer or "")
+        if not compact_answer:
+            return True
+        return re.fullmatch(r"(?:问题|答案|答|Q|A)[:：]?", compact_answer, re.IGNORECASE) is not None
 
     def _split_outline_qa_content(self, question: str, answer: str | None, *, max_chars: int = 1500) -> list[str]:
         """把 outline QA 格式化成文本，超长答案按段落二次切片。"""

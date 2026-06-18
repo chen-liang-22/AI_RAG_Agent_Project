@@ -1,32 +1,62 @@
+"""对话式考试路由。
+
+核心流程：
+1. 从 Qdrant 中按向量库、文件和一级目录筛选结构化 QA 题源；
+2. 开始考试时随机抽题，并优先调用 LLM 把原始 QA 润色成正式试题；
+3. 用户逐轮提交答案，后端用 LLM 分析得分、正确答案、命中点和遗漏点；
+4. 会话、题目、用户答案和分析结果全部写入 SQLite，供历史记录查看。
+"""
+
 import json
 import random
 import re
 import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from langchain_core.messages import HumanMessage, SystemMessage
 from qdrant_client import QdrantClient, models
 
+from api.common_services import _get_knowledge_store
 from api.exam_schemas import (
+    ExamAnswerAnalysis,
     ExamAnswerRequest,
-    ExamGenerateRequest,
-    ExamGenerateResponse,
-    ExamGradeRequest,
-    ExamGradeResponse,
-    ExamGradeResult,
-    ExamQuestionResponse,
+    ExamAnswerResponse,
+    ExamConversationQuestion,
+    ExamHistoryListResponse,
+    ExamQuestionRecord,
     ExamQuestionSource,
+    ExamSectionsResponse,
+    ExamSectionResponse,
+    ExamSessionDetailResponse,
+    ExamSessionSummary,
+    ExamStartRequest,
+    ExamStartResponse,
 )
-from model.factory import get_chat_model, get_chat_model_name_for_mode, normalize_chat_model_mode
+from model.factory import get_chat_model
+from rag.knowledge_store import KnowledgeStore
 from utils.logger_handler import logger
 from utils.qdrant_options import get_qdrant_client_options, normalize_qdrant_collection_name
 
 router = APIRouter()
 
+# Qdrant scroll 的最大翻页次数，避免数据异常时接口长时间循环。
 MAX_EXAM_SCROLL_ROUNDS = 200
+
+# 当前考试支持的题型编码。前端传入空列表或非法值时，会回退到这里的完整集合。
+ALL_QUESTION_TYPES = ["single_choice", "multiple_choice", "true_false", "short_answer", "fill_blank"]
+
+# 入库时多级目录统一使用该分隔符；考试页只展示第一层目录。
+SECTION_PATH_SEPARATOR = " / "
+
+# 题型中文名主要用于命题和阅卷提示词，让模型更稳定地理解题型。
+QUESTION_TYPE_LABELS = {
+    "single_choice": "单选题",
+    "multiple_choice": "多选题",
+    "true_false": "判断题",
+    "short_answer": "简答题",
+    "fill_blank": "填空题",
+}
 
 
 def _elapsed_ms(start_time: float) -> float:
@@ -61,109 +91,6 @@ def _extract_reference_answer(content: str, question: str) -> str:
     return content.replace(question, "", 1).strip() or content
 
 
-def _match_section(metadata: dict[str, Any], section_path: str | None) -> bool:
-    """判断题目是否属于指定章节。"""
-
-    if not section_path:
-        return True
-    expected = section_path.strip()
-    actual = str(metadata.get("section_path") or metadata.get("heading_path") or metadata.get("category") or "")
-    return actual.startswith(expected)
-
-
-def _build_exam_filter(request: ExamGenerateRequest) -> models.Filter:
-    """根据组卷条件构造 Qdrant metadata 过滤器。"""
-
-    conditions: list[models.FieldCondition] = [
-        models.FieldCondition(key="metadata.content_type", match=models.MatchValue(value="qa")),
-    ]
-    if request.document_id:
-        conditions.append(
-            models.FieldCondition(key="metadata.document_id", match=models.MatchValue(value=request.document_id))
-        )
-    return models.Filter(must=conditions)
-
-
-def _scroll_candidate_questions(request: ExamGenerateRequest) -> list[dict[str, Any]]:
-    """从 Qdrant 中读取满足条件的结构化 QA 候选题。"""
-
-    collection_name = normalize_qdrant_collection_name(request.collection_name)
-    client = QdrantClient(**get_qdrant_client_options())
-    candidates: list[dict[str, Any]] = []
-    offset = None
-    scroll_rounds = 0
-
-    while True:
-        scroll_rounds += 1
-        points, offset = client.scroll(
-            collection_name=collection_name,
-            scroll_filter=_build_exam_filter(request),
-            limit=256,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        for point in points:
-            payload = point.payload or {}
-            metadata = _payload_metadata(payload)
-            question = str(metadata.get("question") or "").strip()
-            content = _payload_content(payload)
-            if not question or not content or not _match_section(metadata, request.section_path):
-                continue
-            candidates.append({"payload": payload, "metadata": metadata, "content": content})
-        if offset is None or scroll_rounds >= MAX_EXAM_SCROLL_ROUNDS:
-            break
-
-    logger.info(
-        "[考试] 题源筛选完成 Collection=%s 文件编号=%s 章节=%s 扫描轮次=%s 候选题数=%s",
-        collection_name,
-        request.document_id,
-        request.section_path,
-        scroll_rounds,
-        len(candidates),
-    )
-    return candidates
-
-
-def _deduplicate_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """按原始题目编号和题干去重，避免同一题多片段重复出现。"""
-
-    seen: set[str] = set()
-    unique_items: list[dict[str, Any]] = []
-    for item in candidates:
-        metadata = item["metadata"]
-        key = str(metadata.get("question_id") or metadata.get("qa_id") or metadata.get("question") or "")
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        unique_items.append(item)
-    return unique_items
-
-
-def _build_exam_question(item: dict[str, Any], request: ExamGenerateRequest, paper_id: str, index: int) -> ExamQuestionResponse:
-    """把 Qdrant 候选题转换成前端考试题目。"""
-
-    metadata = item["metadata"]
-    question = str(metadata.get("question") or "").strip()
-    reference_answer = _extract_reference_answer(item["content"], question)
-    source_question_id = str(metadata.get("question_id") or metadata.get("qa_id") or metadata.get("segment_id") or "")
-    return ExamQuestionResponse(
-        question_id=f"{paper_id}_q_{index:04d}",
-        source_question_id=source_question_id or None,
-        question_type="short_answer",
-        difficulty=request.difficulty,
-        question=question,
-        reference_answer=reference_answer,
-        score=request.score_per_question,
-        source=ExamQuestionSource(
-            document_id=_optional_text(metadata.get("document_id")),
-            filename=_optional_text(metadata.get("source_file") or metadata.get("source")),
-            section_path=_optional_text(metadata.get("section_path") or metadata.get("heading_path") or metadata.get("category")),
-            source_page=_optional_int(metadata.get("source_page") or metadata.get("page_no") or metadata.get("page")),
-        ),
-    )
-
-
 def _optional_text(value: object) -> str | None:
     """把可选字段转换成干净字符串，空值统一返回 None。"""
 
@@ -184,45 +111,538 @@ def _optional_int(value: object) -> int | None:
         return None
 
 
-@router.post("/exam/generate", response_model=ExamGenerateResponse)
-def generate_exam(request: ExamGenerateRequest) -> ExamGenerateResponse:
-    """从结构化题库生成简答试卷。"""
+def _metadata_section_path(metadata: dict[str, Any]) -> str:
+    """从题目 metadata 中读取完整目录路径。"""
 
-    start_time = time.perf_counter()
-    if "short_answer" not in {item.strip() for item in request.question_types}:
-        raise HTTPException(status_code=400, detail="第一阶段仅支持 short_answer 简答题")
+    return str(metadata.get("section_path") or metadata.get("heading_path") or metadata.get("category") or "").strip()
 
-    logger.info(
-        "[考试] 开始生成试卷 模式=%s Collection=%s 文件编号=%s 章节=%s 题目数量=%s",
-        request.mode,
-        normalize_qdrant_collection_name(request.collection_name),
-        request.document_id,
-        request.section_path,
-        request.question_count,
-    )
-    candidates = _deduplicate_candidates(_scroll_candidate_questions(request))
-    if not candidates:
-        raise HTTPException(status_code=404, detail="当前题源范围内没有可用于考试的结构化问答题")
 
-    random_generator = random.Random(request.seed)
-    random_generator.shuffle(candidates)
-    selected_items = candidates[:request.question_count]
-    paper_id = f"paper_{uuid.uuid4().hex}"
-    questions = [
-        _build_exam_question(item, request, paper_id, index)
-        for index, item in enumerate(selected_items, start=1)
+def _first_level_section_path(section_path: str | None) -> str:
+    """把完整目录路径压缩为第一层目录，用于前端下拉展示。"""
+
+    clean_path = (section_path or "").strip()
+    if not clean_path:
+        return ""
+    return clean_path.split(SECTION_PATH_SEPARATOR, maxsplit=1)[0].strip()
+
+
+def _section_sort_key(section_path: str) -> tuple[int, int, str]:
+    """按目录中的数字自然排序，保证 1、2、3、10 这种顺序正确。"""
+
+    number_match = re.search(r"\d+", section_path)
+    if number_match:
+        return 0, int(number_match.group(0)), section_path
+    return 1, 0, section_path
+
+
+def _match_section(metadata: dict[str, Any], section_path: str | None) -> bool:
+    """判断题目是否属于指定目录路径。"""
+
+    if not section_path:
+        return True
+    expected = section_path.strip()
+    actual = _metadata_section_path(metadata)
+    return actual == expected or actual.startswith(f"{expected}{SECTION_PATH_SEPARATOR}")
+
+
+def _build_exam_filter(document_id: str | None) -> models.Filter:
+    """根据题源条件构造 Qdrant metadata 过滤器。"""
+
+    # 考试只从结构化 QA 片段中抽题，普通文本切片不直接进入题库。
+    conditions: list[models.FieldCondition] = [
+        models.FieldCondition(key="metadata.content_type", match=models.MatchValue(value="qa")),
     ]
+    if document_id:
+        conditions.append(models.FieldCondition(key="metadata.document_id", match=models.MatchValue(value=document_id)))
+    return models.Filter(must=conditions)
+
+
+def _scroll_candidate_questions(
+        *,
+        collection_name: str | None,
+        document_id: str | None = None,
+        section_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """从 Qdrant 中读取满足条件的结构化 QA 候选题。"""
+
+    final_collection_name = normalize_qdrant_collection_name(collection_name)
+    client = QdrantClient(**get_qdrant_client_options())
+    candidates: list[dict[str, Any]] = []
+    offset = None
+    scroll_rounds = 0
+
+    while True:
+        scroll_rounds += 1
+        points, offset = client.scroll(
+            collection_name=final_collection_name,
+            scroll_filter=_build_exam_filter(document_id),
+            limit=256,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for point in points:
+            payload = point.payload or {}
+            metadata = _payload_metadata(payload)
+            question = str(metadata.get("question") or "").strip()
+            content = _payload_content(payload)
+            # 只保留有题干、有正文、且命中目录过滤条件的 QA 片段。
+            if not question or not content or not _match_section(metadata, section_path):
+                continue
+            candidates.append({"payload": payload, "metadata": metadata, "content": content})
+        if offset is None or scroll_rounds >= MAX_EXAM_SCROLL_ROUNDS:
+            break
+
     logger.info(
-        "[考试] 试卷生成完成 试卷编号=%s 题目数量=%s 耗时毫秒=%.2f",
-        paper_id,
-        len(questions),
-        _elapsed_ms(start_time),
+        "[考试] 题源筛选完成 Collection=%s 文件编号=%s 目录=%s 扫描轮次=%s 候选题数=%s",
+        final_collection_name,
+        document_id,
+        section_path,
+        scroll_rounds,
+        len(candidates),
     )
-    return ExamGenerateResponse(
-        paper_id=paper_id,
-        title="知识掌握度测评",
-        total_score=sum(question.score for question in questions),
-        questions=questions,
+    return _deduplicate_candidates(candidates)
+
+
+def _deduplicate_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按原始题目编号和题干去重，避免同一题多片段重复出现。"""
+
+    seen: set[str] = set()
+    unique_items: list[dict[str, Any]] = []
+    for item in candidates:
+        metadata = item["metadata"]
+        key = str(metadata.get("question_id") or metadata.get("qa_id") or metadata.get("question") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique_items.append(item)
+    return unique_items
+
+
+def _session_summary(row: dict[str, Any]) -> ExamSessionSummary:
+    """把 SQLite 考试会话记录转换成响应模型。"""
+
+    return ExamSessionSummary(
+        session_id=row["session_id"],
+        user_id=row.get("user_id"),
+        title=row.get("title") or "知识掌握度测评",
+        collection_name=row["collection_name"],
+        document_id=row.get("document_id"),
+        filename=row.get("filename"),
+        section_path=row.get("section_path"),
+        round_count=int(row["round_count"]),
+        answered_count=int(row["answered_count"]),
+        total_score=round(float(row.get("total_score") or 0), 2),
+        max_score=round(float(row.get("max_score") or 100), 2),
+        status=row["status"],
+        current_round=int(row.get("current_round") or 1),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row.get("completed_at"),
+    )
+
+
+def _parse_json_field(value: str | None, default: Any) -> Any:
+    """解析 SQLite JSON 字段，失败时返回默认值。"""
+
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return default
+
+
+def _question_from_row(row: dict[str, Any]) -> ExamConversationQuestion:
+    """把 SQLite 考试题目记录转换成前端展示题目。"""
+
+    return ExamConversationQuestion(
+        exam_question_id=row["exam_question_id"],
+        round_no=int(row["round_no"]),
+        question_type=row["question_type"],
+        prompt=row["prompt"],
+        options=_parse_json_field(row.get("options_json"), []),
+        max_score=round(float(row["max_score"]), 2),
+        source=ExamQuestionSource(
+            document_id=row.get("source_document_id"),
+            filename=row.get("source_filename"),
+            section_path=row.get("section_path"),
+            source_page=_optional_int(row.get("source_page")),
+        ),
+    )
+
+
+def _analysis_from_row(row: dict[str, Any]) -> ExamAnswerAnalysis | None:
+    """把 SQLite 题目分析字段转换成响应模型。"""
+
+    if row.get("analysis_json") is None:
+        return None
+    analysis = _parse_json_field(row.get("analysis_json"), {})
+    return ExamAnswerAnalysis(
+        is_correct=bool(row.get("is_correct")),
+        score=round(float(row.get("score") or 0), 2),
+        max_score=round(float(row.get("max_score") or 0), 2),
+        correct_answer=analysis.get("correct_answer"),
+        reference_answer=row.get("reference_answer") or "",
+        hit_points=[str(item) for item in analysis.get("hit_points", [])],
+        missing_points=[str(item) for item in analysis.get("missing_points", [])],
+        wrong_points=[str(item) for item in analysis.get("wrong_points", [])],
+        comment=str(analysis.get("comment") or ""),
+    )
+
+
+def _normalize_answer_value(answer: str | list[str]) -> str:
+    """把前端答案统一成可保存的字符串。"""
+
+    if isinstance(answer, list):
+        return "、".join(str(item).strip() for item in answer if str(item).strip())
+    return str(answer or "").strip()
+
+
+def _split_answer_points(answer: str) -> list[str]:
+    """从参考答案中拆出可用于选择题的短答案片段。"""
+
+    clean_answer = re.sub(r"\s+", " ", answer).strip()
+    parts = re.split(r"[；;。\n]|(?:\d+[.、])|(?:[（(]?[一二三四五六七八九十]+[）)]、?)", clean_answer)
+    points = []
+    for part in parts:
+        text = part.strip(" ：:，,、-")
+        if 4 <= len(text) <= 80:
+            points.append(text)
+    if not points and clean_answer:
+        points.append(clean_answer[:80])
+    return points[:6]
+
+
+def _sample_distractors(candidates: list[dict[str, Any]], current_answer: str, random_generator: random.Random, count: int) -> list[str]:
+    """从同一题源候选答案中抽取干扰项。"""
+
+    current_norm = current_answer.strip().lower()
+    pool: list[str] = []
+    for item in candidates:
+        metadata = item["metadata"]
+        question = str(metadata.get("question") or "").strip()
+        answer = _extract_reference_answer(item["content"], question)
+        for point in _split_answer_points(answer):
+            if point.strip().lower() != current_norm and point not in pool:
+                pool.append(point)
+    random_generator.shuffle(pool)
+    return pool[:count]
+
+
+def _make_single_choice(
+        question: str,
+        answer: str,
+        candidates: list[dict[str, Any]],
+        random_generator: random.Random,
+) -> tuple[str, list[str], str] | None:
+    """把原始问答改造成单选题。"""
+
+    # 这里是模型不可用时的兜底题目，不是主链路；主链路会优先走 _generate_question_with_model。
+    correct_answer = _split_answer_points(answer)[0] if _split_answer_points(answer) else answer[:80]
+    distractors = _sample_distractors(candidates, correct_answer, random_generator, 3)
+    if len(distractors) < 3:
+        return None
+    options = [correct_answer, *distractors]
+    random_generator.shuffle(options)
+    return f"{question}\n请选择最符合参考答案的一项。", options, correct_answer
+
+
+def _make_multiple_choice(
+        question: str,
+        answer: str,
+        candidates: list[dict[str, Any]],
+        random_generator: random.Random,
+) -> tuple[str, list[str], list[str]] | None:
+    """把原始问答改造成多选题。"""
+
+    # 多选题需要至少两个正确点和两个干扰项，否则回退成简答题更稳。
+    correct_points = _split_answer_points(answer)[:3]
+    if len(correct_points) < 2:
+        return None
+    distractors = _sample_distractors(candidates, " ".join(correct_points), random_generator, 2)
+    if len(distractors) < 2:
+        return None
+    options = [*correct_points, *distractors]
+    random_generator.shuffle(options)
+    return f"{question}\n请选择所有正确选项。", options, correct_points
+
+
+def _make_true_false(question: str, answer: str, random_generator: random.Random) -> tuple[str, list[str], str]:
+    """把原始问答改造成判断题。"""
+
+    # 规则兜底时随机生成正误说法，避免判断题永远都是“正确”。
+    correct_is_true = random_generator.random() >= 0.35
+    if correct_is_true:
+        statement = f"{question}：{_split_answer_points(answer)[0] if _split_answer_points(answer) else answer[:80]}"
+        correct_answer = "正确"
+    else:
+        statement = f"{question}：以上说法不完整或不准确"
+        correct_answer = "错误"
+    return f"判断正误：{statement}", ["正确", "错误"], correct_answer
+
+
+def _make_fill_blank(question: str, answer: str) -> tuple[str, list[str], str] | None:
+    """把原始问答改造成填空题。"""
+
+    # 填空题依赖参考答案中能抽出清晰短答案，抽不出来时回退成简答题。
+    answer_points = _split_answer_points(answer)
+    if not answer_points:
+        return None
+    correct_answer = answer_points[0]
+    prompt = f"{question}\n请填写关键答案：____"
+    return prompt, [], correct_answer
+
+
+def _question_type_label(question_type: str) -> str:
+    """把题型编码转换成中文题型名称。"""
+
+    return QUESTION_TYPE_LABELS.get(question_type, question_type)
+
+
+def _normalize_string_list(value: object, *, max_items: int = 8) -> list[str]:
+    """把模型返回的列表字段清洗成去重字符串列表。"""
+
+    if isinstance(value, str):
+        raw_items = [value]
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = []
+
+    clean_items: list[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if text and text not in clean_items:
+            clean_items.append(text)
+    return clean_items[:max_items]
+
+
+def _validate_generated_question(raw_result: dict[str, Any], requested_type: str) -> tuple[str, list[str], Any]:
+    """校验模型生成的题目结构，返回题干、选项和标准答案。"""
+
+    prompt = str(raw_result.get("prompt") or raw_result.get("question") or "").strip()
+    if not prompt:
+        raise ValueError("模型生成题干为空")
+
+    options = _normalize_string_list(raw_result.get("options"), max_items=6)
+    correct_answer = raw_result.get("correct_answer")
+
+    if requested_type == "single_choice":
+        correct_text = str(correct_answer or "").strip()
+        if len(options) < 4 or not correct_text:
+            raise ValueError("单选题选项或答案不完整")
+        if correct_text not in options:
+            options = [correct_text, *[item for item in options if item != correct_text]][:4]
+        return prompt, options[:4], correct_text
+
+    if requested_type == "multiple_choice":
+        correct_items = _normalize_string_list(correct_answer, max_items=6)
+        if len(options) < 4 or len(correct_items) < 2:
+            raise ValueError("多选题选项或答案不完整")
+        missing_answers = [item for item in correct_items if item not in options]
+        options = [*missing_answers, *options]
+        options = _normalize_string_list(options, max_items=6)
+        return prompt, options, correct_items
+
+    if requested_type == "true_false":
+        correct_text = str(correct_answer or "").strip()
+        if correct_text not in {"正确", "错误"}:
+            raise ValueError("判断题答案必须是正确或错误")
+        return prompt, ["正确", "错误"], correct_text
+
+    if requested_type == "fill_blank":
+        correct_text = str(correct_answer or "").strip()
+        if not correct_text:
+            raise ValueError("填空题答案为空")
+        if "____" not in prompt and "（" not in prompt:
+            prompt = f"{prompt}\n请填写空缺处：____"
+        return prompt, [], correct_text
+
+    correct_text = str(correct_answer or raw_result.get("reference_answer") or "").strip()
+    if not correct_text:
+        raise ValueError("简答题标准答案为空")
+    return prompt, [], correct_text
+
+
+def _generate_question_with_model(
+        *,
+        question: str,
+        reference_answer: str,
+        question_type: str,
+        model_mode: str | None,
+) -> tuple[str, list[str], Any]:
+    """调用模型把原始问答润色成正式考试题。"""
+
+    # 所有题型都先经过 LLM 命题，使题干、选项和标准答案看起来像真正的考试题。
+    model = get_chat_model(model_mode)
+    response = model.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "你是资深中文考试命题老师，负责把知识库问答改写成正式考试题。"
+                    "必须只依据给定原始问题和参考答案命题，不要补充资料外的新事实。"
+                    "题干要像正式试题，不能像客服问答或知识片段。"
+                    "正确答案要改写成面向考生的标准答案，不能直接照搬原文。"
+                    "只返回 JSON，不要返回 Markdown。"
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"目标题型：{_question_type_label(question_type)}\n\n"
+                    f"原始问题：{question}\n\n"
+                    f"参考答案：{reference_answer}\n\n"
+                    "请生成一题正式考试题，并严格返回 JSON：\n"
+                    "{"
+                    '"prompt":"正式题干",'
+                    '"options":["选项A","选项B","选项C","选项D"],'
+                    '"correct_answer":"标准答案或正确选项；多选题为字符串数组"'
+                    "}\n"
+                    "要求："
+                    "单选题提供 4 个选项且只有 1 个正确答案；"
+                    "多选题提供 4 到 6 个选项且至少 2 个正确答案；"
+                    "判断题 options 固定为 [\"正确\",\"错误\"]，correct_answer 只能是 正确 或 错误；"
+                    "填空题题干必须自然出现空缺，不要把原始问句原样当题干；"
+                    "简答题不需要 options。"
+                )
+            ),
+        ]
+    )
+    raw_result = _parse_model_json(response.content)
+    return _validate_generated_question(raw_result, question_type)
+
+
+def _build_fallback_conversation_question(
+        *,
+        item: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        question_type: str,
+        random_generator: random.Random,
+        max_score: float,
+) -> dict[str, Any]:
+    """模型生成失败时，用规则兜底生成考试题。"""
+
+    metadata = item["metadata"]
+    question = str(metadata.get("question") or "").strip()
+    reference_answer = _extract_reference_answer(item["content"], question)
+    final_type = question_type
+    prompt = question
+    options: list[str] = []
+    correct_answer: Any = reference_answer
+
+    if question_type == "single_choice":
+        generated = _make_single_choice(question, reference_answer, candidates, random_generator)
+        if generated:
+            prompt, options, correct_answer = generated
+        else:
+            final_type = "short_answer"
+    elif question_type == "multiple_choice":
+        generated = _make_multiple_choice(question, reference_answer, candidates, random_generator)
+        if generated:
+            prompt, options, correct_answer = generated
+        else:
+            final_type = "short_answer"
+    elif question_type == "true_false":
+        prompt, options, correct_answer = _make_true_false(question, reference_answer, random_generator)
+    elif question_type == "fill_blank":
+        generated = _make_fill_blank(question, reference_answer)
+        if generated:
+            prompt, options, correct_answer = generated
+        else:
+            final_type = "short_answer"
+
+    return {
+        "source_question_id": _optional_text(metadata.get("question_id") or metadata.get("qa_id") or metadata.get("segment_id")),
+        "source_document_id": _optional_text(metadata.get("document_id")),
+        "source_filename": _optional_text(metadata.get("source_file") or metadata.get("source")),
+        "source_page": _optional_int(metadata.get("source_page") or metadata.get("page_no") or metadata.get("page")),
+        "section_path": _optional_text(_metadata_section_path(metadata)),
+        "question_type": final_type,
+        "prompt": prompt,
+        "options": options,
+        "correct_answer": correct_answer,
+        "reference_answer": reference_answer,
+        "max_score": max_score,
+    }
+
+
+def _build_conversation_question(
+        *,
+        item: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        question_type: str,
+        random_generator: random.Random,
+        max_score: float,
+        model_mode: str | None = None,
+) -> dict[str, Any]:
+    """先用模型把原始 QA 润色成正式考试题，失败时回退到规则生成。"""
+
+    # 先构造兜底题目，保证模型调用失败时也能保存一条完整考试题记录。
+    fallback_question = _build_fallback_conversation_question(
+        item=item,
+        candidates=candidates,
+        question_type=question_type,
+        random_generator=random_generator,
+        max_score=max_score,
+    )
+    try:
+        prompt, options, correct_answer = _generate_question_with_model(
+            question=str(item["metadata"].get("question") or "").strip(),
+            reference_answer=fallback_question["reference_answer"],
+            question_type=question_type,
+            model_mode=model_mode,
+        )
+        fallback_question["question_type"] = question_type
+        fallback_question["prompt"] = prompt
+        fallback_question["options"] = options
+        fallback_question["correct_answer"] = correct_answer
+        logger.info(
+            "[考试] 题目润色完成 题型=%s 来源题目编号=%s",
+            fallback_question["question_type"],
+            fallback_question["source_question_id"],
+        )
+        return fallback_question
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError, RuntimeError) as exc:
+        logger.error(
+            "[考试] 题目润色失败，已使用规则兜底 题型=%s 来源题目编号=%s 错误=%s",
+            fallback_question["question_type"],
+            fallback_question["source_question_id"],
+            exc,
+            exc_info=True,
+        )
+        return fallback_question
+
+
+def _rule_answer_analysis(question: dict[str, Any], user_answer: str) -> ExamAnswerAnalysis:
+    """模型评分失败时，用规则兜底生成分析结果。"""
+
+    # 兜底规则只做基础精确匹配；正常评分统一由 _model_answer_analysis 交给模型完成。
+    question_type = question["question_type"]
+    correct_answer = _parse_json_field(question.get("correct_answer_json"), None)
+    max_score = float(question["max_score"])
+    clean_user_answer = user_answer.strip()
+
+    if question_type == "multiple_choice":
+        expected_set = {str(item).strip() for item in correct_answer or [] if str(item).strip()}
+        actual_set = {item.strip() for item in re.split(r"[、,，;；\n]+", clean_user_answer) if item.strip()}
+        is_correct = bool(expected_set) and actual_set == expected_set
+    else:
+        is_correct = clean_user_answer.lower() == str(correct_answer or "").strip().lower()
+
+    score = max_score if is_correct else 0.0
+    missing_points = [] if is_correct else [f"正确答案：{correct_answer}"]
+    wrong_points = [] if is_correct else ([f"你的答案：{clean_user_answer or '未作答'}"])
+    comment = "回答正确。" if is_correct else "回答不正确，建议对照正确答案复习。"
+    return ExamAnswerAnalysis(
+        is_correct=is_correct,
+        score=score,
+        max_score=max_score,
+        correct_answer=correct_answer,
+        reference_answer=question.get("reference_answer") or "",
+        hit_points=[clean_user_answer] if is_correct and clean_user_answer else [],
+        missing_points=missing_points,
+        wrong_points=wrong_points,
+        comment=comment,
     )
 
 
@@ -241,134 +661,286 @@ def _parse_model_json(content: object) -> dict[str, Any]:
     return json.loads(text)
 
 
-def _fallback_grade(answer: ExamAnswerRequest, message: str) -> ExamGradeResult:
-    """模型评分失败时返回可展示的保底评分。"""
+def _list_field(raw_result: dict[str, Any], name: str) -> list[str]:
+    """从模型 JSON 中读取字符串列表字段。"""
 
-    return ExamGradeResult(
-        question_id=answer.question_id,
-        score=0,
-        max_score=answer.max_score,
-        wrong_points=["评分模型调用失败"],
-        comment=message,
-        review_suggestion="请稍后重新评分，或检查模型配置。",
-    )
+    value = raw_result.get(name) or []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
 
 
-def _normalize_grade_result(answer: ExamAnswerRequest, raw_result: dict[str, Any]) -> ExamGradeResult:
-    """规范化模型返回的评分 JSON。"""
+def _model_answer_analysis(question: dict[str, Any], user_answer: str, model_mode: str | None) -> ExamAnswerAnalysis:
+    """调用模型统一分析所有题型答案，并润色正确答案和阅卷点评。"""
 
-    try:
-        score = float(raw_result.get("score") or 0)
-    except (TypeError, ValueError):
-        score = 0.0
-    score = max(0.0, min(score, float(answer.max_score)))
-
-    def list_field(name: str) -> list[str]:
-        value = raw_result.get(name) or []
-        if isinstance(value, str):
-            return [value]
-        if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-        return []
-
-    return ExamGradeResult(
-        question_id=answer.question_id,
-        score=score,
-        max_score=answer.max_score,
-        hit_points=list_field("hit_points"),
-        missing_points=list_field("missing_points"),
-        wrong_points=list_field("wrong_points"),
-        comment=str(raw_result.get("comment") or "").strip(),
-        review_suggestion=str(raw_result.get("review_suggestion") or "").strip(),
-    )
-
-
-def _grade_one_answer(answer: ExamAnswerRequest, model_mode: str | None) -> ExamGradeResult:
-    """调用模型对单道简答题做结构化评分。"""
-
-    if not answer.answer.strip():
-        return ExamGradeResult(
-            question_id=answer.question_id,
+    max_score = float(question["max_score"])
+    if not user_answer.strip():
+        correct_answer = _parse_json_field(question.get("correct_answer_json"), None)
+        return ExamAnswerAnalysis(
+            is_correct=False,
             score=0,
-            max_score=answer.max_score,
+            max_score=max_score,
+            correct_answer=correct_answer,
+            reference_answer=question.get("reference_answer") or "",
             missing_points=["未作答"],
             comment="该题未作答。",
-            review_suggestion="先补全答案后再提交评分。",
         )
 
     try:
+        correct_answer = _parse_json_field(question.get("correct_answer_json"), None)
         model = get_chat_model(model_mode)
+        # 简答、填空、选择、判断都统一交给模型分析，这样可以处理同义表达、漏点和表述不完整。
         response = model.invoke(
             [
                 SystemMessage(
                     content=(
-                        "你是严格但公正的中文阅卷老师。"
-                        "必须只根据题目和参考答案评分，不要引入外部知识。"
-                        "必须只返回 JSON，不要返回 Markdown。"
+                        "你是严格但公正的中文考试阅卷老师。"
+                        "必须根据题目、题型、标准答案和参考答案分析用户答案。"
+                        "即使是选择题、判断题和填空题，也要给出自然、专业的阅卷点评。"
+                        "correct_answer 必须润色成适合展示给考生的标准答案，不要机械照搬原始知识库片段。"
+                        "评分要稳健：同义表达、合理缩写和顺序差异可以酌情判对；明显漏点或错选要扣分。"
+                        "只返回 JSON，不要返回 Markdown。"
                     )
                 ),
                 HumanMessage(
                     content=(
-                        f"题目：{answer.question}\n\n"
-                        f"参考答案：{answer.reference_answer}\n\n"
-                        f"学生答案：{answer.answer}\n\n"
-                        f"满分：{answer.max_score}\n\n"
-                        "返回 JSON 格式："
-                        '{"score":0,"hit_points":[],"missing_points":[],"wrong_points":[],"comment":"","review_suggestion":""}'
+                        f"题型：{_question_type_label(question['question_type'])}\n\n"
+                        f"题目：{question['prompt']}\n\n"
+                        f"系统保存的标准答案：{correct_answer}\n\n"
+                        f"参考答案：{question.get('reference_answer') or ''}\n\n"
+                        f"用户答案：{user_answer}\n\n"
+                        f"本题满分：{max_score}\n\n"
+                        "请返回 JSON："
+                        '{"score":0,"is_correct":false,"correct_answer":"润色后的标准答案",'
+                        '"hit_points":[],"missing_points":[],"wrong_points":[],"comment":""}'
                     )
                 ),
             ]
         )
-        return _normalize_grade_result(answer, _parse_model_json(response.content))
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
-        logger.error("[考试] 单题评分失败 题目编号=%s 错误=%s", answer.question_id, exc, exc_info=True)
-        return _fallback_grade(answer, f"评分失败：{exc}")
+        raw_result = _parse_model_json(response.content)
+        score = max(0.0, min(float(raw_result.get("score") or 0), max_score))
+        polished_answer = raw_result.get("correct_answer")
+        if polished_answer in (None, "", []):
+            polished_answer = correct_answer
+        return ExamAnswerAnalysis(
+            is_correct=bool(raw_result.get("is_correct")) or score >= max_score * 0.8,
+            score=score,
+            max_score=max_score,
+            correct_answer=polished_answer,
+            reference_answer=question.get("reference_answer") or "",
+            hit_points=_list_field(raw_result, "hit_points"),
+            missing_points=_list_field(raw_result, "missing_points"),
+            wrong_points=_list_field(raw_result, "wrong_points"),
+            comment=str(raw_result.get("comment") or "").strip(),
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError, RuntimeError) as exc:
+        logger.error("[考试] 模型阅卷失败，已使用规则兜底 题目编号=%s 错误=%s", question["exam_question_id"], exc, exc_info=True)
+        fallback = _rule_answer_analysis(question, user_answer)
+        fallback.comment = f"{fallback.comment}（模型阅卷失败，已使用规则兜底。）"
+        return fallback
 
 
-@router.post("/exam/grade", response_model=ExamGradeResponse)
-def grade_exam(request: ExamGradeRequest) -> ExamGradeResponse:
-    """批量评分考试答案，返回结构化结果。"""
+def _analysis_to_metadata(analysis: ExamAnswerAnalysis) -> dict[str, Any]:
+    """把分析模型转换成可保存 JSON。"""
+
+    return {
+        "correct_answer": analysis.correct_answer,
+        "hit_points": analysis.hit_points,
+        "missing_points": analysis.missing_points,
+        "wrong_points": analysis.wrong_points,
+        "comment": analysis.comment,
+    }
+
+
+def _store() -> KnowledgeStore:
+    """获取知识库元数据仓库。"""
+
+    return _get_knowledge_store()
+
+
+@router.get("/exam/sections", response_model=ExamSectionsResponse)
+def list_exam_sections(
+        collection_name: str | None = None,
+        document_id: str | None = None,
+) -> ExamSectionsResponse:
+    """查询某个向量库/文件下可用于考试的目录路径。"""
+
+    final_collection_name = normalize_qdrant_collection_name(collection_name)
+    candidates = _scroll_candidate_questions(collection_name=final_collection_name, document_id=document_id)
+    section_counts: dict[str, int] = {}
+    for item in candidates:
+        metadata = item["metadata"]
+        # 前端目录只展示第一层，完整子目录仍保留在题目来源里。
+        section = _first_level_section_path(_metadata_section_path(metadata))
+        if not section:
+            continue
+        section_counts[section] = section_counts.get(section, 0) + 1
+
+    sections = [
+        ExamSectionResponse(section_path=section_path, question_count=count)
+        for section_path, count in sorted(section_counts.items(), key=lambda item: _section_sort_key(item[0]))
+    ]
+    return ExamSectionsResponse(collection_name=final_collection_name, document_id=document_id, sections=sections)
+
+
+@router.post("/exam/sessions", response_model=ExamStartResponse)
+def start_exam_session(request: ExamStartRequest) -> ExamStartResponse:
+    """开始一场对话式随机考试。"""
 
     start_time = time.perf_counter()
-    if not request.answers:
-        raise HTTPException(status_code=400, detail="评分答案不能为空")
+    final_collection_name = normalize_qdrant_collection_name(request.collection_name)
+    question_types = [item for item in request.question_types if item in ALL_QUESTION_TYPES] or ALL_QUESTION_TYPES
+    candidates = _scroll_candidate_questions(
+        collection_name=final_collection_name,
+        document_id=request.document_id,
+        section_path=request.section_path,
+    )
+    if not candidates:
+        raise HTTPException(status_code=404, detail="当前题源范围内没有可用于考试的结构化问答题")
 
-    selected_model_mode = normalize_chat_model_mode(request.model_mode)
-    selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
-    logger.info(
-        "[考试] 开始批量评分 试卷编号=%s 用户编号=%s 答案数量=%s 模型模式=%s 模型名称=%s",
-        request.paper_id,
-        request.user_id,
-        len(request.answers),
-        selected_model_mode,
-        selected_model_name,
+    random_generator = random.Random(request.seed)
+    random_generator.shuffle(candidates)
+    # 先随机抽出本场考试需要的原始 QA，再逐题命题并持久化。
+    selected_items = candidates[:request.round_count]
+    if len(selected_items) < request.round_count:
+        raise HTTPException(status_code=400, detail=f"当前题源只有 {len(selected_items)} 道题，不足 {request.round_count} 轮")
+
+    document = _store().get_document(request.document_id) if request.document_id else None
+    max_score = round(100 / request.round_count, 4)
+    session = _store().create_exam_session(
+        user_id=request.user_id,
+        title="对话式知识测评",
+        collection_name=final_collection_name,
+        document_id=request.document_id,
+        filename=document.get("filename") if document else None,
+        section_path=request.section_path,
+        round_count=request.round_count,
+        question_types=question_types,
+        model_mode=request.model_mode,
+        metadata={"seed": request.seed},
     )
 
-    results: list[ExamGradeResult] = []
-    max_workers = min(5, len(request.answers))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(_grade_one_answer, answer, selected_model_mode): answer.question_id
-            for answer in request.answers
-        }
-        for future in as_completed(future_map):
-            results.append(future.result())
+    for index, item in enumerate(selected_items, start=1):
+        question_type = random_generator.choice(question_types)
+        # 每一轮题目在开始考试时生成并保存，后续查看历史时可以完整复现当时的题目。
+        question_data = _build_conversation_question(
+            item=item,
+            candidates=candidates,
+            question_type=question_type,
+            random_generator=random_generator,
+            max_score=max_score,
+            model_mode=request.model_mode,
+        )
+        _store().add_exam_question(session_id=session["session_id"], round_no=index, **question_data)
 
-    result_order = {answer.question_id: index for index, answer in enumerate(request.answers)}
-    results.sort(key=lambda item: result_order.get(item.question_id, 0))
-    total_score = sum(item.score for item in results)
-    max_score = sum(answer.max_score for answer in request.answers)
+    refreshed_session = _store().get_exam_session(session["session_id"])
+    current_question = _store().get_exam_question(session_id=session["session_id"], round_no=1)
+    if refreshed_session is None or current_question is None:
+        raise HTTPException(status_code=500, detail="考试会话创建后读取失败")
+
     logger.info(
-        "[考试] 批量评分完成 试卷编号=%s 用户编号=%s 总分=%.2f 满分=%s 耗时毫秒=%.2f",
-        request.paper_id,
-        request.user_id,
-        total_score,
-        max_score,
+        "[考试] 对话式考试开始 会话编号=%s Collection=%s 文件编号=%s 目录=%s 轮数=%s 耗时毫秒=%.2f",
+        session["session_id"],
+        final_collection_name,
+        request.document_id,
+        request.section_path,
+        request.round_count,
         _elapsed_ms(start_time),
     )
-    return ExamGradeResponse(
-        paper_id=request.paper_id,
-        total_score=total_score,
-        max_score=max_score,
-        results=results,
+    return ExamStartResponse(session=_session_summary(refreshed_session), current_question=_question_from_row(current_question))
+
+
+@router.post("/exam/sessions/{session_id}/answer", response_model=ExamAnswerResponse)
+def answer_exam_session(session_id: str, request: ExamAnswerRequest) -> ExamAnswerResponse:
+    """提交当前轮答案，并返回分析和下一题。"""
+
+    session = _store().get_exam_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="考试会话不存在")
+    if session["status"] == "completed":
+        raise HTTPException(status_code=400, detail="考试已完成，不能继续提交答案")
+
+    current_round = int(session.get("answered_count") or 0) + 1
+    question = _store().get_exam_question(session_id=session_id, round_no=current_round)
+    if question is None:
+        raise HTTPException(status_code=404, detail="当前轮题目不存在")
+    if question["status"] == "answered":
+        raise HTTPException(status_code=400, detail="当前轮题目已经作答")
+
+    user_answer = _normalize_answer_value(request.answer)
+    # 所有题型都走同一套模型阅卷逻辑，模型失败时内部自动回退到规则评分。
+    analysis = _model_answer_analysis(question, user_answer, session.get("model_mode"))
+
+    answered_question = _store().answer_exam_question(
+        session_id=session_id,
+        exam_question_id=question["exam_question_id"],
+        user_answer=user_answer,
+        is_correct=analysis.is_correct,
+        score=analysis.score,
+        analysis=_analysis_to_metadata(analysis),
     )
+    refreshed_session = _store().get_exam_session(session_id)
+    if refreshed_session is None:
+        raise HTTPException(status_code=500, detail="考试会话更新后读取失败")
+
+    next_question = None
+    if refreshed_session["status"] != "completed":
+        next_row = _store().get_exam_question(
+            session_id=session_id,
+            round_no=int(refreshed_session["answered_count"]) + 1,
+        )
+        next_question = _question_from_row(next_row) if next_row else None
+
+    logger.info(
+        "[考试] 单轮作答完成 会话编号=%s 轮次=%s 题型=%s 得分=%.2f 状态=%s",
+        session_id,
+        current_round,
+        question["question_type"],
+        analysis.score,
+        refreshed_session["status"],
+    )
+    return ExamAnswerResponse(
+        session=_session_summary(refreshed_session),
+        answered_question=_question_from_row(answered_question),
+        analysis=analysis,
+        next_question=next_question,
+    )
+
+
+@router.get("/exam/sessions", response_model=ExamHistoryListResponse)
+def list_exam_sessions(
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=10, ge=1, le=50),
+        user_id: str | None = None,
+        keyword: str | None = None,
+) -> ExamHistoryListResponse:
+    """分页查询考试历史记录。"""
+
+    sessions, total = _store().list_exam_sessions(page=page, page_size=page_size, user_id=user_id, keyword=keyword)
+    return ExamHistoryListResponse(
+        items=[_session_summary(item) for item in sessions],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/exam/sessions/{session_id}", response_model=ExamSessionDetailResponse)
+def get_exam_session_detail(session_id: str) -> ExamSessionDetailResponse:
+    """查询考试历史详情，包含题目、用户答案和分析。"""
+
+    session = _store().get_exam_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="考试会话不存在")
+    questions = [
+        ExamQuestionRecord(
+            question=_question_from_row(row),
+            user_answer=row.get("user_answer"),
+            analysis=_analysis_from_row(row),
+            answered_at=row.get("answered_at"),
+        )
+        for row in _store().list_exam_questions(session_id)
+    ]
+    return ExamSessionDetailResponse(session=_session_summary(session), questions=questions)

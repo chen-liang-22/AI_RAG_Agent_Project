@@ -60,3 +60,79 @@ def test_conversations_can_be_filtered_by_keyword(tmp_path):
     assert user_matches[0]["conversation_id"] == "conv_report"
     assert id_total == 1
     assert id_matches[0]["conversation_id"] == "conv_robot"
+
+
+def test_exam_session_questions_and_answers_are_persisted(tmp_path):
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    session = store.create_exam_session(
+        session_id="exam_unit",
+        user_id="user_exam",
+        title="Java 基础测评",
+        collection_name="agent",
+        document_id="doc_java",
+        filename="Java面试题.pdf",
+        section_path="Java 基础",
+        round_count=2,
+        question_types=["true_false", "short_answer"],
+        model_mode="low",
+        metadata={"seed": 7},
+    )
+
+    first_question = store.add_exam_question(
+        session_id=session["session_id"],
+        round_no=1,
+        source_question_id="qa_001",
+        source_document_id="doc_java",
+        source_filename="Java面试题.pdf",
+        source_page=3,
+        section_path="Java 基础",
+        question_type="true_false",
+        prompt="判断正误：Java 支持面向对象。",
+        options=["正确", "错误"],
+        correct_answer="正确",
+        reference_answer="Java 支持面向对象。",
+        max_score=50,
+    )
+    store.add_exam_question(
+        session_id=session["session_id"],
+        round_no=2,
+        source_question_id="qa_002",
+        source_document_id="doc_java",
+        source_filename="Java面试题.pdf",
+        source_page=4,
+        section_path="Java 基础",
+        question_type="short_answer",
+        prompt="简述 JVM 的作用。",
+        options=[],
+        correct_answer="运行 Java 字节码",
+        reference_answer="JVM 负责加载并运行 Java 字节码。",
+        max_score=50,
+    )
+
+    answered = store.answer_exam_question(
+        session_id=session["session_id"],
+        exam_question_id=first_question["exam_question_id"],
+        user_answer="正确",
+        is_correct=True,
+        score=50,
+        analysis={
+            "correct_answer": "正确",
+            "hit_points": ["Java 支持面向对象"],
+            "missing_points": [],
+            "wrong_points": [],
+            "comment": "回答正确。",
+        },
+    )
+    histories, total = store.list_exam_sessions(page=1, page_size=10, user_id="user_exam")
+    questions = store.list_exam_questions(session["session_id"])
+    refreshed_session = store.get_exam_session(session["session_id"])
+
+    assert answered["status"] == "answered"
+    assert answered["user_answer"] == "正确"
+    assert total == 1
+    assert histories[0]["session_id"] == "exam_unit"
+    assert refreshed_session is not None
+    assert refreshed_session["answered_count"] == 1
+    assert refreshed_session["total_score"] == 50
+    assert refreshed_session["status"] == "active"
+    assert [question["round_no"] for question in questions] == [1, 2]

@@ -295,6 +295,60 @@ class KnowledgeStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS exam_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    title TEXT,
+                    collection_name TEXT NOT NULL,
+                    document_id TEXT,
+                    filename TEXT,
+                    section_path TEXT,
+                    round_count INTEGER NOT NULL,
+                    question_types_json TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    current_round INTEGER NOT NULL DEFAULT 1,
+                    answered_count INTEGER NOT NULL DEFAULT 0,
+                    total_score REAL NOT NULL DEFAULT 0,
+                    max_score REAL NOT NULL DEFAULT 100,
+                    model_mode TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS exam_questions (
+                    exam_question_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    round_no INTEGER NOT NULL,
+                    source_question_id TEXT,
+                    source_document_id TEXT,
+                    source_filename TEXT,
+                    source_page INTEGER,
+                    section_path TEXT,
+                    question_type TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    options_json TEXT,
+                    correct_answer_json TEXT,
+                    reference_answer TEXT,
+                    user_answer TEXT,
+                    is_correct INTEGER,
+                    score REAL,
+                    max_score REAL NOT NULL,
+                    analysis_json TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    answered_at TEXT,
+                    FOREIGN KEY(session_id) REFERENCES exam_sessions(session_id) ON DELETE CASCADE,
+                    UNIQUE(session_id, round_no)
+                )
+                """
+            )
             self._ensure_document_columns(conn)
             conn.execute(
                 """
@@ -332,6 +386,24 @@ class KnowledgeStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_dictionary_items_code_parent
                 ON dictionary_items(dictionary_code, parent_item_id, sort_order)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_exam_sessions_updated
+                ON exam_sessions(updated_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_exam_sessions_user_status
+                ON exam_sessions(user_id, status)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_exam_questions_session_round
+                ON exam_questions(session_id, round_no)
                 """
             )
             self.seed_default_dictionaries(conn)
@@ -1095,3 +1167,298 @@ class KnowledgeStore:
             model_name=model_name,
             metadata=metadata,
         )
+
+    def create_exam_session(
+            self,
+            *,
+            session_id: str | None = None,
+            user_id: str | None = None,
+            title: str | None = None,
+            collection_name: str,
+            document_id: str | None = None,
+            filename: str | None = None,
+            section_path: str | None = None,
+            round_count: int,
+            question_types: list[str],
+            model_mode: str | None = None,
+            metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """创建一场对话式考试会话。"""
+
+        now = utc_now_text()
+        clean_session_id = (session_id or "").strip() or f"exam_{uuid.uuid4().hex}"
+        question_types_json = json.dumps(question_types, ensure_ascii=False)
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False) if metadata else None
+        clean_title = (title or "").strip()[:120] or "知识掌握度测评"
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO exam_sessions (
+                    session_id, user_id, title, collection_name, document_id, filename,
+                    section_path, round_count, question_types_json, status, current_round,
+                    answered_count, total_score, max_score, model_mode, metadata_json,
+                    created_at, updated_at, completed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, 0, 0, 100, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    clean_session_id,
+                    user_id,
+                    clean_title,
+                    collection_name,
+                    document_id,
+                    filename,
+                    section_path,
+                    round_count,
+                    question_types_json,
+                    model_mode,
+                    metadata_json,
+                    now,
+                    now,
+                ),
+            )
+
+        session = self.get_exam_session(clean_session_id)
+        if session is None:
+            raise RuntimeError(f"考试会话创建失败：{clean_session_id}")
+        return session
+
+    def add_exam_question(
+            self,
+            *,
+            session_id: str,
+            round_no: int,
+            source_question_id: str | None,
+            source_document_id: str | None,
+            source_filename: str | None,
+            source_page: int | None,
+            section_path: str | None,
+            question_type: str,
+            prompt: str,
+            options: list[str] | None,
+            correct_answer: Any,
+            reference_answer: str,
+            max_score: float,
+    ) -> dict[str, Any]:
+        """保存考试会话中的单轮题目。"""
+
+        now = utc_now_text()
+        exam_question_id = f"exam_q_{uuid.uuid4().hex}"
+        options_json = json.dumps(options or [], ensure_ascii=False)
+        correct_answer_json = json.dumps(correct_answer, ensure_ascii=False)
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO exam_questions (
+                    exam_question_id, session_id, round_no, source_question_id,
+                    source_document_id, source_filename, source_page, section_path,
+                    question_type, prompt, options_json, correct_answer_json,
+                    reference_answer, max_score, status, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    exam_question_id,
+                    session_id,
+                    round_no,
+                    source_question_id,
+                    source_document_id,
+                    source_filename,
+                    source_page,
+                    section_path,
+                    question_type,
+                    prompt,
+                    options_json,
+                    correct_answer_json,
+                    reference_answer,
+                    max_score,
+                    now,
+                ),
+            )
+
+        question = self.get_exam_question(exam_question_id=exam_question_id)
+        if question is None:
+            raise RuntimeError(f"考试题目保存失败：{exam_question_id}")
+        return question
+
+    def get_exam_session(self, session_id: str) -> dict[str, Any] | None:
+        """按考试会话编号查询考试会话。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM exam_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return self.row_to_dict(row)
+
+    def get_exam_question(
+            self,
+            *,
+            exam_question_id: str | None = None,
+            session_id: str | None = None,
+            round_no: int | None = None,
+    ) -> dict[str, Any] | None:
+        """查询单道考试题目，支持按题目编号或会话轮次定位。"""
+
+        with self.connect() as conn:
+            if exam_question_id:
+                row = conn.execute(
+                    "SELECT * FROM exam_questions WHERE exam_question_id = ?",
+                    (exam_question_id,),
+                ).fetchone()
+            elif session_id and round_no is not None:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM exam_questions
+                    WHERE session_id = ? AND round_no = ?
+                    """,
+                    (session_id, round_no),
+                ).fetchone()
+            else:
+                row = None
+        return self.row_to_dict(row)
+
+    def list_exam_questions(self, session_id: str) -> list[dict[str, Any]]:
+        """查询某场考试的全部题目。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM exam_questions
+                WHERE session_id = ?
+                ORDER BY round_no ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def answer_exam_question(
+            self,
+            *,
+            session_id: str,
+            exam_question_id: str,
+            user_answer: str,
+            is_correct: bool,
+            score: float,
+            analysis: dict[str, Any],
+    ) -> dict[str, Any]:
+        """保存用户单轮作答和分析结果，并刷新考试会话分数。"""
+
+        now = utc_now_text()
+        analysis_json = json.dumps(analysis, ensure_ascii=False)
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE exam_questions
+                SET user_answer = ?, is_correct = ?, score = ?, analysis_json = ?,
+                    status = 'answered', answered_at = ?
+                WHERE exam_question_id = ? AND session_id = ?
+                """,
+                (
+                    user_answer,
+                    1 if is_correct else 0,
+                    score,
+                    analysis_json,
+                    now,
+                    exam_question_id,
+                    session_id,
+                ),
+            )
+            aggregate = conn.execute(
+                """
+                SELECT
+                    COUNT(CASE WHEN status = 'answered' THEN 1 END) AS answered_count,
+                    COALESCE(SUM(CASE WHEN status = 'answered' THEN score ELSE 0 END), 0) AS total_score,
+                    COUNT(*) AS question_count
+                FROM exam_questions
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            session = conn.execute(
+                """
+                SELECT round_count
+                FROM exam_sessions
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            answered_count = int(aggregate["answered_count"] if aggregate else 0)
+            total_score = float(aggregate["total_score"] if aggregate else 0)
+            round_count = int(session["round_count"] if session else 0)
+            completed = answered_count >= round_count > 0
+            next_round = min(answered_count + 1, round_count)
+            conn.execute(
+                """
+                UPDATE exam_sessions
+                SET answered_count = ?, total_score = ?, current_round = ?,
+                    status = ?, updated_at = ?, completed_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    answered_count,
+                    total_score,
+                    next_round,
+                    "completed" if completed else "active",
+                    now,
+                    now if completed else None,
+                    session_id,
+                ),
+            )
+
+        question = self.get_exam_question(exam_question_id=exam_question_id)
+        if question is None:
+            raise RuntimeError(f"考试题目不存在：{exam_question_id}")
+        return question
+
+    def list_exam_sessions(
+            self,
+            *,
+            page: int = 1,
+            page_size: int = 10,
+            user_id: str | None = None,
+            keyword: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """分页查询考试会话记录。"""
+
+        final_page = max(1, int(page))
+        final_page_size = max(1, min(int(page_size), 50))
+        offset = (final_page - 1) * final_page_size
+        conditions = ["1 = 1"]
+        params: list[Any] = []
+
+        if user_id:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+
+        clean_keyword = (keyword or "").strip()
+        if clean_keyword:
+            like_keyword = f"%{self._escape_like_keyword(clean_keyword)}%"
+            conditions.append(
+                "(title LIKE ? ESCAPE '\\' OR filename LIKE ? ESCAPE '\\' OR section_path LIKE ? ESCAPE '\\')"
+            )
+            params.extend([like_keyword, like_keyword, like_keyword])
+
+        where_sql = " AND ".join(conditions)
+        with self.connect() as conn:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS total FROM exam_sessions WHERE {where_sql}",
+                params,
+            ).fetchone()
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM exam_sessions
+                WHERE {where_sql}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, final_page_size, offset],
+            ).fetchall()
+
+        return [dict(row) for row in rows], int(total_row["total"] if total_row else 0)

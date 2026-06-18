@@ -5,6 +5,7 @@ from qdrant_client import QdrantClient, models  # QdrantClient 用于按 documen
 
 from model.factory import embed_model  # embedding 模型，用于把文本分片转成向量
 from rag.document_parser import DocumentParser  # 通用文档解析器，负责识别、切分和 FAQ 抽取
+from rag.file_processors import FileProcessorFactory  # 文件处理器工厂，根据类型选择具体读取策略
 from utils.config_handler import qdrant_conf  # 读取 config/qdrant.yml 中的向量库配置
 from utils.file_handler import (  # 文件处理工具
     pdf_loader,  # PDF 加载器
@@ -201,57 +202,19 @@ class VectorStoreService:
     def get_file_documents(read_path: str) -> list[Document]:
         """根据文件后缀选择 loader，把单个文件读取成 Document 列表。"""
 
-        lower_read_path = read_path.lower()
-
-        if lower_read_path.endswith(".txt"):
-            return txt_loader(read_path)
-
-        if lower_read_path.endswith(".pdf"):
-            documents = pdf_loader(read_path)
-            outline = VectorStoreService.read_pdf_outline(read_path)
-            if documents and outline:
-                documents[0].metadata["_pdf_outline"] = outline
-            return documents
-
-        return []
+        try:
+            return FileProcessorFactory.load_documents(read_path)
+        except ValueError:
+            return []
 
     @staticmethod
     def read_pdf_outline(read_path: str) -> list[dict]:
         """读取 PDF 书签目录，返回 level/title/page 结构。"""
 
-        try:
-            from pypdf import PdfReader
-
-            reader = PdfReader(read_path)
-            outline_items: list[dict] = []
-
-            def walk(items, level: int = 0) -> None:
-                for item in items:
-                    if isinstance(item, list):
-                        walk(item, level + 1)
-                        continue
-
-                    title = str(getattr(item, "title", item)).strip()
-                    if not title:
-                        continue
-                    try:
-                        page_no = reader.get_destination_page_number(item) + 1
-                    except (KeyError, ValueError, TypeError, AttributeError):
-                        page_no = None
-
-                    outline_items.append(
-                        {
-                            "level": level,
-                            "title": title,
-                            "page": page_no,
-                        }
-                    )
-
-            walk(reader.outline)
-            return outline_items
-        except (ImportError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-            logger.warning("[知识库] PDF书签读取失败 文件=%s 错误=%s", read_path, exc)
-            return []
+        processor = FileProcessorFactory.get_processor("pdf")
+        if hasattr(processor, "read_pdf_outline"):
+            return processor.read_pdf_outline(read_path)
+        return []
 
     def build_index_documents(
             self,
