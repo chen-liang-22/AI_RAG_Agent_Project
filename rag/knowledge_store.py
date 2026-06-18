@@ -7,60 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
-import yaml
-
 from utils.path_tool import get_abs_path
-
-
-def build_collection_domain_keyword_items(collection_name: str, keywords: list[str]) -> list[tuple]:
-    """生成 Collection 领域关键词默认字典项。"""
-
-    group_item = (
-        collection_name,
-        collection_name,
-        None,
-        1,
-        "默认 Collection 的领域关键词分组",
-        {"collection_name": collection_name},
-    )
-    keyword_items = [
-        (
-            f"{collection_name}_keyword_{index}",
-            keyword,
-            collection_name,
-            index,
-            "命中后认为问题可能属于该 Collection 领域",
-            {"collection_name": collection_name, "keyword": keyword},
-        )
-        for index, keyword in enumerate(keywords, start=1)
-    ]
-    return [group_item, *keyword_items]
-
-
-def load_collection_domain_keyword_items() -> list[tuple]:
-    """从配置文件读取 Collection 领域关键词种子项。"""
-
-    config_path = get_abs_path("config/collection_domain_keywords.yml")
-    if not os.path.exists(config_path):
-        return []
-
-    with open(config_path, "r", encoding="utf-8") as file:
-        data = yaml.safe_load(file) or {}
-
-    collections = data.get("collections") or {}
-    if not isinstance(collections, dict):
-        return []
-
-    items: list[tuple] = []
-    for collection_name, keywords in collections.items():
-        if not isinstance(keywords, list):
-            continue
-
-        clean_keywords = [str(keyword).strip() for keyword in keywords if str(keyword).strip()]
-        if clean_keywords:
-            items.extend(build_collection_domain_keyword_items(str(collection_name).strip(), clean_keywords))
-
-    return items
 
 
 DEFAULT_DICTIONARY_ITEMS = [
@@ -165,11 +112,6 @@ DEFAULT_DICTIONARY_ITEMS = [
             ("pdf_text", "PDF 文本", None, 2, "PDF 提取文本预览"),
             ("unsupported", "不支持", None, 3, "暂不支持预览"),
         ],
-    },
-    {
-        "dictionary_code": "collection_domain_keyword",
-        "dictionary_name": "Collection 领域关键词",
-        "items": load_collection_domain_keyword_items(),
     },
 ]
 
@@ -413,6 +355,12 @@ class KnowledgeStore:
 
     def seed_default_dictionaries(self, conn: sqlite3.Connection) -> None:
         """初始化系统默认字典项，已有字典项只更新展示信息。"""
+
+        # 清理已经废弃的软编码关键词字典，避免旧库升级后前端继续展示。
+        conn.execute(
+            "DELETE FROM dictionary_items WHERE dictionary_code = ?",
+            ("collection_domain_keyword",),
+        )
 
         now = utc_now_text()
         for dictionary in DEFAULT_DICTIONARY_ITEMS:
@@ -708,30 +656,6 @@ class KnowledgeStore:
         except (json.JSONDecodeError, TypeError):
             return {}
         return metadata if isinstance(metadata, dict) else {}
-
-    def list_collection_domain_keywords(self, collection_name: str | None = None) -> list[str]:
-        """按 Collection 查询启用的领域关键词。"""
-
-        normalized_collection = str(collection_name or "agent").strip().lower()
-        keywords: list[str] = []
-        seen_keywords: set[str] = set()
-        for row in self.list_dictionary_items(dictionary_code="collection_domain_keyword"):
-            if int(row.get("enabled") or 0) != 1:
-                continue
-
-            metadata = self.parse_metadata(row.get("metadata_json"))
-            keyword = str(metadata.get("keyword") or "").strip()
-            keyword_collection = str(metadata.get("collection_name") or "").strip().lower()
-            if not keyword or keyword_collection not in {normalized_collection, "*", "all"}:
-                continue
-
-            lowered_keyword = keyword.lower()
-            if lowered_keyword in seen_keywords:
-                continue
-            seen_keywords.add(lowered_keyword)
-            keywords.append(keyword)
-
-        return keywords
 
     def normalize_dictionary_code(self, dictionary_code: str, value: str | None = None) -> str:
         """按字典表归一化编码；非法或空值时返回该字典的默认编码。"""

@@ -119,8 +119,8 @@ class DictionaryItemResponse(BaseModel):
 class DictionaryItemUpsertRequest(BaseModel):
     """字典项新增或更新请求体。"""
 
-    dictionary_code: str = Field(..., min_length=1)  # 字典编码，例如 collection_domain_keyword
-    dictionary_name: str = Field(..., min_length=1)  # 字典名称，例如 Collection 领域关键词
+    dictionary_code: str = Field(..., min_length=1)  # 字典编码，例如 model_mode
+    dictionary_name: str = Field(..., min_length=1)  # 字典名称，例如 回答模型档位
     item_code: str = Field(..., min_length=1)  # 字典项编码，同一字典下唯一
     item_name: str = Field(..., min_length=1)  # 字典项展示名称
     parent_item_id: str | None = None  # 父级字典项 ID；为空表示一级项
