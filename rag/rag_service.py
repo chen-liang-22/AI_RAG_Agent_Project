@@ -15,7 +15,6 @@
 """
 
 import json
-import sqlite3
 import time
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
@@ -49,7 +48,7 @@ class RagSummarizeService(object):
     def __init__(self):
         self.vector_store: VectorStoreService | None = None  # Qdrant 向量库服务，懒加载，避免 Qdrant 不可用时整个 RAG 初始化失败
         self.vector_stores: dict[str, VectorStoreService] = {}  # 按 collection 缓存向量库服务，避免多知识库互相串用
-        self.knowledge_store = KnowledgeStore()  # SQLite 元数据仓库；领域关键词等通用字典从这里读取
+        self.knowledge_store = KnowledgeStore()  # SQLite 元数据仓库，用于文档、会话和系统字典管理
         self.query_planner = QueryPlannerService()  # LLM Query Planner，负责把复杂问题拆成多个 search_query
         self.reranker = RuleBasedReranker()  # 规则版精排器
 
@@ -221,9 +220,9 @@ class RagSummarizeService(object):
             logger.info("[查询规划] adaptive模式跳过模型拆分 追踪编号=%s", trace_id)
             return first_queries, first_groups
 
-        if self._should_skip_planner_for_low_quality(query, analysis, quality, collection_name=collection_name):
+        if self._should_skip_planner_for_low_quality(analysis, quality):
             logger.info(
-                "[查询规划] adaptive模式跳过模型改写 追踪编号=%s 原因=首次召回分数极低且未命中Collection领域关键词 "
+                "[查询规划] adaptive模式跳过模型改写 追踪编号=%s 原因=首次召回分数极低 "
                 "Collection=%s 最高分=%.4f 前三平均分=%.4f 检索问题数=%s",
                 trace_id,
                 normalize_qdrant_collection_name(collection_name),
@@ -291,11 +290,8 @@ class RagSummarizeService(object):
 
     def _should_skip_planner_for_low_quality(
             self,
-            query: str,
             analysis: QueryAnalysis,
             quality: RetrievalQuality,
-            *,
-            collection_name: str | None = None,
     ) -> bool:
         if not bool(rag_conf.get("adaptive_skip_planner_on_very_low_score", True)):
             return False
@@ -303,41 +299,9 @@ class RagSummarizeService(object):
         if analysis.intents or analysis.filters:
             return False
 
-        if self._has_collection_domain_keyword(query, collection_name=collection_name):
-            return False
-
         max_score = float(rag_conf.get("adaptive_skip_planner_max_score", 0.45) or 0.45)
         max_top3_avg = float(rag_conf.get("adaptive_skip_planner_top3_avg_score", 0.42) or 0.42)
         return quality.top1_score < max_score and quality.top3_avg_score < max_top3_avg
-
-    def _load_collection_domain_keywords(self, collection_name: str | None = None) -> list[str]:
-        """从字典表读取当前 Collection 的领域关键词。"""
-
-        normalized_collection = normalize_qdrant_collection_name(collection_name)
-        try:
-            return self.knowledge_store.list_collection_domain_keywords(normalized_collection)
-        except (OSError, sqlite3.DatabaseError, ValueError, RuntimeError) as exc:
-            logger.warning(
-                "[查询规划] Collection领域关键词读取失败 Collection=%s 错误=%s",
-                normalized_collection,
-                exc,
-            )
-            return []
-
-    def _has_collection_domain_keyword(self, query: str, collection_name: str | None = None) -> bool:
-        """判断问题是否命中当前 Collection 的领域关键词。"""
-
-        lowered_query = query.lower()
-        keywords = self._load_collection_domain_keywords(collection_name)
-        matched_keyword = next((keyword for keyword in keywords if keyword.lower() in lowered_query), None)
-        if matched_keyword:
-            logger.info(
-                "[查询规划] 命中Collection领域关键词 Collection=%s 关键词=%s",
-                normalize_qdrant_collection_name(collection_name),
-                matched_keyword,
-            )
-            return True
-        return False
 
     def debug_retrieve(self, query: str, collection_name: str | None = None) -> dict:
         """返回 RAG 检索调试信息。

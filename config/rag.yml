@@ -70,11 +70,11 @@ adaptive_retrieve_top3_avg_score: 0.68
 adaptive_skip_planner_on_very_low_score: true
 
 # 极低分跳过 Query Planner 的最高分阈值。
-# 只有 top1 分数低于该值，并且没有命中当前 Collection 领域关键词时，才会跳过模型改写。
+# 只有 top1 分数低于该值时，才可能跳过模型改写。
 adaptive_skip_planner_max_score: 0.55
 
 # 极低分跳过 Query Planner 的前三平均分阈值。
-# 只有 top3 平均分低于该值，并且没有命中当前 Collection 领域关键词时，才会跳过模型改写。
+# 只有 top3 平均分低于该值时，才可能跳过模型改写。
 adaptive_skip_planner_top3_avg_score: 0.50
 
 # 启动预热总开关。
