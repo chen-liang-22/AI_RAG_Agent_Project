@@ -85,6 +85,7 @@ class SalesTrainingService:
             file: UploadFile,
             source_type: str,
             created_by: str | None,
+            model_mode: str | None = None,
     ) -> TrainingKnowledgeUploadResponse:
         """上传训练资料并生成待确认预览。
 
@@ -199,6 +200,7 @@ class SalesTrainingService:
                 batch_id=batch_id,
                 source_file=filename,
                 source_type=source_type,
+                model_mode=model_mode,
             )
             # 阶段 7：把切片明细写入 SQLite；此时 qdrant_point_id 只是未来发布时使用的点编号。
             self.repository.replace_chunks(batch_id, self._chunk_rows(chunks, source_type=source_type))
@@ -440,7 +442,13 @@ class SalesTrainingService:
             quality_report=quality_report,
         )
 
-    def reparse_batch(self, batch_id: str, *, use_llm_fallback: bool = True) -> TrainingKnowledgeReparseResponse:
+    def reparse_batch(
+            self,
+            batch_id: str,
+            *,
+            use_llm_fallback: bool = True,
+            model_mode: str | None = None,
+    ) -> TrainingKnowledgeReparseResponse:
         """重新切分未发布训练资料。
 
         该接口用于人工预览发现规则切分不理想时，主动触发 LLM 兜底切分。
@@ -468,6 +476,7 @@ class SalesTrainingService:
                     batch_id=batch_id,
                     source_file=source_file,
                     source_type=source_type,
+                    model_mode=model_mode,
                 )
             else:
                 evaluator = TrainingIngestQualityEvaluator()
@@ -1823,6 +1832,7 @@ class SalesTrainingService:
             batch_id: str,
             source_file: str,
             source_type: str,
+            model_mode: str | None = None,
     ) -> tuple[list[Any], dict[str, Any]]:
         """根据质量门禁决定是否调用 LLM 兜底切分。"""
 
@@ -1849,6 +1859,7 @@ class SalesTrainingService:
             source_file=source_file,
             source_type=source_type,
             visibility_default=DEFAULT_TRAINING_VISIBILITY,
+            model_mode=model_mode,
         )
         if not llm_chunks:
             rule_report["llm_fallback_attempted"] = True
@@ -1894,6 +1905,7 @@ class SalesTrainingService:
             batch_id: str,
             source_file: str,
             source_type: str,
+            model_mode: str | None = None,
     ) -> tuple[list[Any], dict[str, Any]]:
         """人工触发 LLM 重新切分，并把结果和规则切分质量一起记录。"""
 
@@ -1908,6 +1920,7 @@ class SalesTrainingService:
             source_file=source_file,
             source_type=source_type,
             visibility_default=DEFAULT_TRAINING_VISIBILITY,
+            model_mode=model_mode,
         )
         if not llm_chunks:
             rule_report["selected_splitter"] = "rule_config"

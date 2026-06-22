@@ -7,6 +7,7 @@ import yaml
 from langchain_core.documents import Document
 
 from rag.file_processors import FileProcessorFactory
+from utils.logger_handler import logger
 from utils.path_tool import get_abs_path
 
 
@@ -16,16 +17,22 @@ TRAINING_INGEST_CONFIG_PATH = get_abs_path("config/training_ingest.yml")
 def _load_training_ingest_config() -> dict[str, Any]:
     """读取销售训练入库配置。
 
-    配置读取失败时返回空字典，调用方会继续使用代码里的默认配置。
-    这样可以避免配置文件临时损坏导致上传能力完全不可用。
+    配置文件是 LMS 切片规则的唯一来源，读取失败时直接抛出明确错误。
     """
 
     try:
         with open(TRAINING_INGEST_CONFIG_PATH, "r", encoding="utf-8") as config_file:
             data = yaml.safe_load(config_file) or {}
-        return data if isinstance(data, dict) else {}
-    except (OSError, yaml.YAMLError):
-        return {}
+    except OSError as exc:
+        logger.error("[销售训练] 读取入库配置文件失败 配置路径=%s 错误=%s", TRAINING_INGEST_CONFIG_PATH, exc, exc_info=True)
+        raise RuntimeError(f"销售训练入库配置文件读取失败：{TRAINING_INGEST_CONFIG_PATH}") from exc
+    except yaml.YAMLError as exc:
+        logger.error("[销售训练] 解析入库配置文件失败 配置路径=%s 错误=%s", TRAINING_INGEST_CONFIG_PATH, exc, exc_info=True)
+        raise RuntimeError(f"销售训练入库配置文件解析失败：{TRAINING_INGEST_CONFIG_PATH}") from exc
+    if not isinstance(data, dict):
+        logger.error("[销售训练] 入库配置文件根节点必须是字典 配置路径=%s", TRAINING_INGEST_CONFIG_PATH)
+        raise ValueError(f"销售训练入库配置文件根节点必须是字典：{TRAINING_INGEST_CONFIG_PATH}")
+    return data
 
 
 @dataclass
@@ -67,21 +74,8 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
     一期先实现 LMS，后续扩展不需要改上传主流程。
     """
 
-    DEFAULT_CASE_TITLE_PATTERN = r"^[一二三四五六七八九十]+[、.．]\s*.+"
-    DEFAULT_PART_MARKERS = {
-        "task_requirement": ("任务要求",),
-        "standard_answer": ("匹配答案", "话术案例", "话术原文", "谈单话术", "参考答案"),
-        "hidden_psychology": ("隐性心理", "底层顾虑", "底层需求", "客户底层心理", "核心显性卡点", "隐性痛点"),
-        "scoring_rubric": ("命中点", "扣分点", "评分标准", "能力维度"),
-        "case_profile": ("客户案例", "企业", "老板身份", "合作行业", "客户阶段"),
-    }
-    DEFAULT_PART_VISIBILITY = {
-        "case_profile": "visible",
-        "task_requirement": "visible",
-        "standard_answer": "visible",
-        "hidden_psychology": "hidden",
-        "scoring_rubric": "scoring_only",
-    }
+    REQUIRED_PARTS = ("case_profile", "task_requirement", "standard_answer", "hidden_psychology", "scoring_rubric")
+    ALLOWED_VISIBILITY = ("visible", "hidden", "scoring_only")
 
     def __init__(self, config: dict[str, Any] | None = None):
         """初始化 LMS 切片策略，并从配置文件读取标题关键词。
@@ -90,9 +84,13 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
         """
 
         ingest_config = config or _load_training_ingest_config()
-        lms_config = ingest_config.get("lms_case") if isinstance(ingest_config.get("lms_case"), dict) else {}
-        pattern = str(lms_config.get("case_title_pattern") or self.DEFAULT_CASE_TITLE_PATTERN)
-        self.case_title_pattern = re.compile(pattern)
+        lms_config = self._require_lms_config(ingest_config)
+        pattern = self._require_case_title_pattern(lms_config)
+        try:
+            self.case_title_pattern = re.compile(pattern)
+        except re.error as exc:
+            logger.error("[销售训练] LMS案例标题正则配置错误 配置项=lms_case.case_title_pattern 错误=%s", exc, exc_info=True)
+            raise ValueError("销售训练入库配置错误：lms_case.case_title_pattern 不是合法正则") from exc
         self.part_markers = self._normalize_part_markers(lms_config.get("part_markers"))
         self.part_visibility = self._normalize_part_visibility(lms_config.get("part_visibility"))
 
@@ -332,31 +330,64 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
         return metadata
 
     @classmethod
+    def _raise_config_error(cls, message: str) -> None:
+        """记录 LMS 入库配置错误并中断策略初始化。"""
+
+        logger.error("[销售训练] LMS入库配置错误 %s", message)
+        raise ValueError(f"销售训练入库配置错误：{message}")
+
+    @classmethod
+    def _require_lms_config(cls, ingest_config: dict[str, Any]) -> dict[str, Any]:
+        """读取并校验 LMS 案例入库配置节点。"""
+
+        lms_config = ingest_config.get("lms_case")
+        if not isinstance(lms_config, dict):
+            cls._raise_config_error("缺少 lms_case 配置节点，或该节点不是字典")
+        return lms_config
+
+    @classmethod
+    def _require_case_title_pattern(cls, lms_config: dict[str, Any]) -> str:
+        """读取并校验 LMS 案例标题识别正则。"""
+
+        pattern = lms_config.get("case_title_pattern")
+        if not isinstance(pattern, str) or not pattern.strip():
+            cls._raise_config_error("缺少 lms_case.case_title_pattern 配置，或配置值为空")
+        return pattern.strip()
+
+    @classmethod
     def _normalize_part_markers(cls, raw_markers: Any) -> list[tuple[str, tuple[str, ...]]]:
         """把配置里的关键词字典转换成策略内部使用的有序元组列表。"""
 
         if not isinstance(raw_markers, dict):
-            raw_markers = cls.DEFAULT_PART_MARKERS
+            cls._raise_config_error("缺少 lms_case.part_markers 配置，或该节点不是字典")
         normalized: list[tuple[str, tuple[str, ...]]] = []
-        for case_part, markers in raw_markers.items():
-            if isinstance(markers, list):
-                clean_markers = tuple(str(marker).strip() for marker in markers if str(marker).strip())
-            else:
-                clean_markers = tuple(str(marker).strip() for marker in cls.DEFAULT_PART_MARKERS.get(case_part, ()))
+        for case_part in cls.REQUIRED_PARTS:
+            markers = raw_markers.get(case_part)
+            if not isinstance(markers, list):
+                cls._raise_config_error(f"lms_case.part_markers.{case_part} 必须配置为列表")
+            clean_markers = tuple(str(marker).strip() for marker in markers if str(marker).strip())
+            if not clean_markers:
+                cls._raise_config_error(f"lms_case.part_markers.{case_part} 至少要配置一个非空关键词")
             if clean_markers:
-                normalized.append((str(case_part), clean_markers))
-        return normalized or [(key, tuple(value)) for key, value in cls.DEFAULT_PART_MARKERS.items()]
+                normalized.append((case_part, clean_markers))
+        return normalized
 
     @classmethod
     def _normalize_part_visibility(cls, raw_visibility: Any) -> dict[str, str]:
         """读取不同切片类型的默认可见性配置。"""
 
-        visibility = dict(cls.DEFAULT_PART_VISIBILITY)
-        if isinstance(raw_visibility, dict):
-            for case_part, value in raw_visibility.items():
-                clean_value = str(value).strip()
-                if clean_value:
-                    visibility[str(case_part)] = clean_value
+        if not isinstance(raw_visibility, dict):
+            cls._raise_config_error("缺少 lms_case.part_visibility 配置，或该节点不是字典")
+        visibility: dict[str, str] = {}
+        for case_part in cls.REQUIRED_PARTS:
+            clean_value = str(raw_visibility.get(case_part) or "").strip()
+            if not clean_value:
+                cls._raise_config_error(f"缺少 lms_case.part_visibility.{case_part} 配置，或配置值为空")
+            if clean_value not in cls.ALLOWED_VISIBILITY:
+                cls._raise_config_error(
+                    f"lms_case.part_visibility.{case_part} 只能是 visible、hidden 或 scoring_only"
+                )
+            visibility[case_part] = clean_value
         return visibility
 
 

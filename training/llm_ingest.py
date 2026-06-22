@@ -53,6 +53,7 @@ class TrainingLlmFallbackSplitter:
             source_file: str,
             source_type: str,
             visibility_default: str,
+            model_mode: str | None = None,
     ) -> list[TrainingChunk]:
         """调用 LLM 抽取训练切片。"""
 
@@ -66,17 +67,17 @@ class TrainingLlmFallbackSplitter:
             source_file=source_file,
             source_type=source_type,
         )
-        model_mode = self.config.get("model_mode")
+        selected_model_mode = model_mode if model_mode is not None else self.config.get("model_mode")
         logger.info(
             "[销售训练][资料切分] LLM兜底切分开始 批次编号=%s 文件名=%s 输入字符数=%s 模型档位=%s",
             batch_id,
             source_file,
             min(len(clean_text), max_source_chars),
-            model_mode or "默认",
+            selected_model_mode or "默认",
         )
 
         try:
-            response = get_chat_model(model_mode).invoke(self._messages("请只输出 JSON。", prompt))
+            response = get_chat_model(selected_model_mode).invoke(self._messages("请只输出 JSON。", prompt))
             text = self._content_text(response.content)
             payload = self._parse_json_object(text)
             chunks = self._chunks_from_payload(

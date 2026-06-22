@@ -94,14 +94,16 @@ def list_profile_dictionaries() -> list[DictionaryGroupResponse]:
 
 @router.post("/knowledge/upload", response_model=TrainingKnowledgeUploadResponse)
 def upload_training_knowledge(
-        # 上传的原始训练资料文件。后端会先保存原文件，再解析内容、切片并写入向量库。
+        # 上传的原始训练资料文件。后端会先保存原文件，再解析内容并生成待发布切片预览。
         file: UploadFile = File(...),
         # 资料来源类型。默认 lms_case，决定使用哪一种入库切片策略。
         source_type: str = Form("lms_case"),
+        # 资料切分阶段 LLM 兜底使用的模型档位。为空时使用系统默认档位。
+        model_mode: str | None = Form(None),
         # 上传人标识。作为审计字段入库，方便追踪这批训练资料由谁上传或维护。
         created_by: str | None = Form(None),
 ) -> TrainingKnowledgeUploadResponse:
-    """上传销售训练知识，并写入销售训练资料库和训练向量库。
+    """上传销售训练知识，并生成待确认发布的预览切片。
 
     FastAPI 参数来源说明：
     - File(...)：从 multipart/form-data 的文件字段读取上传文件；
@@ -116,6 +118,7 @@ def upload_training_knowledge(
         file=file,
         source_type=source_type,
         created_by=created_by,
+        model_mode=model_mode,
     )
 
 
@@ -179,13 +182,14 @@ def rollback_training_batch(batch_id: str) -> TrainingKnowledgeRollbackResponse:
 def reparse_training_batch(
         batch_id: str,
         use_llm_fallback: bool = Query(True),
+        model_mode: str | None = Query(None),
 ) -> TrainingKnowledgeReparseResponse:
     """重新切分未发布训练资料。
 
     用于人工预览发现切片质量不好时，主动触发 LLM 兜底切分。
     """
 
-    return _service().reparse_batch(batch_id, use_llm_fallback=use_llm_fallback)
+    return _service().reparse_batch(batch_id, use_llm_fallback=use_llm_fallback, model_mode=model_mode)
 
 
 @router.get("/knowledge/batches/{batch_id}/versions", response_model=TrainingKnowledgeVersionListResponse)

@@ -107,6 +107,7 @@ def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeyp
     repository = TrainingRepository(str(tmp_path / "training.db"))
     service = SalesTrainingService(repository=repository)
     service.vector_service = FakeVectorService()
+    captured_model_modes = []
 
     class FakeFallbackSplitter:
         """测试用 LLM 兜底切分器。"""
@@ -114,7 +115,8 @@ def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeyp
         def should_trigger(self, quality_report):
             return True
 
-        def split(self, *, source_text, batch_id, source_file, source_type, visibility_default):
+        def split(self, *, source_text, batch_id, source_file, source_type, visibility_default, model_mode=None):
+            captured_model_modes.append(model_mode)
             return [
                 TrainingChunk(
                     chunk_id=f"{batch_id}_001_case_profile",
@@ -153,12 +155,14 @@ def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeyp
         file=upload_file,
         source_type="lms_case",
         created_by="tester",
+        model_mode="medium",
     )
 
     assert upload_result.status == "pending_review"
     assert upload_result.quality_report["selected_splitter"] == "llm_fallback"
     assert upload_result.quality_report["llm_fallback_used"] is True
     assert len(repository.list_chunks(upload_result.batch_id)) == 4
+    assert captured_model_modes == ["medium"]
 
 
 def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
@@ -167,6 +171,7 @@ def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
     repository = TrainingRepository(str(tmp_path / "training.db"))
     service = SalesTrainingService(repository=repository)
     service.vector_service = FakeVectorService()
+    captured_model_modes = []
 
     class FakeFallbackSplitter:
         """测试用人工 LLM 重切器。"""
@@ -179,7 +184,8 @@ def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
             # 上传阶段不自动触发，保证本用例只验证人工重切入口。
             return False
 
-        def split(self, *, source_text, batch_id, source_file, source_type, visibility_default):
+        def split(self, *, source_text, batch_id, source_file, source_type, visibility_default, model_mode=None):
+            captured_model_modes.append(model_mode)
             return [
                 TrainingChunk(
                     chunk_id=f"{batch_id}_llm_case_profile",
@@ -226,7 +232,7 @@ def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
         created_by="tester",
     )
 
-    reparse_result = service.reparse_batch(upload_result.batch_id, use_llm_fallback=True)
+    reparse_result = service.reparse_batch(upload_result.batch_id, use_llm_fallback=True, model_mode="low")
 
     assert reparse_result.status == "pending_review"
     assert reparse_result.quality_report["selected_splitter"] == "llm_fallback"
@@ -237,6 +243,7 @@ def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
     assert all("LLM" in row["chunk_text"] for row in saved_chunks)
     saved_batch = repository.get_batch(upload_result.batch_id)
     assert saved_batch["status"] == "pending_review"
+    assert captured_model_modes == ["low"]
 
 
 def test_training_preview_uses_saved_chunks(tmp_path):
