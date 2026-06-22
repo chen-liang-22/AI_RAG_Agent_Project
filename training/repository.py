@@ -75,6 +75,10 @@ class TrainingRepository:
                     source_file TEXT NOT NULL,
                     file_path TEXT,
                     file_md5 TEXT,
+                    version_group_id TEXT,
+                    version_no INTEGER NOT NULL DEFAULT 1,
+                    previous_batch_id TEXT,
+                    is_current INTEGER NOT NULL DEFAULT 0,
                     profile_type TEXT,
                     task_type TEXT,
                     industry TEXT,
@@ -84,6 +88,7 @@ class TrainingRepository:
                     chunk_count INTEGER NOT NULL DEFAULT 0,
                     point_count INTEGER NOT NULL DEFAULT 0,
                     error_message TEXT,
+                    quality_report_json TEXT,
                     created_by TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -93,6 +98,12 @@ class TrainingRepository:
             # training_knowledge_batches：一次文件上传对应一条批次记录。
             # 它主要保存文件级元数据和处理状态，不保存大段正文。
             self._ensure_column(conn, "training_knowledge_batches", "file_path", "TEXT")
+            self._ensure_column(conn, "training_knowledge_batches", "quality_report_json", "TEXT")
+            self._ensure_column(conn, "training_knowledge_batches", "version_group_id", "TEXT")
+            self._ensure_column(conn, "training_knowledge_batches", "version_no", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(conn, "training_knowledge_batches", "previous_batch_id", "TEXT")
+            self._ensure_column(conn, "training_knowledge_batches", "is_current", "INTEGER NOT NULL DEFAULT 0")
+            self._migrate_training_batch_versions(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS training_knowledge_chunks (
@@ -163,7 +174,7 @@ class TrainingRepository:
                 """
                 CREATE TABLE IF NOT EXISTS training_plans (
                     plan_id TEXT PRIMARY KEY,
-                    plan_name TEXT NOT NULL UNIQUE,
+                    plan_name TEXT NOT NULL,
                     trainee_id TEXT NOT NULL,
                     trainee_name TEXT NOT NULL,
                     profile_type TEXT NOT NULL,
@@ -183,6 +194,7 @@ class TrainingRepository:
                 """
             )
             # training_plans：训练方案主表，负责把“训练名称、角色、阶段、评分规则”串起来。
+            self._migrate_training_plans_allow_duplicate_names(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sales_training_sessions (
@@ -273,6 +285,100 @@ class TrainingRepository:
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
 
     @staticmethod
+    def _migrate_training_plans_allow_duplicate_names(conn: sqlite3.Connection) -> None:
+        """把旧训练方案表迁移为允许同名训练。
+
+        SQLite 不能直接删除 UNIQUE 约束，所以检测到旧表仍然把 plan_name 作为唯一字段时，
+        需要建临时表、复制数据、替换旧表。每场训练仍然由 plan_id 保证唯一。
+        """
+
+        unique_indexes = conn.execute("PRAGMA index_list(training_plans)").fetchall()
+        has_plan_name_unique_index = False
+        for index_row in unique_indexes:
+            if int(index_row["unique"] or 0) != 1:
+                continue
+            index_columns = conn.execute(f"PRAGMA index_info({index_row['name']})").fetchall()
+            column_names = [str(column["name"]) for column in index_columns]
+            if column_names == ["plan_name"]:
+                has_plan_name_unique_index = True
+                break
+        if not has_plan_name_unique_index:
+            return
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS training_plans_new (
+                plan_id TEXT PRIMARY KEY,
+                plan_name TEXT NOT NULL,
+                trainee_id TEXT NOT NULL,
+                trainee_name TEXT NOT NULL,
+                profile_type TEXT NOT NULL,
+                trainee_json TEXT NOT NULL,
+                selected_fields_json TEXT NOT NULL,
+                scenario_description TEXT NOT NULL,
+                extra_details TEXT,
+                model_mode TEXT,
+                active_profile_id TEXT,
+                active_setting_id TEXT,
+                role_status TEXT NOT NULL,
+                goal_status TEXT NOT NULL,
+                score_status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO training_plans_new (
+                plan_id, plan_name, trainee_id, trainee_name, profile_type,
+                trainee_json, selected_fields_json, scenario_description, extra_details,
+                model_mode, active_profile_id, active_setting_id,
+                role_status, goal_status, score_status, created_at, updated_at
+            )
+            SELECT
+                plan_id, plan_name, trainee_id, trainee_name, profile_type,
+                trainee_json, selected_fields_json, scenario_description, extra_details,
+                model_mode, active_profile_id, active_setting_id,
+                role_status, goal_status, score_status, created_at, updated_at
+            FROM training_plans
+            """
+        )
+        conn.execute("DROP TABLE training_plans")
+        conn.execute("ALTER TABLE training_plans_new RENAME TO training_plans")
+
+    @staticmethod
+    def _migrate_training_batch_versions(conn: sqlite3.Connection) -> None:
+        """给历史训练资料批次补齐版本字段。
+
+        老数据没有 version_group_id 和 is_current。
+        这里把每个已发布批次先视为一个独立版本组的当前版本，
+        后续同名文件再次发布时再进入真正的版本链。
+        """
+
+        conn.execute(
+            """
+            UPDATE training_knowledge_batches
+            SET version_group_id = batch_id
+            WHERE version_group_id IS NULL OR version_group_id = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE training_knowledge_batches
+            SET version_no = 1
+            WHERE version_no IS NULL OR version_no <= 0
+            """
+        )
+        conn.execute(
+            """
+            UPDATE training_knowledge_batches
+            SET is_current = 1
+            WHERE status = 'published' AND COALESCE(is_current, 0) = 0
+            """
+        )
+
+    @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         # sqlite3.Row 不是普通 dict，转成 dict 后业务层更好处理。
         return dict(row) if row is not None else None
@@ -290,11 +396,12 @@ class TrainingRepository:
             conn.execute(
                 """
                 INSERT INTO training_knowledge_batches (
-                    batch_id, source_type, source_file, file_path, file_md5, profile_type,
-                    task_type, industry, difficulty, visibility_default, status,
-                    created_by, created_at, updated_at
+                    batch_id, source_type, source_file, file_path, file_md5,
+                    version_group_id, version_no, previous_batch_id, is_current,
+                    profile_type, task_type, industry, difficulty, visibility_default, status,
+                    error_message, quality_report_json, created_by, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     # SQLite 使用 ? 作为参数占位符，避免手动拼 SQL 导致注入风险。
@@ -303,12 +410,18 @@ class TrainingRepository:
                     values.get("source_file"),
                     values.get("file_path"),
                     values.get("file_md5"),
+                    values.get("version_group_id") or batch_id,
+                    int(values.get("version_no") or 1),
+                    values.get("previous_batch_id"),
+                    int(bool(values.get("is_current"))),
                     values.get("profile_type"),
                     values.get("task_type"),
                     values.get("industry"),
                     values.get("difficulty"),
                     values.get("visibility_default"),
                     values.get("status", "uploaded"),
+                    values.get("error_message"),
+                    self._json(values.get("quality_report")) if values.get("quality_report") is not None else None,
                     values.get("created_by"),
                     now,
                     now,
@@ -324,6 +437,8 @@ class TrainingRepository:
             chunk_count: int | None = None,
             point_count: int | None = None,
             error_message: str | None = None,
+            quality_report: dict[str, Any] | None = None,
+            is_current: bool | None = None,
     ) -> None:
         """更新训练知识上传批次状态和统计信息。
 
@@ -340,10 +455,111 @@ class TrainingRepository:
                     chunk_count = COALESCE(?, chunk_count),
                     point_count = COALESCE(?, point_count),
                     error_message = ?,
+                    quality_report_json = COALESCE(?, quality_report_json),
+                    is_current = COALESCE(?, is_current),
                     updated_at = ?
                 WHERE batch_id = ?
                 """,
-                (status, chunk_count, point_count, error_message, utc_now_text(), batch_id),
+                (
+                    status,
+                    chunk_count,
+                    point_count,
+                    error_message,
+                    self._json(quality_report) if quality_report is not None else None,
+                    int(is_current) if is_current is not None else None,
+                    utc_now_text(),
+                    batch_id,
+                ),
+            )
+
+    def get_latest_batch_for_version(self, *, source_type: str, source_file: str) -> dict[str, Any] | None:
+        """按资料类型和文件名查询最新版本批次。"""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM training_knowledge_batches
+                WHERE source_type = ? AND source_file = ? AND status != 'deleted'
+                ORDER BY version_no DESC, updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (source_type, source_file),
+            ).fetchone()
+        return self._row(row)
+
+    def list_current_published_batch_ids(self) -> list[str]:
+        """查询当前参与训练检索的已发布批次编号。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT batch_id
+                FROM training_knowledge_batches
+                WHERE status = 'published' AND COALESCE(is_current, 0) = 1
+                ORDER BY updated_at DESC, created_at DESC
+                """
+            ).fetchall()
+        return [str(row["batch_id"]) for row in rows]
+
+    def list_published_batches_in_version_group(
+            self,
+            version_group_id: str,
+            *,
+            exclude_batch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """查询同一版本组内已发布或已归档的批次。"""
+
+        params: list[Any] = [version_group_id]
+        exclude_sql = ""
+        if exclude_batch_id:
+            exclude_sql = "AND batch_id != ?"
+            params.append(exclude_batch_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM training_knowledge_batches
+                WHERE version_group_id = ?
+                  AND status IN ('published', 'archived')
+                  {exclude_sql}
+                ORDER BY version_no DESC, updated_at DESC
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_batches_in_version_group(self, version_group_id: str) -> list[dict[str, Any]]:
+        """查询同一版本组内的全部未删除批次。"""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM training_knowledge_batches
+                WHERE version_group_id = ?
+                  AND status != 'deleted'
+                ORDER BY version_no DESC, updated_at DESC, created_at DESC
+                """,
+                (version_group_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def archive_other_versions(self, *, version_group_id: str, current_batch_id: str) -> None:
+        """把同版本组内非当前版本标记为归档。"""
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE training_knowledge_batches
+                SET status = 'archived',
+                    is_current = 0,
+                    updated_at = ?
+                WHERE version_group_id = ?
+                  AND batch_id != ?
+                  AND status = 'published'
+                """,
+                (utc_now_text(), version_group_id, current_batch_id),
             )
 
     def get_published_batch_by_md5(self, file_md5: str) -> dict[str, Any] | None:
@@ -447,6 +663,42 @@ class TrainingRepository:
             )
         return self.get_chunk(chunk_id) or {}
 
+    def replace_chunks(self, batch_id: str, chunks: list[dict[str, Any]]) -> None:
+        """替换某个批次的切片明细。
+
+        预览阶段会先保存切片；确认发布时如果重新解析，也可以用这个方法覆盖旧切片。
+        """
+
+        with self.connect() as conn:
+            conn.execute("DELETE FROM training_knowledge_chunks WHERE batch_id = ?", (batch_id,))
+            for values in chunks:
+                metadata = values.get("metadata") or {}
+                conn.execute(
+                    """
+                    INSERT INTO training_knowledge_chunks (
+                        chunk_id, batch_id, qdrant_point_id, chunk_text, source_type,
+                        profile_type, task_type, industry, difficulty, case_part,
+                        visibility, metadata_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        values.get("chunk_id"),
+                        batch_id,
+                        values.get("qdrant_point_id"),
+                        values.get("chunk_text"),
+                        values.get("source_type"),
+                        values.get("profile_type"),
+                        values.get("task_type"),
+                        values.get("industry"),
+                        values.get("difficulty"),
+                        values.get("case_part"),
+                        values.get("visibility"),
+                        self._json(metadata),
+                        utc_now_text(),
+                    ),
+                )
+
     def get_batch(self, batch_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM training_knowledge_batches WHERE batch_id = ?", (batch_id,)).fetchone()
@@ -474,7 +726,7 @@ class TrainingRepository:
         """创建训练方案。
 
         训练方案是角色、训练阶段、评分规则的上层聚合。
-        plan_name 由数据库 UNIQUE 约束保证不重复。
+        plan_id 保证唯一，plan_name 允许重复，方便同一主题多次训练。
         """
 
         now = utc_now_text()
@@ -717,12 +969,18 @@ class TrainingRepository:
             self,
             setting_id: str,
             *,
+            training_purpose: str | None = None,
+            round_limit: int | None = None,
             stages: list[dict[str, Any]] | None = None,
             scoring_rules: dict | None = None,
     ) -> dict[str, Any]:
-        """人工修改训练阶段或评分规则。"""
+        """人工修改训练宗旨、轮数、阶段或评分规则。"""
 
-        updates: dict[str, str] = {}
+        updates: dict[str, Any] = {}
+        if training_purpose is not None:
+            updates["training_purpose"] = training_purpose
+        if round_limit is not None:
+            updates["round_limit"] = int(round_limit)
         if stages is not None:
             updates["stages_json"] = self._json(stages)
         if scoring_rules is not None:

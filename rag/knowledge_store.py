@@ -158,6 +158,20 @@ DEFAULT_DICTIONARY_ITEMS = [
             ("scoring_only", "评分专用", None, 3, "主要用于训练结束评分，不作为权限展示", {"tag_type": "danger"}),
         ],
     },
+    {
+        "dictionary_code": "training_batch_status",
+        "dictionary_name": "销售训练资料批次状态",
+        "items": [
+            ("parsing", "解析中", None, 1, "文件已保存，正在解析和切片", {"tag_type": "warning"}),
+            ("pending_review", "待确认", None, 2, "切片和质量评估已完成，等待人工确认发布", {"tag_type": "warning"}),
+            ("embedding", "发布中", None, 3, "正在生成向量并写入 Qdrant", {"tag_type": "warning"}),
+            ("published", "已发布", None, 4, "训练资料已完成向量入库，可以参与训练检索", {"tag_type": "success"}),
+            ("archived", "历史版本", None, 5, "同一资料的新版本已发布，该版本不再参与训练检索，可按需回滚", {"tag_type": "info"}),
+            ("parsing_failed", "解析失败", None, 6, "文件解析、切片或向量入库失败，需要查看错误信息", {"tag_type": "danger"}),
+            ("deleted", "已删除", None, 7, "批次已软删除，列表不再展示，相关向量点会被删除", {"tag_type": "info"}),
+            ("duplicated", "重复复用", None, 8, "上传响应状态，表示文件 MD5 命中已发布批次并复用历史数据", {"tag_type": "info"}),
+        ],
+    },
 ] + PROFILE_DICTIONARY_ITEMS
 
 

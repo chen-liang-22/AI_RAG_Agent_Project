@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import time
 import uuid
 from collections.abc import Iterator
@@ -12,8 +13,12 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from model.factory import get_chat_model
+from rag.file_processors import FileProcessorFactory
 from rag.vector_store import VectorStoreService
 from training.factories.knowledge_ingest_strategy_factory import KnowledgeIngestStrategyFactory
+from training.llm_ingest import TrainingLlmFallbackSplitter
+from training.publish_validation import TrainingPublishValidator
+from training.quality import TrainingIngestQualityEvaluator
 from training.repository import TrainingRepository, utc_now_text
 from training.schemas import (
     GoalSettingResponse,
@@ -33,6 +38,10 @@ from training.schemas import (
     TrainingKnowledgeDeleteResponse,
     TrainingKnowledgeBatchListResponse,
     TrainingKnowledgeBatchResponse,
+    TrainingKnowledgePublishResponse,
+    TrainingKnowledgeReparseResponse,
+    TrainingKnowledgeRollbackResponse,
+    TrainingKnowledgeVersionListResponse,
     TrainingSessionDetailResponse,
     TrainingSessionListResponse,
     TrainingSessionSummaryResponse,
@@ -54,6 +63,7 @@ from utils.path_tool import get_abs_path
 
 TRAINING_COLLECTION_NAME = "sales_training_cases"
 ALLOWED_TRAINING_FILE_TYPES = {"txt", "pdf", "docx"}
+DEFAULT_TRAINING_VISIBILITY = "visible"
 
 
 class SalesTrainingService:
@@ -74,40 +84,48 @@ class SalesTrainingService:
             *,
             file: UploadFile,
             source_type: str,
-            profile_type: str | None,
-            task_type: str | None,
-            industry: str | None,
-            difficulty: str | None,
-            visibility_default: str,
             created_by: str | None,
     ) -> TrainingKnowledgeUploadResponse:
-        """上传并入库训练知识。
+        """上传训练资料并生成待确认预览。
 
         主流程：
         1. 保存上传文件到 uploads/batch_xxx；
-        2. 创建上传批次记录；
+        2. 创建上传批次记录，状态为 parsing；
         3. 根据 source_type 选择切片策略；
-        4. 写入 Qdrant；
-        5. 写入 SQLite 切片明细；
-        6. 更新批次状态。
+        4. 对切片结果做质量评估；
+        5. 保存切片明细；
+        6. 状态改为 pending_review，等待人工确认发布。
         """
 
+        # 阶段 1：清洗文件名并校验扩展名，避免危险路径和不支持的文件类型进入后续流程。
         filename = self._safe_filename(file.filename)
         # rsplit(".", 1) 只从右边切一次，能正确处理 a.b.docx 这种文件名。
         file_type = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         if file_type not in ALLOWED_TRAINING_FILE_TYPES:
             raise HTTPException(status_code=400, detail=f"训练知识暂不支持该文件类型：{file_type}")
 
+        # 阶段 2：为本次上传生成 batch_id，并把原始文件保存到 uploads/{batch_id}/。
+        # batch_id 是训练资料后续查询、预览、删除、向量过滤的主线索。
         batch_id = f"batch_{uuid.uuid4().hex}"
+        # 拼出本批次上传目录的绝对路径，例如 uploads/batch_xxx，用来隔离保存每次上传的原始文件。
         upload_dir = get_abs_path(os.path.join("uploads", batch_id))
+        # 确保上传目录存在；exist_ok=True 表示目录已存在时不报错，便于重复执行或异常重试。
         os.makedirs(upload_dir, exist_ok=True)
+        # 拼出原始文件最终保存路径，把清洗后的文件名放到本批次上传目录下。
         file_path = os.path.join(upload_dir, filename)
-        # UploadFile.file 是类文件对象，copyfileobj 适合大文件流式复制，不用一次性读入内存。
+        # 以二进制写入模式打开本地目标文件：w 表示写入，b 表示二进制。
+        # 如果文件不存在会自动创建；如果文件已存在会先清空，适配 txt、pdf、docx 等不同文件格式。
         with open(file_path, "wb") as target:
+            # 把 FastAPI 上传文件流复制到本地文件中，完成原始文件落盘保存。
             shutil.copyfileobj(file.file, target)
 
+        # 阶段 3：计算文件 MD5 做内容级去重。
+        # 只要文件内容完全相同，就直接复用已经 published 的历史批次。
+        # 根据本地保存后的原始文件计算 MD5，MD5 可以理解为文件内容的唯一指纹。
         file_md5 = get_file_md5_hex(file_path)
+        # 用文件 MD5 查询是否已经存在发布成功的同内容批次，避免重复解析和重复写入向量库。
         existing_batch = self.repository.get_published_batch_by_md5(file_md5)
+        # Python 中有值的对象会被当作 True；这里表示查到了重复文件批次，就进入复用逻辑。
         if existing_batch:
             # 文件内容完全一样时不重复写入向量库，直接返回已有批次。
             # 临时上传文件已经落到新目录里，这里删除它，避免 uploads 下堆重复文件。
@@ -124,101 +142,94 @@ class SalesTrainingService:
                 point_count=int(existing_batch.get("point_count") or 0),
                 source_file=existing_batch.get("source_file"),
                 duplicate_of=existing_batch["batch_id"],
+                quality_report=self._load_json(existing_batch.get("quality_report_json"), {}),
             )
 
+        version_info = self._next_training_batch_version(source_type=source_type, source_file=filename)
+        # 阶段 4：先创建 SQLite 批次记录，状态置为 parsing。
+        # 这样即使后续解析失败，也能在后台和日志里追踪到失败原因。
+        # self.repository 是当前服务的仓储成员变量，专门负责读写训练相关的 SQLite 数据。
         batch = self.repository.create_batch(
+            # 本次上传批次的唯一编号，后续查切片、删向量、预览文件都靠它关联。
             batch_id=batch_id,
+            # 资料来源类型，例如 lms_case，用来决定后续采用哪一种解析切片策略。
             source_type=source_type,
+            # 用户上传的原始文件名，保存到数据库后用于列表展示和文件预览。
             source_file=filename,
+            # 原始文件在服务器本地的保存路径，后续预览或重新解析时会用到。
             file_path=file_path,
+            # 原始文件内容的 MD5 指纹，用于判断是否上传过完全相同的文件。
             file_md5=file_md5,
-            profile_type=profile_type,
-            task_type=task_type,
-            industry=industry,
-            difficulty=difficulty,
-            visibility_default=visibility_default,
+            version_group_id=version_info["version_group_id"],
+            version_no=version_info["version_no"],
+            previous_batch_id=version_info.get("previous_batch_id"),
+            is_current=False,
+            # 默认可见性不再由前端传入，统一由后端作为兜底值维护。
+            # visible 表示默认切片对学员可见；策略解析时也可以按片段覆盖成 hidden/scoring_only。
+            visibility_default=DEFAULT_TRAINING_VISIBILITY,
+            # 批次初始状态设为 parsing，表示已创建记录，正在解析和入库。 	解析中	文件已保存，正在解析、切片并写入向量库
             status="parsing",
+            # 创建人标识，通常来自当前登录用户；为空时表示系统或匿名上传。
             created_by=created_by,
         )
-        logger.info("[销售训练] 训练知识上传开始 批次编号=%s 文件名=%s 类型=%s", batch_id, filename, source_type)
+        logger.info(
+            "[销售训练] 训练知识上传开始 批次编号=%s 文件名=%s 类型=%s 版本组=%s 版本号=%s",
+            batch_id,
+            filename,
+            source_type,
+            version_info["version_group_id"],
+            version_info["version_no"],
+        )
 
         try:
-            context = {
-                "batch_id": batch_id,
-                "source_file": filename,
-                "source_type": source_type,
-                "profile_type": profile_type,
-                "task_type": task_type,
-                "industry": industry,
-                "difficulty": difficulty,
-                "visibility_default": visibility_default,
-            }
-            # 工厂方法：上传接口只关心 source_type，具体怎么切片交给策略对象。
-            strategy = KnowledgeIngestStrategyFactory.create(source_type)
-            chunks = strategy.parse_chunks(file_path, context)
+            # 阶段 5：解析文件并生成预览切片；这里不写 Qdrant。
+            chunks = self._parse_training_chunks(
+                file_path=file_path,
+                batch_id=batch_id,
+                source_file=filename,
+                source_type=source_type,
+            )
             if not chunks:
                 raise ValueError("文件没有切出有效训练知识")
 
-            documents: list[Document] = []
-            for chunk in chunks:
-                # LangChain 的 Document = page_content + metadata。
-                # page_content 进入 embedding；metadata 会作为 Qdrant payload 保存，用于后续过滤/追踪。
-                metadata = {
-                    "batch_id": batch_id,
-                    "chunk_id": chunk.chunk_id,
-                    "content_type": "sales_training_case",
-                    "source_type": source_type,
-                    "source_file": filename,
-                    "file_md5": file_md5,
-                    "profile_type": profile_type,
-                    "task_type": task_type,
-                    "industry": industry,
-                    "difficulty": difficulty,
-                    "case_part": chunk.case_part,
-                    "visibility": chunk.visibility,
-                    # **chunk.metadata 是字典解包，类似把一个 Map 的键值合并进当前 Map。
-                    # 如果 key 重复，后面的值会覆盖前面的值；这里 chunk.metadata 放最后，便于扩展。
-                    **chunk.metadata,
-                }
-                documents.append(Document(page_content=chunk.text, metadata=metadata))
-
-            # add_documents 会调用 embedding 模型生成向量，然后写入 Qdrant collection。
-            self.vector_service.vector_store.add_documents(documents)
-            for chunk in chunks:
-                # SQLite 保留一份切片明细，方便前端预览和后续排查。
-                self.repository.add_chunk(
-                    chunk_id=chunk.chunk_id,
-                    batch_id=batch_id,
-                    qdrant_point_id=chunk.chunk_id,
-                    chunk_text=chunk.text,
-                    source_type=source_type,
-                    profile_type=profile_type,
-                    task_type=task_type,
-                    industry=industry,
-                    difficulty=difficulty,
-                    case_part=chunk.case_part,
-                    visibility=chunk.visibility,
-                    metadata=chunk.metadata,
-                )
-
+            # 阶段 6：计算切片质量报告；质量较低时才尝试 LLM 兜底切分。
+            chunks, quality_report = self._improve_training_chunks_if_needed(
+                chunks=chunks,
+                file_path=file_path,
+                batch_id=batch_id,
+                source_file=filename,
+                source_type=source_type,
+            )
+            # 阶段 7：把切片明细写入 SQLite；此时 qdrant_point_id 只是未来发布时使用的点编号。
+            self.repository.replace_chunks(batch_id, self._chunk_rows(chunks, source_type=source_type))
+            # 阶段 8：上传预览完成，等待人工确认发布。
             self.repository.update_batch_status(
                 batch_id,
-                status="published",
+                status="pending_review",
                 chunk_count=len(chunks),
-                point_count=len(chunks),
+                point_count=0,
+                quality_report=quality_report,
             )
-            logger.info("[销售训练] 训练知识入库完成 批次编号=%s 切片数量=%s", batch_id, len(chunks))
+            logger.info(
+                "[销售训练] 训练知识预览生成完成 批次编号=%s 切片数量=%s 质量分=%s 切分方式=%s",
+                batch_id,
+                len(chunks),
+                quality_report.get("score"),
+                quality_report.get("selected_splitter"),
+            )
             return TrainingKnowledgeUploadResponse(
                 batch_id=batch["batch_id"],
-                status="published",
+                status="pending_review",
                 chunk_count=len(chunks),
-                point_count=len(chunks),
+                point_count=0,
                 source_file=filename,
+                quality_report=quality_report,
             )
         except Exception as exc:
+            # 任意阶段失败都把批次标记为 parsing_failed，并保留错误消息。
             self.repository.update_batch_status(batch_id, status="parsing_failed", error_message=str(exc))
-            logger.error("[销售训练] 训练知识入库失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
-            raise HTTPException(status_code=500, detail=f"训练知识入库失败：{exc}") from exc
+            logger.error("[销售训练] 训练知识预览生成失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"训练知识预览生成失败：{exc}") from exc
 
     def list_batches(self, *, page: int = 1, page_size: int = 10) -> TrainingKnowledgeBatchListResponse:
         """分页查询已经上传过的训练资料。"""
@@ -245,40 +256,27 @@ class SalesTrainingService:
         file_type = str(batch["source_file"]).rsplit(".", 1)[-1].lower() if "." in str(batch["source_file"]) else ""
         safe_max_chars = max(500, min(100000, max_chars))
 
-        if file_type == "txt":
+        stored_preview = self._saved_chunk_preview(batch_id, safe_max_chars=safe_max_chars)
+        if stored_preview["content"]:
+            content = stored_preview["content"]
+            truncated = stored_preview["truncated"]
+            preview_type = "saved_chunks"
+        elif file_type == "txt":
             with open(file_path, "r", encoding="utf-8", errors="replace") as file:
                 content = file.read(safe_max_chars + 1)
             truncated = len(content) > safe_max_chars
             preview_type = "text"
         elif file_type in ALLOWED_TRAINING_FILE_TYPES:
+            # 兼容旧批次：如果数据库没有切片，再临时解析原文件做只读预览。
             strategy = KnowledgeIngestStrategyFactory.create(batch.get("source_type") or "lms_case")
             chunks = strategy.parse_chunks(file_path, {
                 "batch_id": batch_id,
                 "source_file": batch.get("source_file"),
                 "source_type": batch.get("source_type"),
-                "profile_type": batch.get("profile_type"),
-                "task_type": batch.get("task_type"),
-                "industry": batch.get("industry"),
-                "difficulty": batch.get("difficulty"),
-                "visibility_default": batch.get("visibility_default"),
+                "visibility_default": batch.get("visibility_default") or DEFAULT_TRAINING_VISIBILITY,
             })
-            parts: list[str] = []
-            total_chars = 0
-            truncated = False
-            for chunk in chunks:
-                part = f"{chunk.case_part}\n{chunk.text.strip()}"
-                if not part.strip():
-                    continue
-                separator = "\n\n" if parts else ""
-                candidate = f"{separator}{part}"
-                remaining = safe_max_chars - total_chars
-                if len(candidate) > remaining:
-                    parts.append(candidate[:remaining])
-                    truncated = True
-                    break
-                parts.append(candidate)
-                total_chars += len(candidate)
-            content = "".join(parts)
+            content = "\n\n".join(f"{chunk.case_part}\n{chunk.text.strip()}" for chunk in chunks)[:safe_max_chars]
+            truncated = len(content) >= safe_max_chars
             preview_type = "document_text"
         else:
             raise HTTPException(status_code=400, detail=f"当前训练资料类型不支持预览：{file_type}")
@@ -317,6 +315,211 @@ class SalesTrainingService:
         logger.info("[销售训练] 训练资料已删除 批次编号=%s", batch_id)
         return TrainingKnowledgeDeleteResponse(status="deleted", batch_id=batch_id)
 
+    def publish_batch(self, batch_id: str) -> TrainingKnowledgePublishResponse:
+        """人工确认发布训练资料。
+
+        发布阶段才会调用 embedding 并写入 Qdrant，避免低质量切片直接污染向量库。
+        """
+
+        batch = self._get_active_batch(batch_id)
+        if batch["status"] == "published":
+            logger.info("[销售训练] 训练资料已经发布，直接返回 批次编号=%s", batch_id)
+            return TrainingKnowledgePublishResponse(
+                batch_id=batch_id,
+                status="published",
+                chunk_count=int(batch.get("chunk_count") or 0),
+                point_count=int(batch.get("point_count") or 0),
+                quality_report=self._load_json(batch.get("quality_report_json"), {}),
+            )
+        if batch["status"] not in {"pending_review", "embedding"}:
+            raise HTTPException(status_code=400, detail=f"当前状态不允许发布：{batch['status']}")
+
+        chunks = self.repository.list_chunks(batch_id)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="没有可发布的训练切片，请重新上传")
+
+        self.repository.update_batch_status(batch_id, status="embedding")
+        try:
+            documents = [
+                self._document_from_chunk_row(row, batch=batch)
+                for row in chunks
+            ]
+            self.vector_service.vector_store.add_documents(documents)
+            quality_report = self._load_json(batch.get("quality_report_json"), {})
+            publish_validation = TrainingPublishValidator().validate(
+                vector_service=self.vector_service,
+                batch_id=batch_id,
+                chunks=chunks,
+            )
+            quality_report["publish_validation"] = publish_validation
+            self._archive_previous_training_versions(batch)
+            self.repository.update_batch_status(
+                batch_id,
+                status="published",
+                chunk_count=len(chunks),
+                point_count=len(chunks),
+                quality_report=quality_report,
+                is_current=True,
+            )
+        except Exception as exc:
+            self.repository.update_batch_status(batch_id, status="parsing_failed", error_message=str(exc))
+            logger.error("[销售训练] 训练资料发布失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"训练资料发布失败：{exc}") from exc
+
+        logger.info(
+            "[销售训练] 训练资料发布完成 批次编号=%s 向量点数量=%s 抽样验证=%s",
+            batch_id,
+            len(chunks),
+            quality_report.get("publish_validation", {}).get("summary", "未执行"),
+        )
+        return TrainingKnowledgePublishResponse(
+            batch_id=batch_id,
+            status="published",
+            chunk_count=len(chunks),
+            point_count=len(chunks),
+            quality_report=quality_report,
+        )
+
+    def rollback_batch(self, batch_id: str) -> TrainingKnowledgeRollbackResponse:
+        """回滚训练资料到指定历史版本。
+
+        回滚会把指定批次重新写入 Qdrant，并把同版本组其他版本归档。
+        SQLite 历史记录不删除，方便后续继续查看每个版本。
+        """
+
+        batch = self._get_active_batch(batch_id)
+        if batch["status"] not in {"published", "archived"}:
+            raise HTTPException(status_code=400, detail=f"当前状态不允许回滚：{batch['status']}")
+        chunks = self.repository.list_chunks(batch_id)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="该版本没有可回滚的训练切片")
+
+        version_group_id = batch.get("version_group_id") or batch["batch_id"]
+        try:
+            self._delete_version_group_vectors(version_group_id)
+            documents = [self._document_from_chunk_row(row, batch=batch) for row in chunks]
+            self.vector_service.vector_store.add_documents(documents)
+            quality_report = self._load_json(batch.get("quality_report_json"), {})
+            quality_report["rollback"] = {
+                "rolled_back": True,
+                "summary": f"已回滚到版本 {int(batch.get('version_no') or 1)}。",
+            }
+            publish_validation = TrainingPublishValidator().validate(
+                vector_service=self.vector_service,
+                batch_id=batch_id,
+                chunks=chunks,
+            )
+            quality_report["publish_validation"] = publish_validation
+            self.repository.archive_other_versions(version_group_id=version_group_id, current_batch_id=batch_id)
+            self.repository.update_batch_status(
+                batch_id,
+                status="published",
+                chunk_count=len(chunks),
+                point_count=len(chunks),
+                quality_report=quality_report,
+                is_current=True,
+            )
+        except Exception as exc:
+            logger.error("[销售训练] 训练资料版本回滚失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"训练资料版本回滚失败：{exc}") from exc
+
+        logger.info(
+            "[销售训练] 训练资料版本回滚完成 批次编号=%s 版本组=%s 版本号=%s 向量点数量=%s",
+            batch_id,
+            version_group_id,
+            int(batch.get("version_no") or 1),
+            len(chunks),
+        )
+        return TrainingKnowledgeRollbackResponse(
+            batch_id=batch_id,
+            status="published",
+            version_group_id=version_group_id,
+            version_no=int(batch.get("version_no") or 1),
+            chunk_count=len(chunks),
+            point_count=len(chunks),
+            quality_report=quality_report,
+        )
+
+    def reparse_batch(self, batch_id: str, *, use_llm_fallback: bool = True) -> TrainingKnowledgeReparseResponse:
+        """重新切分未发布训练资料。
+
+        该接口用于人工预览发现规则切分不理想时，主动触发 LLM 兜底切分。
+        已发布版本不能直接重切，避免 SQLite 切片和 Qdrant 向量不一致。
+        """
+
+        batch = self._get_active_batch(batch_id)
+        if batch["status"] not in {"pending_review", "parsing_failed"}:
+            raise HTTPException(status_code=400, detail=f"当前状态不允许重新切分：{batch['status']}")
+
+        file_path = self._resolve_batch_file_path(batch)
+        source_type = str(batch.get("source_type") or "lms_case")
+        source_file = str(batch.get("source_file") or "")
+        try:
+            rule_chunks = self._parse_training_chunks(
+                file_path=file_path,
+                batch_id=batch_id,
+                source_file=source_file,
+                source_type=source_type,
+            )
+            if use_llm_fallback:
+                chunks, quality_report = self._force_llm_reparse_chunks(
+                    rule_chunks=rule_chunks,
+                    file_path=file_path,
+                    batch_id=batch_id,
+                    source_file=source_file,
+                    source_type=source_type,
+                )
+            else:
+                evaluator = TrainingIngestQualityEvaluator()
+                chunks = rule_chunks
+                quality_report = evaluator.evaluate(chunks).to_dict()
+                quality_report["selected_splitter"] = "rule_config"
+                quality_report["llm_fallback_used"] = False
+                quality_report["rule_score"] = quality_report.get("score")
+
+            if not chunks:
+                raise ValueError("重新切分没有生成有效训练切片")
+            self.repository.replace_chunks(batch_id, self._chunk_rows(chunks, source_type=source_type))
+            self.repository.update_batch_status(
+                batch_id,
+                status="pending_review",
+                chunk_count=len(chunks),
+                point_count=0,
+                quality_report=quality_report,
+                is_current=False,
+            )
+        except Exception as exc:
+            self.repository.update_batch_status(batch_id, status="parsing_failed", error_message=str(exc))
+            logger.error("[销售训练] 训练资料重新切分失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"训练资料重新切分失败：{exc}") from exc
+
+        logger.info(
+            "[销售训练] 训练资料重新切分完成 批次编号=%s 切片数量=%s 质量分=%s 切分方式=%s",
+            batch_id,
+            len(chunks),
+            quality_report.get("score"),
+            quality_report.get("selected_splitter"),
+        )
+        return TrainingKnowledgeReparseResponse(
+            batch_id=batch_id,
+            status="pending_review",
+            chunk_count=len(chunks),
+            point_count=0,
+            source_file=source_file,
+            quality_report=quality_report,
+        )
+
+    def list_batch_versions(self, batch_id: str) -> TrainingKnowledgeVersionListResponse:
+        """查询指定训练资料所在版本组的版本链。"""
+
+        batch = self._get_active_batch(batch_id)
+        version_group_id = str(batch.get("version_group_id") or batch["batch_id"])
+        rows = self.repository.list_batches_in_version_group(version_group_id)
+        return TrainingKnowledgeVersionListResponse(
+            version_group_id=version_group_id,
+            items=[self._batch_response(row) for row in rows],
+        )
+
     def list_chunks(self, batch_id: str) -> TrainingKnowledgeChunkListResponse:
         """查询某个上传批次的训练知识切片。"""
 
@@ -343,20 +546,15 @@ class SalesTrainingService:
         这样用户可以先命名、检查画像和场景，再按步骤生成后续内容。
         """
 
-        try:
-            plan = self.repository.create_plan(
-                plan_name=request.plan_name.strip(),
-                trainee=request.trainee.model_dump(),
-                profile_type=request.profile_type,
-                selected_fields=request.selected_fields,
-                scenario_description=request.scenario_description.strip(),
-                extra_details=request.extra_details.strip(),
-                model_mode=request.model_mode,
-            )
-        except Exception as exc:
-            if "UNIQUE" in str(exc).upper() or "unique" in str(exc).lower():
-                raise HTTPException(status_code=400, detail=f"训练名称已存在：{request.plan_name}") from exc
-            raise
+        plan = self.repository.create_plan(
+            plan_name=request.plan_name.strip(),
+            trainee=request.trainee.model_dump(),
+            profile_type=request.profile_type,
+            selected_fields=request.selected_fields,
+            scenario_description=request.scenario_description.strip(),
+            extra_details=request.extra_details.strip(),
+            model_mode=request.model_mode,
+        )
         logger.info("[销售训练] 训练方案创建完成 方案编号=%s 名称=%s", plan["plan_id"], plan["plan_name"])
         return self._plan_detail_response(plan)
 
@@ -398,22 +596,28 @@ class SalesTrainingService:
             updates["plan_name"] = request.plan_name.strip()
         if request.trainee is not None:
             trainee_data = request.trainee.model_dump()
-            updates["trainee_json"] = self.repository._json(trainee_data)
-            updates["trainee_id"] = trainee_data["trainee_id"]
-            updates["trainee_name"] = trainee_data.get("trainee_name") or "销售学员"
-            role_input_changed = True
+            if self._json_changed(self._load_json(plan.get("trainee_json"), {}), trainee_data):
+                updates["trainee_json"] = self.repository._json(trainee_data)
+                updates["trainee_id"] = trainee_data["trainee_id"]
+                updates["trainee_name"] = trainee_data.get("trainee_name") or "销售学员"
+                role_input_changed = True
         if request.profile_type is not None and request.profile_type != plan["profile_type"]:
             updates["profile_type"] = request.profile_type
             role_input_changed = True
         if request.selected_fields is not None:
-            updates["selected_fields_json"] = self.repository._json(request.selected_fields)
-            role_input_changed = True
+            if self._json_changed(self._load_json(plan.get("selected_fields_json"), {}), request.selected_fields):
+                updates["selected_fields_json"] = self.repository._json(request.selected_fields)
+                role_input_changed = True
         if request.scenario_description is not None:
-            updates["scenario_description"] = request.scenario_description.strip()
-            role_input_changed = True
+            scenario_description = request.scenario_description.strip()
+            if scenario_description != (plan.get("scenario_description") or ""):
+                updates["scenario_description"] = scenario_description
+                role_input_changed = True
         if request.extra_details is not None:
-            updates["extra_details"] = request.extra_details.strip()
-            role_input_changed = True
+            extra_details = request.extra_details.strip()
+            if extra_details != (plan.get("extra_details") or ""):
+                updates["extra_details"] = extra_details
+                role_input_changed = True
         if request.model_mode is not None:
             updates["model_mode"] = request.model_mode
 
@@ -449,10 +653,16 @@ class SalesTrainingService:
                 })
 
         active_setting_id = updates.get("active_setting_id", plan.get("active_setting_id"))
-        if active_setting_id and request.stages is not None:
+        if active_setting_id and (
+                request.training_purpose is not None
+                or request.round_limit is not None
+                or request.stages is not None
+        ):
             self.repository.update_goal_setting(
                 active_setting_id,
-                stages=[item.model_dump() for item in request.stages],
+                training_purpose=request.training_purpose.strip() if request.training_purpose is not None else None,
+                round_limit=request.round_limit,
+                stages=[item.model_dump() for item in request.stages] if request.stages is not None else None,
             )
             goal_changed = True
         if active_setting_id and request.scoring_rules is not None:
@@ -462,9 +672,8 @@ class SalesTrainingService:
 
         try:
             updated = self.repository.update_plan(plan_id, **updates) if updates else self._require_plan(plan_id)
-        except Exception as exc:
-            if "UNIQUE" in str(exc).upper() or "unique" in str(exc).lower():
-                raise HTTPException(status_code=400, detail=f"训练名称已存在：{request.plan_name}") from exc
+        except sqlite3.DatabaseError as exc:
+            logger.error("[销售训练] 训练方案保存数据库异常 方案编号=%s 错误=%s", plan_id, exc, exc_info=True)
             raise
         logger.info(
             "[销售训练] 训练方案已修改 方案编号=%s 角色输入变化=%s 角色内容变化=%s 阶段变化=%s",
@@ -1073,7 +1282,16 @@ class SalesTrainingService:
             len(query or ""),
             self._short_text(query),
         )
-        documents = self.vector_service.search_documents(query, k=k)
+        current_batch_ids = self.repository.list_current_published_batch_ids()
+        if not current_batch_ids:
+            logger.info(
+                "[销售训练][训练证据检索] 没有当前发布版本，跳过向量检索 collection=%s 耗时秒=%s",
+                TRAINING_COLLECTION_NAME,
+                round(max(0.0, time.perf_counter() - start_perf), 3),
+            )
+            return []
+        search_filters = {"batch_id": current_batch_ids}
+        documents = self.vector_service.search_documents(query, k=k, filters=search_filters)
         evidence: list[dict[str, Any]] = []
         for document in documents:
             metadata = dict(document.metadata)
@@ -1375,6 +1593,33 @@ class SalesTrainingService:
             return default
 
     @staticmethod
+    def _compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        """清理写入 Qdrant 的 metadata，避免空标签污染向量库 payload。"""
+
+        compacted: dict[str, Any] = {}
+        for key, value in metadata.items():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            compacted[key] = value
+        return compacted
+
+    @staticmethod
+    def _json_changed(old_value: Any, new_value: Any) -> bool:
+        """比较两个 JSON 结构是否真正变化。
+
+        前端编辑页会提交完整快照，不能因为字段存在就认为内容变化。
+        这里先按中文稳定序列化再比较，避免字典顺序导致误判。
+        """
+
+        return json.dumps(old_value, ensure_ascii=False, sort_keys=True) != json.dumps(
+            new_value,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    @staticmethod
     def _normalize_response_mode(response_mode: str | None) -> str:
         """统一响应模式枚举。"""
 
@@ -1465,6 +1710,250 @@ class SalesTrainingService:
         )
 
     @staticmethod
+    def _chunk_rows(chunks: list[Any], *, source_type: str) -> list[dict[str, Any]]:
+        """把训练切片对象转换成 SQLite 明细行。"""
+
+        rows = []
+        for chunk in chunks:
+            rows.append(
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "qdrant_point_id": chunk.chunk_id,
+                    "chunk_text": chunk.text,
+                    "source_type": source_type,
+                    "case_part": chunk.case_part,
+                    "visibility": chunk.visibility,
+                    "metadata": chunk.metadata,
+                }
+            )
+        return rows
+
+    def _parse_training_chunks(
+            self,
+            *,
+            file_path: str,
+            batch_id: str,
+            source_file: str,
+            source_type: str,
+    ) -> list[Any]:
+        """按资料类型解析训练切片。"""
+
+        context = {
+            "batch_id": batch_id,
+            "source_file": source_file,
+            "source_type": source_type,
+            "visibility_default": DEFAULT_TRAINING_VISIBILITY,
+        }
+        strategy = KnowledgeIngestStrategyFactory.create(source_type)
+        return strategy.parse_chunks(file_path, context)
+
+    def _next_training_batch_version(self, *, source_type: str, source_file: str) -> dict[str, Any]:
+        """计算本次上传资料的版本信息。"""
+
+        latest_batch = self.repository.get_latest_batch_for_version(source_type=source_type, source_file=source_file)
+        if not latest_batch:
+            return {"version_group_id": None, "version_no": 1, "previous_batch_id": None}
+        return {
+            "version_group_id": latest_batch.get("version_group_id") or latest_batch["batch_id"],
+            "version_no": int(latest_batch.get("version_no") or 1) + 1,
+            "previous_batch_id": latest_batch["batch_id"],
+        }
+
+    def _archive_previous_training_versions(self, batch: dict[str, Any]) -> None:
+        """发布新版本后归档同版本组旧版本，并删除旧版本向量点。"""
+
+        version_group_id = batch.get("version_group_id") or batch["batch_id"]
+        previous_versions = self.repository.list_published_batches_in_version_group(
+            version_group_id,
+            exclude_batch_id=batch["batch_id"],
+        )
+        for previous_batch in previous_versions:
+            VectorStoreService.delete_vectors_by_metadata(
+                "batch_id",
+                previous_batch["batch_id"],
+                collection_name=TRAINING_COLLECTION_NAME,
+            )
+        self.repository.archive_other_versions(version_group_id=version_group_id, current_batch_id=batch["batch_id"])
+        if previous_versions:
+            logger.info(
+                "[销售训练] 旧版本训练资料已归档 版本组=%s 当前批次=%s 归档数量=%s",
+                version_group_id,
+                batch["batch_id"],
+                len(previous_versions),
+            )
+
+    def _delete_version_group_vectors(self, version_group_id: str) -> None:
+        """删除同版本组内所有已发布或归档版本的 Qdrant 向量点。"""
+
+        version_batches = self.repository.list_published_batches_in_version_group(version_group_id)
+        for version_batch in version_batches:
+            VectorStoreService.delete_vectors_by_metadata(
+                "batch_id",
+                version_batch["batch_id"],
+                collection_name=TRAINING_COLLECTION_NAME,
+            )
+
+    def _saved_chunk_preview(self, batch_id: str, *, safe_max_chars: int) -> dict[str, Any]:
+        """读取已经保存的切片预览，保证预览内容和后续发布内容一致。"""
+
+        stored_chunks = self.repository.list_chunks(batch_id)
+        parts: list[str] = []
+        total_chars = 0
+        truncated = False
+        for chunk in stored_chunks:
+            part = f"{chunk.get('case_part') or 'unknown'}\n{str(chunk.get('chunk_text') or '').strip()}"
+            if not part.strip():
+                continue
+            separator = "\n\n" if parts else ""
+            candidate = f"{separator}{part}"
+            remaining = safe_max_chars - total_chars
+            if len(candidate) > remaining:
+                parts.append(candidate[:remaining])
+                truncated = True
+                break
+            parts.append(candidate)
+            total_chars += len(candidate)
+        return {"content": "".join(parts), "truncated": truncated}
+
+    def _improve_training_chunks_if_needed(
+            self,
+            *,
+            chunks: list[Any],
+            file_path: str,
+            batch_id: str,
+            source_file: str,
+            source_type: str,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        """根据质量门禁决定是否调用 LLM 兜底切分。"""
+
+        evaluator = TrainingIngestQualityEvaluator()
+        rule_report = evaluator.evaluate(chunks).to_dict()
+        rule_report["selected_splitter"] = "rule_config"
+        rule_report["llm_fallback_used"] = False
+        rule_report["rule_score"] = rule_report.get("score")
+
+        fallback_splitter = TrainingLlmFallbackSplitter()
+        if not fallback_splitter.should_trigger(rule_report):
+            return chunks, rule_report
+
+        logger.info(
+            "[销售训练][资料切分] 规则切分质量偏低，准备尝试LLM兜底 批次编号=%s 文件名=%s 规则质量分=%s",
+            batch_id,
+            source_file,
+            rule_report.get("score"),
+        )
+        source_text = self._read_training_source_text(file_path)
+        llm_chunks = fallback_splitter.split(
+            source_text=source_text,
+            batch_id=batch_id,
+            source_file=source_file,
+            source_type=source_type,
+            visibility_default=DEFAULT_TRAINING_VISIBILITY,
+        )
+        if not llm_chunks:
+            rule_report["llm_fallback_attempted"] = True
+            rule_report["llm_fallback_used"] = False
+            rule_report.setdefault("warnings", []).append("已尝试 LLM 兜底切分，但模型未返回可用切片，继续使用规则切分结果。")
+            return chunks, rule_report
+
+        llm_report = evaluator.evaluate(llm_chunks).to_dict()
+        llm_score = int(llm_report.get("score") or 0)
+        rule_score = int(rule_report.get("score") or 0)
+        if llm_score > rule_score:
+            llm_report["selected_splitter"] = "llm_fallback"
+            llm_report["llm_fallback_attempted"] = True
+            llm_report["llm_fallback_used"] = True
+            llm_report["rule_score"] = rule_score
+            llm_report["llm_score"] = llm_score
+            logger.info(
+                "[销售训练][资料切分] 已采用LLM兜底切分 批次编号=%s 规则质量分=%s LLM质量分=%s 切片数量=%s",
+                batch_id,
+                rule_score,
+                llm_score,
+                len(llm_chunks),
+            )
+            return llm_chunks, llm_report
+
+        rule_report["llm_fallback_attempted"] = True
+        rule_report["llm_fallback_used"] = False
+        rule_report["llm_score"] = llm_score
+        rule_report.setdefault("warnings", []).append("LLM 兜底切分未明显优于规则切分，已保留规则切分结果。")
+        logger.info(
+            "[销售训练][资料切分] LLM兜底未被采用 批次编号=%s 规则质量分=%s LLM质量分=%s",
+            batch_id,
+            rule_score,
+            llm_score,
+        )
+        return chunks, rule_report
+
+    def _force_llm_reparse_chunks(
+            self,
+            *,
+            rule_chunks: list[Any],
+            file_path: str,
+            batch_id: str,
+            source_file: str,
+            source_type: str,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        """人工触发 LLM 重新切分，并把结果和规则切分质量一起记录。"""
+
+        evaluator = TrainingIngestQualityEvaluator()
+        rule_report = evaluator.evaluate(rule_chunks).to_dict()
+        source_text = self._read_training_source_text(file_path)
+        fallback_splitter = TrainingLlmFallbackSplitter()
+        fallback_splitter.config["enabled"] = True
+        llm_chunks = fallback_splitter.split(
+            source_text=source_text,
+            batch_id=batch_id,
+            source_file=source_file,
+            source_type=source_type,
+            visibility_default=DEFAULT_TRAINING_VISIBILITY,
+        )
+        if not llm_chunks:
+            rule_report["selected_splitter"] = "rule_config"
+            rule_report["llm_fallback_attempted"] = True
+            rule_report["llm_fallback_used"] = False
+            rule_report["rule_score"] = rule_report.get("score")
+            rule_report.setdefault("warnings", []).append("人工触发 LLM 重新切分失败，已保留规则切分结果。")
+            return rule_chunks, rule_report
+
+        llm_report = evaluator.evaluate(llm_chunks).to_dict()
+        llm_report["selected_splitter"] = "llm_fallback"
+        llm_report["llm_fallback_attempted"] = True
+        llm_report["llm_fallback_used"] = True
+        llm_report["manual_reparse"] = True
+        llm_report["rule_score"] = rule_report.get("score")
+        llm_report["llm_score"] = llm_report.get("score")
+        return llm_chunks, llm_report
+
+    @staticmethod
+    def _read_training_source_text(file_path: str) -> str:
+        """读取训练资料原文，供低质量 LLM 兜底切分使用。"""
+
+        documents = FileProcessorFactory.load_documents(file_path)
+        return "\n\n".join(document.page_content for document in documents).strip()
+
+    def _document_from_chunk_row(self, row: dict[str, Any], *, batch: dict[str, Any]) -> Document:
+        """把 SQLite 切片行转换成写入 Qdrant 的 Document。"""
+
+        chunk_metadata = self._load_json(row.get("metadata_json"), {})
+        metadata = self._compact_metadata({
+            "batch_id": batch["batch_id"],
+            "chunk_id": row["chunk_id"],
+            "content_type": "sales_training_case",
+            "source_type": row.get("source_type") or batch.get("source_type"),
+            "source_file": batch.get("source_file"),
+            "file_md5": batch.get("file_md5"),
+            "version_group_id": batch.get("version_group_id") or batch["batch_id"],
+            "version_no": int(batch.get("version_no") or 1),
+            "is_current": bool(batch.get("is_current")),
+            "case_part": row.get("case_part"),
+            "visibility": row.get("visibility"),
+            **chunk_metadata,
+        })
+        return Document(page_content=row["chunk_text"], metadata=metadata)
+
+    @staticmethod
     def _batch_response(row: dict[str, Any]) -> TrainingKnowledgeBatchResponse:
         """把训练资料批次数据库行转换成前端响应。"""
 
@@ -1474,6 +1963,10 @@ class SalesTrainingService:
             source_file=row["source_file"],
             file_path=row.get("file_path"),
             file_md5=row.get("file_md5"),
+            version_group_id=row.get("version_group_id") or row["batch_id"],
+            version_no=int(row.get("version_no") or 1),
+            previous_batch_id=row.get("previous_batch_id"),
+            is_current=bool(row.get("is_current")),
             profile_type=row.get("profile_type"),
             task_type=row.get("task_type"),
             industry=row.get("industry"),
@@ -1483,6 +1976,7 @@ class SalesTrainingService:
             chunk_count=int(row.get("chunk_count") or 0),
             point_count=int(row.get("point_count") or 0),
             error_message=row.get("error_message"),
+            quality_report=SalesTrainingService._load_json(row.get("quality_report_json"), {}),
             created_by=row.get("created_by"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],

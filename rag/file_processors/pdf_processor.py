@@ -17,6 +17,19 @@ class PdfFileProcessor(BaseFileProcessor):
 
         documents = pdf_loader(file_path)
         outline = self.read_pdf_outline(file_path)
+        outline_by_page = self._outline_by_page(outline)
+        for index, document in enumerate(documents, start=1):
+            page_no = int(document.metadata.get("page") or index - 1) + 1
+            document.metadata["page_no"] = page_no
+            document.metadata["structured_blocks"] = [
+                {
+                    "block_index": index,
+                    "block_type": "page",
+                    "page_no": page_no,
+                    "outline_title": outline_by_page.get(page_no),
+                    "text": document.page_content,
+                }
+            ]
         if documents and outline:
             documents[0].metadata["_pdf_outline"] = outline
         return documents
@@ -60,3 +73,15 @@ class PdfFileProcessor(BaseFileProcessor):
         except (ImportError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.warning("[知识库] PDF书签读取失败 文件=%s 错误=%s", file_path, exc)
             return []
+
+    @staticmethod
+    def _outline_by_page(outline: list[dict[str, Any]]) -> dict[int, str]:
+        """把 PDF 书签目录转换成页码到标题的映射。"""
+
+        result: dict[int, str] = {}
+        for item in outline:
+            page = item.get("page")
+            title = str(item.get("title") or "").strip()
+            if isinstance(page, int) and title and page not in result:
+                result[page] = title
+        return result

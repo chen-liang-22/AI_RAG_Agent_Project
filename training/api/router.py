@@ -23,7 +23,11 @@ from training.schemas import (
     TrainingKnowledgeBatchListResponse,
     TrainingKnowledgeChunkListResponse,
     TrainingKnowledgeDeleteResponse,
+    TrainingKnowledgePublishResponse,
     TrainingKnowledgePreviewResponse,
+    TrainingKnowledgeReparseResponse,
+    TrainingKnowledgeRollbackResponse,
+    TrainingKnowledgeVersionListResponse,
     TrainingKnowledgeUploadResponse,
     TrainingScoreResponse,
     TrainingSessionResponse,
@@ -43,6 +47,7 @@ PROFILE_DICTIONARY_CODES = (
     "training_source_type",
     "training_case_part",
     "training_chunk_usage",
+    "training_batch_status",
 )
 
 
@@ -75,6 +80,7 @@ def list_profile_dictionaries() -> list[DictionaryGroupResponse]:
     - training_source_type：训练资料来源类型。
     - training_case_part：训练资料切片类型。
     - training_chunk_usage：训练切片模型用途。
+    - training_batch_status：训练资料上传批次状态。
 
     该接口是训练模块的专用门面，底层仍复用通用 dictionary_items 表。
     """
@@ -88,31 +94,27 @@ def list_profile_dictionaries() -> list[DictionaryGroupResponse]:
 
 @router.post("/knowledge/upload", response_model=TrainingKnowledgeUploadResponse)
 def upload_training_knowledge(
+        # 上传的原始训练资料文件。后端会先保存原文件，再解析内容、切片并写入向量库。
         file: UploadFile = File(...),
+        # 资料来源类型。默认 lms_case，决定使用哪一种入库切片策略。
         source_type: str = Form("lms_case"),
-        profile_type: str | None = Form(None),
-        task_type: str | None = Form(None),
-        industry: str | None = Form(None),
-        difficulty: str | None = Form(None),
-        visibility_default: str = Form("visible"),
+        # 上传人标识。作为审计字段入库，方便追踪这批训练资料由谁上传或维护。
         created_by: str | None = Form(None),
 ) -> TrainingKnowledgeUploadResponse:
-    """上传训练知识并写入 sales_training_cases。
+    """上传销售训练知识，并写入销售训练资料库和训练向量库。
 
     FastAPI 参数来源说明：
-    - File(...)：从 multipart/form-data 的文件字段读取；
-    - Form(...)：从 multipart/form-data 的普通表单字段读取；
-    - 返回值会按 response_model 序列化成 JSON。
+    - File(...)：从 multipart/form-data 的文件字段读取上传文件；
+    - Form(...)：只接收当前真正参与上传入库的普通表单字段；
+    - response_model：把服务层返回值序列化为前端需要的 JSON。
+
+    注意：profile_type、task_type、industry、difficulty 当前不参与训练检索过滤，
+    上传时不再接收这些弱标签，避免向量库 payload 中出现没有业务价值的空字段。
     """
 
     return _service().upload_knowledge(
         file=file,
         source_type=source_type,
-        profile_type=profile_type,
-        task_type=task_type,
-        industry=industry,
-        difficulty=difficulty,
-        visibility_default=visibility_default,
         created_by=created_by,
     )
 
@@ -152,6 +154,47 @@ def delete_training_batch(batch_id: str) -> TrainingKnowledgeDeleteResponse:
     return _service().delete_batch(batch_id)
 
 
+@router.post("/knowledge/batches/{batch_id}/publish", response_model=TrainingKnowledgePublishResponse)
+def publish_training_batch(batch_id: str) -> TrainingKnowledgePublishResponse:
+    """人工确认发布训练资料。
+
+    上传接口只负责解析、切片和质量评估；确认发布时才写入 Qdrant。
+    """
+
+    return _service().publish_batch(batch_id)
+
+
+@router.post("/knowledge/batches/{batch_id}/rollback", response_model=TrainingKnowledgeRollbackResponse)
+def rollback_training_batch(batch_id: str) -> TrainingKnowledgeRollbackResponse:
+    """回滚训练资料到指定历史版本。
+
+    只允许对 published / archived 版本执行。
+    回滚后，该版本会重新成为当前参与训练检索的版本。
+    """
+
+    return _service().rollback_batch(batch_id)
+
+
+@router.post("/knowledge/batches/{batch_id}/reparse", response_model=TrainingKnowledgeReparseResponse)
+def reparse_training_batch(
+        batch_id: str,
+        use_llm_fallback: bool = Query(True),
+) -> TrainingKnowledgeReparseResponse:
+    """重新切分未发布训练资料。
+
+    用于人工预览发现切片质量不好时，主动触发 LLM 兜底切分。
+    """
+
+    return _service().reparse_batch(batch_id, use_llm_fallback=use_llm_fallback)
+
+
+@router.get("/knowledge/batches/{batch_id}/versions", response_model=TrainingKnowledgeVersionListResponse)
+def list_training_batch_versions(batch_id: str) -> TrainingKnowledgeVersionListResponse:
+    """查询训练资料版本链。"""
+
+    return _service().list_batch_versions(batch_id)
+
+
 @router.get("/knowledge/batches/{batch_id}/chunks", response_model=TrainingKnowledgeChunkListResponse)
 def list_training_chunks(batch_id: str) -> TrainingKnowledgeChunkListResponse:
     """查询训练知识上传批次的切片。
@@ -164,7 +207,7 @@ def list_training_chunks(batch_id: str) -> TrainingKnowledgeChunkListResponse:
 
 @router.post("/plans", response_model=TrainingPlanDetailResponse)
 def create_training_plan(request: TrainingPlanCreateRequest) -> TrainingPlanDetailResponse:
-    """创建训练方案，训练名称必须唯一。"""
+    """创建训练方案，训练名称允许重复，每条记录用 plan_id 区分。"""
 
     return _service().create_plan(request)
 

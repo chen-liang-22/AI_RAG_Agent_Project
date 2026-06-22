@@ -3,9 +3,29 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+import yaml
 from langchain_core.documents import Document
 
 from rag.file_processors import FileProcessorFactory
+from utils.path_tool import get_abs_path
+
+
+TRAINING_INGEST_CONFIG_PATH = get_abs_path("config/training_ingest.yml")
+
+
+def _load_training_ingest_config() -> dict[str, Any]:
+    """读取销售训练入库配置。
+
+    配置读取失败时返回空字典，调用方会继续使用代码里的默认配置。
+    这样可以避免配置文件临时损坏导致上传能力完全不可用。
+    """
+
+    try:
+        with open(TRAINING_INGEST_CONFIG_PATH, "r", encoding="utf-8") as config_file:
+            data = yaml.safe_load(config_file) or {}
+        return data if isinstance(data, dict) else {}
+    except (OSError, yaml.YAMLError):
+        return {}
 
 
 @dataclass
@@ -47,18 +67,34 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
     一期先实现 LMS，后续扩展不需要改上传主流程。
     """
 
-    # 编译正则后复用，避免每次切片都重新解析正则。
-    # 该规则用于识别“一、客户案例”这类中文编号标题。
-    CASE_TITLE_PATTERN = re.compile(r"^[一二三四五六七八九十]+[、.．]\s*.+")
-    # PART_MARKERS 用关键词把案例内容分到不同业务片段。
-    # 元组第一项是内部类型，第二项是一组可匹配的中文标题关键词。
-    PART_MARKERS = [
-        ("task_requirement", ("任务要求",)),
-        ("standard_answer", ("匹配答案", "话术案例", "话术原文", "谈单话术", "参考答案")),
-        ("hidden_psychology", ("隐性心理", "底层顾虑", "底层需求", "客户底层心理", "核心显性卡点", "隐性痛点")),
-        ("scoring_rubric", ("命中点", "扣分点", "评分标准", "能力维度")),
-        ("case_profile", ("客户案例", "企业", "老板身份", "合作行业", "客户阶段")),
-    ]
+    DEFAULT_CASE_TITLE_PATTERN = r"^[一二三四五六七八九十]+[、.．]\s*.+"
+    DEFAULT_PART_MARKERS = {
+        "task_requirement": ("任务要求",),
+        "standard_answer": ("匹配答案", "话术案例", "话术原文", "谈单话术", "参考答案"),
+        "hidden_psychology": ("隐性心理", "底层顾虑", "底层需求", "客户底层心理", "核心显性卡点", "隐性痛点"),
+        "scoring_rubric": ("命中点", "扣分点", "评分标准", "能力维度"),
+        "case_profile": ("客户案例", "企业", "老板身份", "合作行业", "客户阶段"),
+    }
+    DEFAULT_PART_VISIBILITY = {
+        "case_profile": "visible",
+        "task_requirement": "visible",
+        "standard_answer": "visible",
+        "hidden_psychology": "hidden",
+        "scoring_rubric": "scoring_only",
+    }
+
+    def __init__(self, config: dict[str, Any] | None = None):
+        """初始化 LMS 切片策略，并从配置文件读取标题关键词。
+
+        关键词放在 config/training_ingest.yml，避免业务词散落在代码里。
+        """
+
+        ingest_config = config or _load_training_ingest_config()
+        lms_config = ingest_config.get("lms_case") if isinstance(ingest_config.get("lms_case"), dict) else {}
+        pattern = str(lms_config.get("case_title_pattern") or self.DEFAULT_CASE_TITLE_PATTERN)
+        self.case_title_pattern = re.compile(pattern)
+        self.part_markers = self._normalize_part_markers(lms_config.get("part_markers"))
+        self.part_visibility = self._normalize_part_visibility(lms_config.get("part_visibility"))
 
     def parse_chunks(self, file_path: str, context: dict[str, Any]) -> list[TrainingChunk]:
         """按 LMS 任务案例结构切片。
@@ -67,20 +103,26 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
         向量写入由 SalesTrainingService 统一处理。
         """
 
+        # 第一步：先用通用文件处理器读取 txt/pdf/docx，输出 LangChain Document。
+        # 这里不关心具体文件格式，格式差异交给 FileProcessorFactory。
         documents = FileProcessorFactory.load_documents(file_path)
         # FileProcessorFactory 返回 LangChain Document；这里再抽出段落列表。
         paragraphs = self._paragraphs_from_documents(documents)
+        # 第二步：按中文编号标题拆出多个客户案例。
+        # 例如“一、客户画像A”“二、客户画像B”会变成两个 case。
         cases = self._split_cases(paragraphs)
         chunks: list[TrainingChunk] = []
 
         # enumerate(..., start=1) 会从 1 开始计数，更符合业务展示习惯。
         for case_index, case in enumerate(cases, start=1):
             case_title = case["title"] or f"训练案例 {case_index}"
+            # 第三步：在单个案例内部，按任务要求、话术、隐性心理、评分标准等标题拆段。
             parts = self._split_parts(case["lines"])
             for case_part, lines in parts.items():
-                text = "\n".join(line for line in lines if line.strip()).strip()
+                text = self._text_from_blocks(lines).strip()
                 if not text:
                     continue
+                # 第四步：不同业务片段分配不同 visibility，后续生成角色、对话、评分会按用途过滤。
                 visibility = self._visibility_for_part(case_part)
                 # :03d 表示数字补足 3 位，例如 1 -> 001，方便排序和排查。
                 chunk_id = f"{context['batch_id']}_{case_index:03d}_{case_part}"
@@ -94,6 +136,7 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
                             "case_title": case_title,
                             "case_index": case_index,
                             "source_file": context.get("source_file"),
+                            **self._block_metadata(lines),
                         },
                     )
                 )
@@ -102,35 +145,56 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
             return chunks
 
         # 兜底：如果文档结构完全不符合预期，至少保证能入库并被检索。
-        fallback_text = "\n".join(paragraphs).strip()
+        # 这种兜底切片效果不如结构化 LMS 文档，文档里会提醒用户检查源文件结构。
+        fallback_text = self._text_from_blocks(paragraphs).strip()
         return [
             TrainingChunk(
                 chunk_id=f"{context['batch_id']}_001_case_profile",
                 text=fallback_text,
                 case_part="case_profile",
                 visibility=context.get("visibility_default") or "visible",
-                metadata={"case_title": "未识别结构的 LMS 文档", "source_file": context.get("source_file")},
+                metadata={
+                    "case_title": "未识别结构的 LMS 文档",
+                    "source_file": context.get("source_file"),
+                    **self._block_metadata(paragraphs),
+                },
             )
         ] if fallback_text else []
 
     @staticmethod
-    def _paragraphs_from_documents(documents: list[Document]) -> list[str]:
+    def _paragraphs_from_documents(documents: list[Document]) -> list[dict[str, Any]]:
         """优先使用 DOCX 处理器保留的段落，否则按换行拆分。
 
         DOCX 处理器会把原始段落放到 metadata["paragraphs"]。
         PDF/TXT 没有这个结构时，就用 page_content.splitlines() 兜底。
         """
 
-        paragraphs: list[str] = []
+        paragraphs: list[dict[str, Any]] = []
         for document in documents:
-            raw_paragraphs = document.metadata.get("paragraphs")
+            raw_paragraphs = document.metadata.get("structured_blocks") or document.metadata.get("paragraphs")
             if isinstance(raw_paragraphs, list):
-                paragraphs.extend(str(item.get("text") or "").strip() for item in raw_paragraphs if isinstance(item, dict))
+                for item in raw_paragraphs:
+                    if not isinstance(item, dict):
+                        continue
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        paragraphs.append({**item, "text": text})
             else:
-                paragraphs.extend(line.strip() for line in document.page_content.splitlines())
-        return [text for text in paragraphs if text]
+                page_no = document.metadata.get("page_no") or document.metadata.get("page")
+                for index, line in enumerate(document.page_content.splitlines(), start=1):
+                    text = line.strip()
+                    if text:
+                        paragraphs.append(
+                            {
+                                "block_index": index,
+                                "block_type": "paragraph",
+                                "page_no": page_no,
+                                "text": text,
+                            }
+                        )
+        return paragraphs
 
-    def _split_cases(self, paragraphs: list[str]) -> list[dict[str, Any]]:
+    def _split_cases(self, paragraphs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """按“一、二、三”这类标题拆成训练案例。
 
         返回结构示例：
@@ -139,13 +203,14 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
 
         cases: list[dict[str, Any]] = []
         current_title = ""
-        current_lines: list[str] = []
+        current_lines: list[dict[str, Any]] = []
 
         for paragraph in paragraphs:
-            if self.CASE_TITLE_PATTERN.match(paragraph):
+            text = str(paragraph.get("text") or "").strip()
+            if self.case_title_pattern.match(text):
                 if current_lines:
                     cases.append({"title": current_title, "lines": current_lines})
-                current_title = paragraph
+                current_title = text
                 current_lines = []
                 continue
             current_lines.append(paragraph)
@@ -154,14 +219,14 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
             cases.append({"title": current_title, "lines": current_lines})
         return cases
 
-    def _split_parts(self, lines: list[str]) -> dict[str, list[str]]:
+    def _split_parts(self, lines: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         """把单个案例拆成业务段落。
 
         current_part 表示“当前正在收集哪个片段”。
         遇到新的标题关键词后，后续行会进入新的片段。
         """
 
-        parts: dict[str, list[str]] = {
+        parts: dict[str, list[dict[str, Any]]] = {
             "case_profile": [],
             "task_requirement": [],
             "standard_answer": [],
@@ -171,9 +236,13 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
         current_part = "case_profile"
 
         for line in lines:
-            matched_part = self._detect_part(line)
+            text = str(line.get("text") or "").strip()
+            matched_part = self._detect_part(text)
             if matched_part:
                 current_part = matched_part
+                # “任务要求”这种纯标题只负责切换片段；“企业：某外贸公司”这种带内容的标签行要保留下来。
+                if not self._is_part_heading_only(text, matched_part):
+                    parts[current_part].append(line)
                 continue
             parts[current_part].append(line)
 
@@ -186,13 +255,32 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
         """
 
         clean_line = line.strip()
-        for part, markers in self.PART_MARKERS:
+        for part, markers in self.part_markers:
             if any(marker in clean_line for marker in markers):
                 return part
         return None
 
-    @staticmethod
-    def _visibility_for_part(case_part: str) -> str:
+    def _is_part_heading_only(self, line: str, case_part: str) -> bool:
+        """判断命中的片段标记是不是纯标题行。
+
+        纯标题行示例：任务要求、匹配答案、命中点。
+        带内容行示例：企业：某外贸公司、客户阶段：已初步沟通。
+        带内容行必须保留到正文里，否则客户画像字段会在切分时丢失。
+        """
+
+        clean_line = line.strip()
+        for part, markers in self.part_markers:
+            if part != case_part:
+                continue
+            for marker in markers:
+                if marker not in clean_line:
+                    continue
+                remainder = clean_line.replace(marker, "", 1).strip()
+                remainder = re.sub(r"^[：:、.．\-\s]+", "", remainder).strip()
+                return not bool(remainder)
+        return False
+
+    def _visibility_for_part(self, case_part: str) -> str:
         """根据片段类型决定可见范围。
 
         hidden_psychology 只给 AI 客户使用；
@@ -200,11 +288,76 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
         其他内容默认学员也可见。
         """
 
-        if case_part == "hidden_psychology":
-            return "hidden"
-        if case_part == "scoring_rubric":
-            return "scoring_only"
-        return "visible"
+        return self.part_visibility.get(case_part, "visible")
+
+    @staticmethod
+    def _text_from_blocks(blocks: list[dict[str, Any]]) -> str:
+        """把结构化 block 合并成切片正文。"""
+
+        return "\n".join(str(block.get("text") or "").strip() for block in blocks if str(block.get("text") or "").strip())
+
+    @staticmethod
+    def _block_metadata(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+        """从切片 block 中提取可追踪的结构化来源信息。"""
+
+        if not blocks:
+            return {}
+        block_indexes = [block.get("block_index") for block in blocks if block.get("block_index") is not None]
+        page_numbers = sorted({
+            int(block.get("page_no"))
+            for block in blocks
+            if isinstance(block.get("page_no"), int)
+        })
+        heading_levels = sorted({
+            int(block.get("heading_level"))
+            for block in blocks
+            if isinstance(block.get("heading_level"), int)
+        })
+        outline_titles = []
+        for block in blocks:
+            title = str(block.get("outline_title") or "").strip()
+            if title and title not in outline_titles:
+                outline_titles.append(title)
+
+        metadata: dict[str, Any] = {"structure_source": "structured_blocks"}
+        if block_indexes:
+            metadata["start_block_index"] = min(block_indexes)
+            metadata["end_block_index"] = max(block_indexes)
+        if page_numbers:
+            metadata["page_numbers"] = page_numbers
+        if heading_levels:
+            metadata["heading_levels"] = heading_levels
+        if outline_titles:
+            metadata["outline_titles"] = outline_titles[:5]
+        return metadata
+
+    @classmethod
+    def _normalize_part_markers(cls, raw_markers: Any) -> list[tuple[str, tuple[str, ...]]]:
+        """把配置里的关键词字典转换成策略内部使用的有序元组列表。"""
+
+        if not isinstance(raw_markers, dict):
+            raw_markers = cls.DEFAULT_PART_MARKERS
+        normalized: list[tuple[str, tuple[str, ...]]] = []
+        for case_part, markers in raw_markers.items():
+            if isinstance(markers, list):
+                clean_markers = tuple(str(marker).strip() for marker in markers if str(marker).strip())
+            else:
+                clean_markers = tuple(str(marker).strip() for marker in cls.DEFAULT_PART_MARKERS.get(case_part, ()))
+            if clean_markers:
+                normalized.append((str(case_part), clean_markers))
+        return normalized or [(key, tuple(value)) for key, value in cls.DEFAULT_PART_MARKERS.items()]
+
+    @classmethod
+    def _normalize_part_visibility(cls, raw_visibility: Any) -> dict[str, str]:
+        """读取不同切片类型的默认可见性配置。"""
+
+        visibility = dict(cls.DEFAULT_PART_VISIBILITY)
+        if isinstance(raw_visibility, dict):
+            for case_part, value in raw_visibility.items():
+                clean_value = str(value).strip()
+                if clean_value:
+                    visibility[str(case_part)] = clean_value
+        return visibility
 
 
 class GenericTrainingIngestStrategy(KnowledgeIngestStrategy):

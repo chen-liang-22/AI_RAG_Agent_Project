@@ -39,6 +39,14 @@ def test_openapi_exposes_core_routes():
     assert "/exam/sessions/{session_id}/answer" in paths
     assert "/exam/sessions/{session_id}" in paths
     assert "/training/knowledge/upload" in paths
+    assert "/training/knowledge/batches" in paths
+    assert "/training/knowledge/batches/{batch_id}/preview" in paths
+    assert "/training/knowledge/batches/{batch_id}" in paths
+    assert "/training/knowledge/batches/{batch_id}/publish" in paths
+    assert "/training/knowledge/batches/{batch_id}/rollback" in paths
+    assert "/training/knowledge/batches/{batch_id}/reparse" in paths
+    assert "/training/knowledge/batches/{batch_id}/versions" in paths
+    assert "/training/knowledge/batches/{batch_id}/chunks" in paths
     assert "/training/profile-dictionaries" in paths
     assert "/training/profiles/generate" in paths
     assert "/training/sessions" in paths
@@ -76,6 +84,7 @@ def test_training_profile_dictionaries_follow_current_portrait_spec():
         "training_source_type",
         "training_case_part",
         "training_chunk_usage",
+        "training_batch_status",
     }
 
     student_fields = {item["item_code"]: item for item in groups["student_portrait"]["items"]}
@@ -87,6 +96,18 @@ def test_training_profile_dictionaries_follow_current_portrait_spec():
         "goal_senior",
     }
     assert student_fields["student_portrait_other"]["metadata"]["input_type"] == "text"
+    status_items = {item["item_code"]: item for item in groups["training_batch_status"]["items"]}
+    assert set(status_items) == {
+        "parsing",
+        "pending_review",
+            "embedding",
+            "published",
+            "archived",
+            "parsing_failed",
+            "deleted",
+            "duplicated",
+    }
+    assert status_items["published"]["item_name"] == "已发布"
 
     overseas_fields = {item["item_code"]: item for item in groups["overseas_bd"]["items"]}
     assert "overseas_bd_high_intention_cooperation_stage" in overseas_fields

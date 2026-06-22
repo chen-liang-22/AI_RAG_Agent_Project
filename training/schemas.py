@@ -8,14 +8,15 @@ from pydantic import BaseModel, Field
 
 
 class TrainingKnowledgeUploadResponse(BaseModel):
-    """训练知识上传入库响应。"""
+    """训练知识上传预览响应。"""
 
     batch_id: str  # 上传批次 ID，用于后续查询本次文件拆出的切片。
-    status: str  # 入库状态，例如 parsing / published / parsing_failed。
+    status: str  # 批次状态，例如 pending_review / duplicated。
     chunk_count: int  # SQLite 中保存的切片数量。
-    point_count: int  # 写入 Qdrant 的向量点数量。
+    point_count: int  # 写入 Qdrant 的向量点数量；预览阶段通常为 0。
     source_file: str | None = None  # 原始文件名，方便前端展示“上传了哪个资料”。
     duplicate_of: str | None = None  # 如果命中 MD5 去重，这里返回已存在的批次 ID。
+    quality_report: dict = Field(default_factory=dict)  # 切片质量报告，供前端确认发布前查看。
     # Python 的 list 是可变对象，不能直接写 failed_chunks: list[str] = []。
     # default_factory=list 类似“每次 new 一个新 ArrayList”，避免多个响应对象共享同一个列表。
     failed_chunks: list[str] = Field(default_factory=list)
@@ -29,6 +30,10 @@ class TrainingKnowledgeBatchResponse(BaseModel):
     source_file: str  # 上传文件名。
     file_path: str | None = None  # 原始文件在服务端的保存路径，用于预览和排查。
     file_md5: str | None = None  # 文件 MD5，用于判断重复上传。
+    version_group_id: str | None = None  # 版本组 ID，同一个文件多次发布会归到同一版本组。
+    version_no: int = 1  # 版本号，从 1 开始递增。
+    previous_batch_id: str | None = None  # 上一个版本的批次 ID。
+    is_current: bool = False  # 是否为当前参与训练检索的版本。
     profile_type: str | None = None  # 适用客户画像类型。
     task_type: str | None = None  # 训练任务类型。
     industry: str | None = None  # 行业标签。
@@ -38,6 +43,7 @@ class TrainingKnowledgeBatchResponse(BaseModel):
     chunk_count: int  # 切片数量。
     point_count: int  # 向量点数量。
     error_message: str | None = None  # 入库失败原因。
+    quality_report: dict = Field(default_factory=dict)  # 最近一次切片质量报告。
     created_by: str | None = None  # 上传人。
     created_at: str  # 创建时间。
     updated_at: str  # 更新时间。
@@ -66,6 +72,46 @@ class TrainingKnowledgeDeleteResponse(BaseModel):
 
     status: str  # 固定返回 deleted。
     batch_id: str  # 被删除的训练资料批次 ID。
+
+
+class TrainingKnowledgePublishResponse(BaseModel):
+    """训练资料确认发布响应。"""
+
+    batch_id: str  # 被发布的批次 ID。
+    status: str  # 发布后的状态，通常为 published。
+    chunk_count: int  # 发布使用的切片数量。
+    point_count: int  # 写入 Qdrant 的向量点数量。
+    quality_report: dict = Field(default_factory=dict)  # 发布时参考的质量报告。
+
+
+class TrainingKnowledgeRollbackResponse(BaseModel):
+    """训练资料版本回滚响应。"""
+
+    batch_id: str  # 回滚后恢复为当前版本的批次 ID。
+    status: str  # 回滚后的状态，通常为 published。
+    version_group_id: str  # 版本组 ID。
+    version_no: int  # 回滚到的版本号。
+    chunk_count: int  # 重新写入的切片数量。
+    point_count: int  # 重新写入 Qdrant 的向量点数量。
+    quality_report: dict = Field(default_factory=dict)  # 回滚版本的质量报告。
+
+
+class TrainingKnowledgeReparseResponse(BaseModel):
+    """训练资料重新切分响应。"""
+
+    batch_id: str  # 被重新切分的批次 ID。
+    status: str  # 重新切分后的状态，通常为 pending_review。
+    chunk_count: int  # 重新生成的切片数量。
+    point_count: int  # 预览阶段固定为 0。
+    source_file: str | None = None  # 原始文件名。
+    quality_report: dict = Field(default_factory=dict)  # 重新切分后的质量报告。
+
+
+class TrainingKnowledgeVersionListResponse(BaseModel):
+    """训练资料版本链响应。"""
+
+    version_group_id: str  # 版本组 ID。
+    items: list[TrainingKnowledgeBatchResponse]  # 同版本组内的批次列表，按版本号倒序。
 
 
 class TrainingKnowledgeChunkResponse(BaseModel):
@@ -200,7 +246,7 @@ class GoalSettingResponse(BaseModel):
 class TrainingPlanCreateRequest(BaseModel):
     """创建训练方案请求。"""
 
-    plan_name: str = Field(..., min_length=1, max_length=80)  # 训练名称，必须唯一。
+    plan_name: str = Field(..., min_length=1, max_length=80)  # 训练名称，允许同名，使用 plan_id 区分记录。
     trainee: TraineeProfileRequest  # 学员画像快照。
     profile_type: str = "overseas_bd"  # 客户画像类型。
     selected_fields: dict = Field(default_factory=dict)  # 客户画像字段快照。
@@ -212,7 +258,7 @@ class TrainingPlanCreateRequest(BaseModel):
 class TrainingPlanUpdateRequest(BaseModel):
     """修改训练方案请求。"""
 
-    plan_name: str | None = Field(None, min_length=1, max_length=80)  # 改名时仍做唯一校验。
+    plan_name: str | None = Field(None, min_length=1, max_length=80)  # 训练名称，允许同名。
     trainee: TraineeProfileRequest | None = None  # 修改学员画像会影响角色和后续阶段。
     profile_type: str | None = None  # 修改客户画像类型会影响角色和后续阶段。
     selected_fields: dict | None = None  # 修改客户画像字段会影响角色和后续阶段。
@@ -223,6 +269,8 @@ class TrainingPlanUpdateRequest(BaseModel):
     visible_profile: dict | None = None  # 人工微调可见画像，不影响阶段。
     hidden_profile: dict | None = None  # 修改隐藏画像会影响阶段和评分。
     role_profile: dict | None = None  # 修改扮演画像会影响阶段和评分。
+    training_purpose: str | None = None  # 人工修改训练宗旨，会影响后续训练会话展示。
+    round_limit: int | None = Field(None, ge=1, le=100)  # 人工修改训练轮数，限制在 1-100。
     stages: list[GoalStage] | None = None  # 修改训练阶段会影响评分设置。
     scoring_rules: dict | None = None  # 只修改评分规则不影响前置步骤。
 
