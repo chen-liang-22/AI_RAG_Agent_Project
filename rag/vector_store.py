@@ -294,6 +294,30 @@ class VectorStoreService:
         )
 
     @staticmethod
+    def delete_vectors_by_metadata(field_name: str, field_value: str, collection_name: str | None = None) -> None:
+        """按 metadata 字段删除 Qdrant 向量。
+
+        训练资料没有写入 documents 表，所以没有 document_id。
+        这里用 batch_id 等业务字段删除对应 points。
+        """
+
+        client = QdrantClient(**get_qdrant_client_options())
+        client.delete(
+            collection_name=normalize_qdrant_collection_name(collection_name),
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key=f"metadata.{field_name}",
+                            match=models.MatchValue(value=field_value),
+                        )
+                    ]
+                )
+            ),
+            wait=True,
+        )
+
+    @staticmethod
     def list_collections() -> list[str]:
         client = QdrantClient(**get_qdrant_client_options())
         return [collection.name for collection in client.get_collections().collections]

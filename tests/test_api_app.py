@@ -38,6 +38,13 @@ def test_openapi_exposes_core_routes():
     assert "/exam/sessions" in paths
     assert "/exam/sessions/{session_id}/answer" in paths
     assert "/exam/sessions/{session_id}" in paths
+    assert "/training/knowledge/upload" in paths
+    assert "/training/profile-dictionaries" in paths
+    assert "/training/profiles/generate" in paths
+    assert "/training/sessions" in paths
+    assert "/training/sessions/{session_id}" in paths
+    assert "/training/sessions/{session_id}/turns" in paths
+    assert "/training/sessions/{session_id}/final-score" in paths
     assert "/exam/generate" not in paths
     assert "/exam/grade" not in paths
 
@@ -51,6 +58,51 @@ def test_dictionaries_return_document_structure_items():
     data = response.json()
     assert data[0]["dictionary_code"] == "document_structure"
     assert {item["item_code"] for item in data[0]["items"]} == {"qa", "numbered", "text"}
+
+
+def test_training_profile_dictionaries_follow_current_portrait_spec():
+    client = TestClient(app)
+
+    response = client.get("/training/profile-dictionaries")
+
+    assert response.status_code == 200
+    data = response.json()
+    groups = {group["dictionary_code"]: group for group in data}
+    assert set(groups) == {
+        "student_portrait",
+        "wzf_customer_manager",
+        "wm_ai_service",
+        "overseas_bd",
+        "training_source_type",
+        "training_case_part",
+        "training_chunk_usage",
+    }
+
+    student_fields = {item["item_code"]: item for item in groups["student_portrait"]["items"]}
+    position_role_options = {child["item_code"] for child in student_fields["position_role"]["children"]}
+    assert position_role_options == {"wzf_customer_manager", "wm_ai_service", "overseas_bd"}
+    assert {child["item_code"] for child in student_fields["task_goal"]["children"]} == {
+        "goal_junior",
+        "goal_intermediate",
+        "goal_senior",
+    }
+    assert student_fields["student_portrait_other"]["metadata"]["input_type"] == "text"
+
+    overseas_fields = {item["item_code"]: item for item in groups["overseas_bd"]["items"]}
+    assert "overseas_bd_high_intention_cooperation_stage" in overseas_fields
+    assert {child["item_code"] for child in overseas_fields["overseas_bd_customer_type"]["children"]} == {
+        "overseas_bd_customer_type_c_end",
+        "overseas_bd_customer_type_b_end",
+        "overseas_bd_customer_type_g_end",
+    }
+
+    case_part_names = {item["item_code"]: item["item_name"] for item in groups["training_case_part"]["items"]}
+    assert case_part_names["case_profile"] == "客户背景"
+    assert case_part_names["hidden_psychology"] == "客户顾虑"
+
+    usage_names = {item["item_code"]: item["item_name"] for item in groups["training_chunk_usage"]["items"]}
+    assert usage_names["visible"] == "通用知识"
+    assert usage_names["scoring_only"] == "评分专用"
 
 
 def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch):

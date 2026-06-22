@@ -61,16 +61,14 @@ def _build_dictionary_tree(items: list[dict]) -> list[DictionaryItemResponse]:
     return build_children(None)
 
 
-@router.get("/dictionaries", response_model=list[DictionaryGroupResponse])
-def list_dictionaries(
-        dictionary_code: str | None = Query(default=None, description="字典编码；为空时返回全部字典"),
-) -> list[DictionaryGroupResponse]:
-    """查询系统字典，返回按字典编码分组后的多层级结构。"""
+def build_dictionary_groups(items: list[dict]) -> list[DictionaryGroupResponse]:
+    """把数据库字典行按字典编码分组，并组装成树形响应。
 
-    store = _get_knowledge_store()
-    rows = store.list_dictionary_items(dictionary_code=dictionary_code)
+    这个函数是字典接口的门面函数，训练模块也会复用它，避免两边各写一套树构建逻辑。
+    """
+
     groups: dict[str, list[dict]] = {}
-    for row in rows:
+    for row in items:
         groups.setdefault(row["dictionary_code"], []).append(row)
 
     result = []
@@ -83,6 +81,18 @@ def list_dictionaries(
                 items=_build_dictionary_tree(group_rows),
             )
         )
+    return result
+
+
+@router.get("/dictionaries", response_model=list[DictionaryGroupResponse])
+def list_dictionaries(
+        dictionary_code: str | None = Query(default=None, description="字典编码；为空时返回全部字典"),
+) -> list[DictionaryGroupResponse]:
+    """查询系统字典，返回按字典编码分组后的多层级结构。"""
+
+    store = _get_knowledge_store()
+    rows = store.list_dictionary_items(dictionary_code=dictionary_code)
+    result = build_dictionary_groups(rows)
 
     logger.info("[字典表] 查询字典完成 字典编码=%s 字典数量=%s", dictionary_code or "全部", len(result))
     return result

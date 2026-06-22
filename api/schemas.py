@@ -97,6 +97,7 @@ class HealthResponse(BaseModel):
     qdrant: str  # Qdrant 状态；ok 或 unavailable
     collection_name: str  # 当前项目使用的 Qdrant collection 名称
     collections: list[str] = Field(default_factory=list)  # Qdrant 中已有的 collection 列表
+    collection_points: dict[str, int] = Field(default_factory=dict)  # 每个 collection 在 Qdrant 中的向量点数量
 
 
 class DictionaryItemResponse(BaseModel):

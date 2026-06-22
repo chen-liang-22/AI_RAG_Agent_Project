@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
+from rag.profile_dictionaries import PROFILE_DICTIONARY_ITEMS
 from utils.path_tool import get_abs_path
 
 
@@ -113,7 +114,51 @@ DEFAULT_DICTIONARY_ITEMS = [
             ("unsupported", "不支持", None, 3, "暂不支持预览"),
         ],
     },
-]
+    {
+        "dictionary_code": "training_source_type",
+        "dictionary_name": "销售训练资料来源类型",
+        "items": [
+            (
+                "lms_case",
+                "LMS 销售训练案例",
+                None,
+                1,
+                "按客户案例、任务要求、标准答案、隐藏心理、评分标准做专门结构化拆分",
+                {
+                    "default": True,
+                    "implemented": True,
+                    "strategy": "LmsCaseIngestStrategy",
+                    "collection_name": "sales_training_cases",
+                },
+            ),
+        ],
+    },
+    {
+        "dictionary_code": "training_case_part",
+        "dictionary_name": "销售训练切片类型",
+        "items": [
+            ("case_profile", "客户背景", None, 1, "客户案例、公司背景、合作阶段等信息", {"tag_type": "info"}),
+            ("task_requirement", "训练任务", None, 2, "本次训练要求、沟通目标和操作约束", {"tag_type": "primary"}),
+            ("standard_answer", "参考话术", None, 3, "标准答案、优秀话术和建议表达", {"tag_type": "success"}),
+            ("hidden_psychology", "客户顾虑", None, 4, "客户真实顾虑、隐性心理和潜在异议", {"tag_type": "warning"}),
+            ("scoring_rubric", "评分依据", None, 5, "评分标准、命中点和扣分点", {"tag_type": "danger"}),
+            ("product_fact", "产品事实", None, 6, "产品功能、参数、服务和交付事实", {"tag_type": "info"}),
+            ("faq", "常见问答", None, 7, "常见客户问题和标准答复", {"tag_type": "info"}),
+            ("competitor", "竞品信息", None, 8, "竞品对比、优势劣势和替代方案", {"tag_type": "warning"}),
+            ("success_case", "成功案例", None, 9, "成交案例、客户证言和效果证明", {"tag_type": "success"}),
+            ("glossary", "术语说明", None, 10, "行业术语、缩写和业务概念", {"tag_type": "info"}),
+        ],
+    },
+    {
+        "dictionary_code": "training_chunk_usage",
+        "dictionary_name": "训练切片模型用途",
+        "items": [
+            ("visible", "通用知识", None, 1, "角色生成、对话训练和评分都可参考", {"tag_type": "info"}),
+            ("hidden", "客户内部顾虑", None, 2, "主要用于 AI 客户扮演和追问，不作为权限展示", {"tag_type": "warning"}),
+            ("scoring_only", "评分专用", None, 3, "主要用于训练结束评分，不作为权限展示", {"tag_type": "danger"}),
+        ],
+    },
+] + PROFILE_DICTIONARY_ITEMS
 
 
 def utc_now_text() -> str:
@@ -356,10 +401,13 @@ class KnowledgeStore:
     def seed_default_dictionaries(self, conn: sqlite3.Connection) -> None:
         """初始化系统默认字典项，已有字典项只更新展示信息。"""
 
-        # 清理已经废弃的软编码关键词字典，避免旧库升级后前端继续展示。
+        # 清理已经废弃的旧字典，避免旧库升级后前端继续展示过期口径。
         conn.execute(
-            "DELETE FROM dictionary_items WHERE dictionary_code = ?",
-            ("collection_domain_keyword",),
+            """
+            DELETE FROM dictionary_items
+            WHERE dictionary_code IN (?, ?)
+            """,
+            ("collection_domain_keyword", "sales_customer_profile_template"),
         )
 
         now = utc_now_text()

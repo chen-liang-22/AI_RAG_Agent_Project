@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from rag.file_processors.base import BaseFileProcessor
+from rag.file_processors.docx_processor import DocxFileProcessor
 from rag.file_processors.pdf_processor import PdfFileProcessor
 from rag.file_processors.txt_processor import TxtFileProcessor
 
@@ -21,6 +22,7 @@ class FileProcessorFactory:
             return
         cls.register(TxtFileProcessor())
         cls.register(PdfFileProcessor())
+        cls.register(DocxFileProcessor())
 
     @classmethod
     def register(cls, processor: BaseFileProcessor) -> None:

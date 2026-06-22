@@ -23,9 +23,16 @@ def health() -> HealthResponse:
     try:
         client = QdrantClient(**get_qdrant_client_options())  # 按配置连接 Qdrant
         collections = [collection.name for collection in client.get_collections().collections]  # 获取全部 collection 名称
+        collection_points = {
+            # count(exact=True) 读取 Qdrant 当前 collection 的真实向量点数量。
+            # 首页需要这个数字区分“普通文件列表为空”和“向量库确实为空”。
+            collection_name: int(client.count(collection_name=collection_name, exact=True).count)
+            for collection_name in collections
+        }
         qdrant_status = _service_status("ok")  # 能正常连接和读取 collection，说明 Qdrant 可用
     except Exception:
         collections = []  # Qdrant 不可用时返回空列表，避免健康检查接口直接报错
+        collection_points = {}  # Qdrant 不可用时无法统计点数，返回空字典
         qdrant_status = _service_status("unavailable")  # 标记 Qdrant 不可用
 
     status = _service_status("ok") if qdrant_status == _service_status("ok") else _service_status("degraded")
@@ -34,4 +41,5 @@ def health() -> HealthResponse:
         qdrant=qdrant_status,  # 返回 Qdrant 状态
         collection_name=collection_name,  # 返回当前 collection 名称
         collections=collections,  # 返回 Qdrant collection 列表
+        collection_points=collection_points,  # 返回每个 collection 的真实向量点数量
     )
