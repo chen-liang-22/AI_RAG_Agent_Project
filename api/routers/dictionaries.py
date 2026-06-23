@@ -14,7 +14,7 @@ def _get_knowledge_store() -> KnowledgeStore:
 
 
 def _item_to_response(item: dict, children: list[DictionaryItemResponse] | None = None) -> DictionaryItemResponse:
-    """把 SQLite 字典行转换为接口响应对象。"""
+    """把数据库字典行转换为接口响应对象。"""
 
     metadata_json = item.get("metadata_json")
     metadata = {}

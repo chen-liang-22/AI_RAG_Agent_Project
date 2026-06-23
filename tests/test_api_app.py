@@ -104,6 +104,7 @@ def test_training_profile_dictionaries_follow_current_portrait_spec():
             "published",
             "archived",
             "parsing_failed",
+            "publish_failed",
             "deleted",
             "duplicated",
     }
@@ -331,6 +332,54 @@ def test_exam_question_rows_can_generate_first_question_before_remaining(monkeyp
     assert [item["round_no"] for item in all_questions] == [1, 2, 3]
 
 
+def test_exam_first_question_fast_mode_skips_model(monkeypatch, tmp_path):
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    session = store.create_exam_session(
+        session_id="exam_fast_rule_start",
+        user_id="user_exam",
+        title="快速规则首题",
+        collection_name="agent",
+        round_count=1,
+        question_types=["short_answer"],
+        model_mode="low",
+        metadata={"seed": 21},
+    )
+    candidates = [
+        {
+            "metadata": {
+                "question": "快速首题是什么？",
+                "question_id": "qa_fast_1",
+                "document_id": "doc_java",
+                "source_file": "Java面试题.pdf",
+            },
+            "content": "问题：快速首题是什么？\n答案：快速首题答案。",
+        }
+    ]
+
+    class ForbiddenModel:
+        def invoke(self, messages):
+            raise AssertionError("快速首题不应该同步调用模型")
+
+    monkeypatch.setattr(exam_router, "_store", lambda: store)
+    monkeypatch.setattr(exam_router, "get_chat_model", lambda model_mode=None: ForbiddenModel())
+
+    exam_router._build_exam_question_rows(
+        session_id=session["session_id"],
+        selected_items=candidates,
+        candidates=candidates,
+        question_types=["short_answer"],
+        model_mode="low",
+        seed=21,
+        max_score=100,
+        start_round=1,
+        prefer_model=False,
+    )
+    questions = store.list_exam_questions(session["session_id"])
+
+    assert len(questions) == 1
+    assert questions[0]["prompt"] == "快速首题是什么？"
+
+
 def test_choice_answer_value_is_normalized_to_label(tmp_path):
     store = KnowledgeStore(str(tmp_path / "knowledge.db"))
     session = store.create_exam_session(
@@ -361,6 +410,48 @@ def test_choice_answer_value_is_normalized_to_label(tmp_path):
     user_answer = exam_router._normalize_answer_value_for_question(question, "A. 运行 Java 字节码")
 
     assert user_answer == "A"
+
+
+def test_single_choice_generated_label_answer_maps_to_real_option():
+    raw_result = {
+        "prompt": "关于 Spring 依赖注入的作用，下列说法正确的是哪一项？",
+        "options": [
+            "A. 降低对象之间的耦合度",
+            "B. 直接替代数据库事务",
+            "C. 自动压缩静态资源",
+            "D. 强制所有类继承同一父类",
+        ],
+        "correct_answer": "A",
+    }
+
+    prompt, options, correct_answer = exam_router._validate_generated_question(raw_result, "single_choice")
+    display_options, display_answer = exam_router._prepare_objective_question_for_display(
+        "single_choice",
+        options,
+        correct_answer,
+    )
+
+    assert prompt == "关于 Spring 依赖注入的作用，下列说法正确的是哪一项？"
+    assert options == ["降低对象之间的耦合度", "直接替代数据库事务", "自动压缩静态资源", "强制所有类继承同一父类"]
+    assert correct_answer == "降低对象之间的耦合度"
+    assert display_options[0] == "A. 降低对象之间的耦合度"
+    assert "A. A" not in display_options
+    assert display_answer == "A"
+
+
+def test_generated_choice_rejects_label_only_options():
+    raw_result = {
+        "prompt": "关于 Spring 依赖注入的作用，下列说法正确的是哪一项？",
+        "options": ["A", "B", "C", "D"],
+        "correct_answer": "A",
+    }
+
+    try:
+        exam_router._validate_generated_question(raw_result, "single_choice")
+    except ValueError as exc:
+        assert "单选题选项或答案不完整" in str(exc)
+    else:
+        raise AssertionError("纯选项编号不能作为有效选择题选项")
 
 
 def test_multiple_choice_allows_all_options_when_single_question_needs_it():

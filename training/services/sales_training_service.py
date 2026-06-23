@@ -2,12 +2,13 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import time
 import uuid
 from collections.abc import Iterator
+from datetime import date, datetime
 from typing import Any
 
+import yaml
 from fastapi import HTTPException, UploadFile
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -56,28 +57,78 @@ from training.schemas import (
     TrainingTurnRequest,
     TrainingTurnResponse,
 )
+from utils.database_connection import DatabaseErrorTypes
 from utils.file_handler import get_file_md5_hex
 from utils.logger_handler import logger
 from utils.path_tool import get_abs_path
 
 
-TRAINING_COLLECTION_NAME = "sales_training_cases"
+TRAINING_INGEST_CONFIG_PATH = get_abs_path("config/training_ingest.yml")
+DEFAULT_TRAINING_COLLECTION_NAME = "sales_training_cases"
+DEFAULT_TRAINING_STAGING_COLLECTION_NAME = "sales_training_cases_staging"
+TRAINING_COLLECTION_NAME = DEFAULT_TRAINING_COLLECTION_NAME
 ALLOWED_TRAINING_FILE_TYPES = {"txt", "pdf", "docx"}
 DEFAULT_TRAINING_VISIBILITY = "visible"
+
+
+def _load_training_collection_config() -> dict[str, str]:
+    """读取销售训练正式库和临时库 collection 配置。"""
+
+    config = {
+        "published": DEFAULT_TRAINING_COLLECTION_NAME,
+        "staging": DEFAULT_TRAINING_STAGING_COLLECTION_NAME,
+    }
+    try:
+        with open(TRAINING_INGEST_CONFIG_PATH, "r", encoding="utf-8") as config_file:
+            data = yaml.safe_load(config_file) or {}
+    except OSError as exc:
+        logger.warning("[销售训练] 读取训练入库配置失败，使用默认 collection 配置 错误=%s", exc)
+        return config
+    except yaml.YAMLError as exc:
+        logger.warning("[销售训练] 解析训练入库配置失败，使用默认 collection 配置 错误=%s", exc)
+        return config
+
+    collection_config = data.get("collections") if isinstance(data, dict) else {}
+    if not isinstance(collection_config, dict):
+        return config
+    published_collection = str(collection_config.get("published") or "").strip()
+    staging_collection = str(collection_config.get("staging") or "").strip()
+    if published_collection:
+        config["published"] = published_collection
+    if staging_collection:
+        config["staging"] = staging_collection
+    return config
+
+
+def _format_response_time(value: object) -> str | None:
+    """把数据库时间字段统一转换成接口响应字符串。"""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds", sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
 
 
 class SalesTrainingService:
     """销售训练一期外观服务。
 
-    外观模式用于把文件解析、向量库、LLM、SQLite 这些子系统收拢成
+    外观模式用于把文件解析、向量库、LLM、业务数据库这些子系统收拢成
     前端能理解的训练流程接口。一期流程较短，暂不引入 Graph。
     """
 
     def __init__(self, repository: TrainingRepository | None = None):
-        # repository 支持注入，主要是为了单元测试可以传临时 SQLite。
+        # repository 支持注入，主要是为了单元测试可以传临时数据库。
         self.repository = repository or TrainingRepository()
-        # 训练知识使用独立 collection，避免和智能客服的普通知识库混在一起。
-        self.vector_service = VectorStoreService(collection_name=TRAINING_COLLECTION_NAME)
+        collection_config = _load_training_collection_config()
+        self.training_collection_name = collection_config["published"]
+        self.staging_collection_name = collection_config["staging"]
+        # 正式训练知识使用独立 collection，避免和智能客服的普通知识库混在一起。
+        self.vector_service = VectorStoreService(collection_name=self.training_collection_name)
+        # 待人工审核的上传切片写入临时 collection，发布成功后再清理，避免关系型数据库保存正文切片。
+        self.staging_vector_service = VectorStoreService(collection_name=self.staging_collection_name)
 
     def upload_knowledge(
             self,
@@ -147,9 +198,9 @@ class SalesTrainingService:
             )
 
         version_info = self._next_training_batch_version(source_type=source_type, source_file=filename)
-        # 阶段 4：先创建 SQLite 批次记录，状态置为 parsing。
+        # 阶段 4：先创建业务数据库批次记录，状态置为 parsing。
         # 这样即使后续解析失败，也能在后台和日志里追踪到失败原因。
-        # self.repository 是当前服务的仓储成员变量，专门负责读写训练相关的 SQLite 数据。
+        # self.repository 是当前服务的仓储成员变量，专门负责读写训练相关的关系型数据。
         batch = self.repository.create_batch(
             # 本次上传批次的唯一编号，后续查切片、删向量、预览文件都靠它关联。
             batch_id=batch_id,
@@ -183,7 +234,7 @@ class SalesTrainingService:
         )
 
         try:
-            # 阶段 5：解析文件并生成预览切片；这里不写 Qdrant。
+            # 阶段 5：解析文件并生成预览切片；待审核正文只写入临时向量库。
             chunks = self._parse_training_chunks(
                 file_path=file_path,
                 batch_id=batch_id,
@@ -202,20 +253,22 @@ class SalesTrainingService:
                 source_type=source_type,
                 model_mode=model_mode,
             )
-            # 阶段 7：把切片明细写入 SQLite；此时 qdrant_point_id 只是未来发布时使用的点编号。
-            self.repository.replace_chunks(batch_id, self._chunk_rows(chunks, source_type=source_type))
+            # 阶段 7：把待审核切片写入临时向量库，前端预览也从临时库按 batch_id 读取。
+            point_count = self._write_staging_chunks(batch=batch, chunks=chunks, source_type=source_type)
             # 阶段 8：上传预览完成，等待人工确认发布。
             self.repository.update_batch_status(
                 batch_id,
                 status="pending_review",
                 chunk_count=len(chunks),
-                point_count=0,
+                point_count=point_count,
                 quality_report=quality_report,
             )
             logger.info(
-                "[销售训练] 训练知识预览生成完成 批次编号=%s 切片数量=%s 质量分=%s 切分方式=%s",
+                "[销售训练] 训练知识预览生成完成 批次编号=%s 临时向量库=%s 切片数量=%s 向量点数量=%s 质量分=%s 切分方式=%s",
                 batch_id,
+                self.staging_collection_name,
                 len(chunks),
+                point_count,
                 quality_report.get("score"),
                 quality_report.get("selected_splitter"),
             )
@@ -223,7 +276,7 @@ class SalesTrainingService:
                 batch_id=batch["batch_id"],
                 status="pending_review",
                 chunk_count=len(chunks),
-                point_count=0,
+                point_count=point_count,
                 source_file=filename,
                 quality_report=quality_report,
             )
@@ -258,7 +311,7 @@ class SalesTrainingService:
         file_type = str(batch["source_file"]).rsplit(".", 1)[-1].lower() if "." in str(batch["source_file"]) else ""
         safe_max_chars = max(500, min(100000, max_chars))
 
-        stored_preview = self._saved_chunk_preview(batch_id, safe_max_chars=safe_max_chars)
+        stored_preview = self._saved_chunk_preview(batch, safe_max_chars=safe_max_chars)
         if stored_preview["content"]:
             content = stored_preview["content"]
             truncated = stored_preview["truncated"]
@@ -294,8 +347,8 @@ class SalesTrainingService:
         """删除训练资料批次。
 
         删除动作包含两层：
-        1. Qdrant 中按 batch_id 删除本批次向量点；
-        2. SQLite 批次状态改成 deleted，原文件暂时保留。
+        1. Qdrant 正式库和临时库中按 batch_id 删除本批次向量点；
+        2. 业务数据库批次状态改成 deleted，原文件暂时保留。
         """
 
         self._get_active_batch(batch_id)
@@ -303,7 +356,12 @@ class SalesTrainingService:
             VectorStoreService.delete_vectors_by_metadata(
                 "batch_id",
                 batch_id,
-                collection_name=TRAINING_COLLECTION_NAME,
+                collection_name=self.training_collection_name,
+            )
+            VectorStoreService.delete_vectors_by_metadata(
+                "batch_id",
+                batch_id,
+                collection_name=self.staging_collection_name,
             )
             deleted = self.repository.mark_batch_deleted(batch_id)
             if not deleted:
@@ -314,13 +372,19 @@ class SalesTrainingService:
             logger.error("[销售训练] 训练资料删除失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"训练资料删除失败：{exc}") from exc
 
-        logger.info("[销售训练] 训练资料已删除 批次编号=%s", batch_id)
+        logger.info(
+            "[销售训练] 训练资料已删除 批次编号=%s 正式向量库=%s 临时向量库=%s",
+            batch_id,
+            self.training_collection_name,
+            self.staging_collection_name,
+        )
         return TrainingKnowledgeDeleteResponse(status="deleted", batch_id=batch_id)
 
     def publish_batch(self, batch_id: str) -> TrainingKnowledgePublishResponse:
         """人工确认发布训练资料。
 
-        发布阶段才会调用 embedding 并写入 Qdrant，避免低质量切片直接污染向量库。
+        上传阶段已经把待审核切片写入临时 Qdrant collection。
+        发布阶段只把临时向量点复制到正式 collection，成功后删除临时点。
         """
 
         batch = self._get_active_batch(batch_id)
@@ -333,20 +397,16 @@ class SalesTrainingService:
                 point_count=int(batch.get("point_count") or 0),
                 quality_report=self._load_json(batch.get("quality_report_json"), {}),
             )
-        if batch["status"] not in {"pending_review", "embedding"}:
+        if batch["status"] not in {"pending_review", "embedding", "publish_failed"}:
             raise HTTPException(status_code=400, detail=f"当前状态不允许发布：{batch['status']}")
 
-        chunks = self.repository.list_chunks(batch_id)
+        chunks = self._list_staging_chunk_rows(batch_id)
         if not chunks:
-            raise HTTPException(status_code=400, detail="没有可发布的训练切片，请重新上传")
+            raise HTTPException(status_code=400, detail="临时向量库没有可发布的训练切片，请重新上传或重新切分")
 
         self.repository.update_batch_status(batch_id, status="embedding")
         try:
-            documents = [
-                self._document_from_chunk_row(row, batch=batch)
-                for row in chunks
-            ]
-            self.vector_service.vector_store.add_documents(documents)
+            copied_count = self._publish_staging_vectors(batch=batch)
             quality_report = self._load_json(batch.get("quality_report_json"), {})
             publish_validation = TrainingPublishValidator().validate(
                 vector_service=self.vector_service,
@@ -359,48 +419,49 @@ class SalesTrainingService:
                 batch_id,
                 status="published",
                 chunk_count=len(chunks),
-                point_count=len(chunks),
+                point_count=copied_count,
                 quality_report=quality_report,
                 is_current=True,
             )
+            self._delete_staging_vectors(batch_id)
         except Exception as exc:
-            self.repository.update_batch_status(batch_id, status="parsing_failed", error_message=str(exc))
+            self.repository.update_batch_status(batch_id, status="publish_failed", error_message=str(exc))
             logger.error("[销售训练] 训练资料发布失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"训练资料发布失败：{exc}") from exc
 
         logger.info(
-            "[销售训练] 训练资料发布完成 批次编号=%s 向量点数量=%s 抽样验证=%s",
+            "[销售训练] 训练资料发布完成 批次编号=%s 临时向量库=%s 正式向量库=%s 向量点数量=%s 抽样验证=%s",
             batch_id,
-            len(chunks),
+            self.staging_collection_name,
+            self.training_collection_name,
+            copied_count,
             quality_report.get("publish_validation", {}).get("summary", "未执行"),
         )
         return TrainingKnowledgePublishResponse(
             batch_id=batch_id,
             status="published",
             chunk_count=len(chunks),
-            point_count=len(chunks),
+            point_count=copied_count,
             quality_report=quality_report,
         )
 
     def rollback_batch(self, batch_id: str) -> TrainingKnowledgeRollbackResponse:
         """回滚训练资料到指定历史版本。
 
-        回滚会把指定批次重新写入 Qdrant，并把同版本组其他版本归档。
-        SQLite 历史记录不删除，方便后续继续查看每个版本。
+        历史版本的正式向量点会长期保留，回滚时只切换当前版本标记和业务数据库状态。
         """
 
         batch = self._get_active_batch(batch_id)
         if batch["status"] not in {"published", "archived"}:
             raise HTTPException(status_code=400, detail=f"当前状态不允许回滚：{batch['status']}")
-        chunks = self.repository.list_chunks(batch_id)
+        chunks = self._list_published_chunk_rows(batch_id)
         if not chunks:
-            raise HTTPException(status_code=400, detail="该版本没有可回滚的训练切片")
+            raise HTTPException(status_code=400, detail="该版本没有可回滚的训练切片，请重新上传资料")
 
         version_group_id = batch.get("version_group_id") or batch["batch_id"]
         try:
-            self._delete_version_group_vectors(version_group_id)
-            documents = [self._document_from_chunk_row(row, batch=batch) for row in chunks]
-            self.vector_service.vector_store.add_documents(documents)
+            self._mark_version_group_vectors_archived(version_group_id)
+            point_count = self._mark_batch_vectors_current(batch=batch)
             quality_report = self._load_json(batch.get("quality_report_json"), {})
             quality_report["rollback"] = {
                 "rolled_back": True,
@@ -417,7 +478,7 @@ class SalesTrainingService:
                 batch_id,
                 status="published",
                 chunk_count=len(chunks),
-                point_count=len(chunks),
+                point_count=point_count,
                 quality_report=quality_report,
                 is_current=True,
             )
@@ -430,7 +491,7 @@ class SalesTrainingService:
             batch_id,
             version_group_id,
             int(batch.get("version_no") or 1),
-            len(chunks),
+            point_count,
         )
         return TrainingKnowledgeRollbackResponse(
             batch_id=batch_id,
@@ -438,7 +499,7 @@ class SalesTrainingService:
             version_group_id=version_group_id,
             version_no=int(batch.get("version_no") or 1),
             chunk_count=len(chunks),
-            point_count=len(chunks),
+            point_count=point_count,
             quality_report=quality_report,
         )
 
@@ -452,11 +513,11 @@ class SalesTrainingService:
         """重新切分未发布训练资料。
 
         该接口用于人工预览发现规则切分不理想时，主动触发 LLM 兜底切分。
-        已发布版本不能直接重切，避免 SQLite 切片和 Qdrant 向量不一致。
+        已发布版本不能直接重切，避免绕过人工确认并破坏临时库到正式库的发布边界。
         """
 
         batch = self._get_active_batch(batch_id)
-        if batch["status"] not in {"pending_review", "parsing_failed"}:
+        if batch["status"] not in {"pending_review", "parsing_failed", "publish_failed"}:
             raise HTTPException(status_code=400, detail=f"当前状态不允许重新切分：{batch['status']}")
 
         file_path = self._resolve_batch_file_path(batch)
@@ -488,12 +549,12 @@ class SalesTrainingService:
 
             if not chunks:
                 raise ValueError("重新切分没有生成有效训练切片")
-            self.repository.replace_chunks(batch_id, self._chunk_rows(chunks, source_type=source_type))
+            point_count = self._write_staging_chunks(batch=batch, chunks=chunks, source_type=source_type)
             self.repository.update_batch_status(
                 batch_id,
                 status="pending_review",
                 chunk_count=len(chunks),
-                point_count=0,
+                point_count=point_count,
                 quality_report=quality_report,
                 is_current=False,
             )
@@ -513,7 +574,7 @@ class SalesTrainingService:
             batch_id=batch_id,
             status="pending_review",
             chunk_count=len(chunks),
-            point_count=0,
+            point_count=point_count,
             source_file=source_file,
             quality_report=quality_report,
         )
@@ -532,9 +593,10 @@ class SalesTrainingService:
     def list_chunks(self, batch_id: str) -> TrainingKnowledgeChunkListResponse:
         """查询某个上传批次的训练知识切片。"""
 
-        self._get_active_batch(batch_id)
+        batch = self._get_active_batch(batch_id)
         chunks = []
-        for row in self.repository.list_chunks(batch_id):
+        chunk_rows = self._list_batch_chunk_rows(batch)
+        for row in chunk_rows:
             metadata = self._load_json(row.get("metadata_json"), {})
             chunks.append(
                 TrainingKnowledgeChunkResponse(
@@ -681,7 +743,7 @@ class SalesTrainingService:
 
         try:
             updated = self.repository.update_plan(plan_id, **updates) if updates else self._require_plan(plan_id)
-        except sqlite3.DatabaseError as exc:
+        except DatabaseErrorTypes as exc:
             logger.error("[销售训练] 训练方案保存数据库异常 方案编号=%s 错误=%s", plan_id, exc, exc_info=True)
             raise
         logger.info(
@@ -1285,7 +1347,7 @@ class SalesTrainingService:
         start_perf = time.perf_counter()
         logger.info(
             "[销售训练][训练证据检索] 开始检索 collection=%s 可见性=%s 返回数量=%s 查询长度=%s 查询预览=%s",
-            TRAINING_COLLECTION_NAME,
+            self.training_collection_name,
             self._join_values(visibility),
             k,
             len(query or ""),
@@ -1295,7 +1357,7 @@ class SalesTrainingService:
         if not current_batch_ids:
             logger.info(
                 "[销售训练][训练证据检索] 没有当前发布版本，跳过向量检索 collection=%s 耗时秒=%s",
-                TRAINING_COLLECTION_NAME,
+                self.training_collection_name,
                 round(max(0.0, time.perf_counter() - start_perf), 3),
             )
             return []
@@ -1320,7 +1382,7 @@ class SalesTrainingService:
             )
         logger.info(
             "[销售训练][训练证据检索] 检索完成 collection=%s 原始文档数=%s 过滤后证据数=%s 来源文件=%s 案例部分=%s 耗时秒=%s",
-            TRAINING_COLLECTION_NAME,
+            self.training_collection_name,
             len(documents),
             len(evidence),
             self._join_values(item.get("source_file") for item in evidence),
@@ -1586,7 +1648,7 @@ class SalesTrainingService:
     def _load_json(value: Any, default: Any) -> Any:
         """安全读取 JSON 字段。
 
-        SQLite 里 JSON 以 TEXT 存储，所以读出来通常是 str。
+        关系型数据库里 JSON 读出来可能是 str，也可能已是 dict/list。
         但部分内部调用可能已经传入 dict/list，这里直接返回，减少重复 json.loads。
         """
 
@@ -1690,8 +1752,8 @@ class SalesTrainingService:
             score_status=row["score_status"],
             active_profile_id=row.get("active_profile_id"),
             active_setting_id=row.get("active_setting_id"),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+            created_at=_format_response_time(row["created_at"]),
+            updated_at=_format_response_time(row["updated_at"]),
         )
 
     def _plan_detail_response(self, row: dict[str, Any]) -> TrainingPlanDetailResponse:
@@ -1718,24 +1780,140 @@ class SalesTrainingService:
             goal_setting=self._goal_response(setting_row) if setting_row else None,
         )
 
-    @staticmethod
-    def _chunk_rows(chunks: list[Any], *, source_type: str) -> list[dict[str, Any]]:
-        """把训练切片对象转换成 SQLite 明细行。"""
+    def _write_staging_chunks(self, *, batch: dict[str, Any], chunks: list[Any], source_type: str) -> int:
+        """把待审核训练切片写入临时向量库。"""
 
-        rows = []
-        for chunk in chunks:
+        batch_id = str(batch["batch_id"])
+        documents = [
+            self._document_from_training_chunk(chunk, batch=batch, source_type=source_type, status="pending_review", is_current=False)
+            for chunk in chunks
+        ]
+        self._delete_staging_vectors(batch_id)
+        if documents:
+            self.staging_vector_service.vector_store.add_documents(documents)
+        logger.info(
+            "[销售训练] 待审核切片已写入临时向量库 批次编号=%s 临时向量库=%s 切片数量=%s",
+            batch_id,
+            self.staging_collection_name,
+            len(documents),
+        )
+        return len(documents)
+
+    def _publish_staging_vectors(self, *, batch: dict[str, Any]) -> int:
+        """把临时向量库中的待审核切片复制到正式向量库。"""
+
+        batch_id = str(batch["batch_id"])
+        metadata_updates = {
+            "status": "published",
+            "is_current": True,
+            "published_at": utc_now_text(),
+        }
+        self.vector_service.delete_by_metadata("batch_id", batch_id)
+        copied_count = self.staging_vector_service.copy_points_by_metadata_to(
+            self.vector_service,
+            "batch_id",
+            batch_id,
+            metadata_updates=metadata_updates,
+        )
+        if copied_count <= 0:
+            raise ValueError("临时向量库复制到正式向量库失败，没有复制任何向量点")
+        logger.info(
+            "[销售训练] 待审核切片已复制到正式向量库 批次编号=%s 临时向量库=%s 正式向量库=%s 向量点数量=%s",
+            batch_id,
+            self.staging_collection_name,
+            self.training_collection_name,
+            copied_count,
+        )
+        return copied_count
+
+    def _delete_staging_vectors(self, batch_id: str) -> None:
+        """删除临时向量库中某个批次的待审核切片。"""
+
+        self.staging_vector_service.delete_by_metadata("batch_id", batch_id)
+
+    def _list_batch_chunk_rows(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
+        """按批次状态从临时库或正式库读取切片行。"""
+
+        batch_id = str(batch["batch_id"])
+        if batch.get("status") in {"pending_review", "embedding", "publish_failed", "parsing_failed"}:
+            return self._list_staging_chunk_rows(batch_id)
+        return self._list_published_chunk_rows(batch_id)
+
+    def _list_staging_chunk_rows(self, batch_id: str) -> list[dict[str, Any]]:
+        """从临时向量库读取待审核切片行。"""
+
+        return self._documents_to_chunk_rows(
+            self.staging_vector_service.list_documents_by_metadata("batch_id", batch_id),
+            batch_id=batch_id,
+        )
+
+    def _list_published_chunk_rows(self, batch_id: str) -> list[dict[str, Any]]:
+        """从正式向量库读取已发布切片行。"""
+
+        return self._documents_to_chunk_rows(
+            self.vector_service.list_documents_by_metadata("batch_id", batch_id),
+            batch_id=batch_id,
+        )
+
+    def _documents_to_chunk_rows(self, documents: list[Document], *, batch_id: str) -> list[dict[str, Any]]:
+        """把 Qdrant Document 列表转换为前端切片行。"""
+
+        rows: list[dict[str, Any]] = []
+        for document in documents:
+            metadata = dict(document.metadata)
             rows.append(
                 {
-                    "chunk_id": chunk.chunk_id,
-                    "qdrant_point_id": chunk.chunk_id,
-                    "chunk_text": chunk.text,
-                    "source_type": source_type,
-                    "case_part": chunk.case_part,
-                    "visibility": chunk.visibility,
-                    "metadata": chunk.metadata,
+                    "chunk_id": str(metadata.get("chunk_id") or ""),
+                    "batch_id": str(metadata.get("batch_id") or batch_id),
+                    "qdrant_point_id": str(metadata.get("chunk_id") or ""),
+                    "chunk_text": document.page_content,
+                    "source_type": metadata.get("source_type"),
+                    "case_part": metadata.get("case_part"),
+                    "visibility": metadata.get("visibility"),
+                    "metadata_json": json.dumps(metadata, ensure_ascii=False),
+                    "metadata": metadata,
                 }
             )
-        return rows
+        return sorted(rows, key=self._chunk_sort_key)
+
+    @staticmethod
+    def _chunk_sort_key(row: dict[str, Any]) -> tuple[int, str, str]:
+        """按案例序号、切片编号稳定排序。"""
+
+        metadata = SalesTrainingService._load_json(row.get("metadata_json"), {})
+        try:
+            case_index = int(metadata.get("case_index") or 0)
+        except (TypeError, ValueError):
+            case_index = 0
+        return case_index, str(row.get("chunk_id") or ""), str(row.get("case_part") or "")
+
+    def _document_from_training_chunk(
+            self,
+            chunk: Any,
+            *,
+            batch: dict[str, Any],
+            source_type: str,
+            status: str,
+            is_current: bool,
+    ) -> Document:
+        """把内存训练切片转换成 Qdrant Document。"""
+
+        metadata = self._compact_metadata({
+            "batch_id": batch["batch_id"],
+            "chunk_id": chunk.chunk_id,
+            "content_type": "sales_training_case",
+            "source_type": source_type,
+            "source_file": batch.get("source_file"),
+            "file_md5": batch.get("file_md5"),
+            "version_group_id": batch.get("version_group_id") or batch["batch_id"],
+            "version_no": int(batch.get("version_no") or 1),
+            "status": status,
+            "is_current": is_current,
+            "case_part": chunk.case_part,
+            "visibility": chunk.visibility,
+            **dict(chunk.metadata or {}),
+        })
+        return Document(page_content=chunk.text, metadata=metadata)
 
     def _parse_training_chunks(
             self,
@@ -1769,7 +1947,7 @@ class SalesTrainingService:
         }
 
     def _archive_previous_training_versions(self, batch: dict[str, Any]) -> None:
-        """发布新版本后归档同版本组旧版本，并删除旧版本向量点。"""
+        """发布新版本后归档同版本组旧版本，并保留旧版本向量点用于回滚。"""
 
         version_group_id = batch.get("version_group_id") or batch["batch_id"]
         previous_versions = self.repository.list_published_batches_in_version_group(
@@ -1777,35 +1955,49 @@ class SalesTrainingService:
             exclude_batch_id=batch["batch_id"],
         )
         for previous_batch in previous_versions:
-            VectorStoreService.delete_vectors_by_metadata(
+            self.vector_service.update_metadata_by_metadata(
                 "batch_id",
                 previous_batch["batch_id"],
-                collection_name=TRAINING_COLLECTION_NAME,
+                metadata_updates={"status": "archived", "is_current": False},
             )
         self.repository.archive_other_versions(version_group_id=version_group_id, current_batch_id=batch["batch_id"])
         if previous_versions:
             logger.info(
-                "[销售训练] 旧版本训练资料已归档 版本组=%s 当前批次=%s 归档数量=%s",
+                "[销售训练] 旧版本训练资料已归档并保留向量 版本组=%s 当前批次=%s 归档数量=%s",
                 version_group_id,
                 batch["batch_id"],
                 len(previous_versions),
             )
 
-    def _delete_version_group_vectors(self, version_group_id: str) -> None:
-        """删除同版本组内所有已发布或归档版本的 Qdrant 向量点。"""
+    def _mark_version_group_vectors_archived(self, version_group_id: str) -> None:
+        """把同版本组内所有正式向量点标记为历史版本。"""
 
         version_batches = self.repository.list_published_batches_in_version_group(version_group_id)
         for version_batch in version_batches:
-            VectorStoreService.delete_vectors_by_metadata(
+            self.vector_service.update_metadata_by_metadata(
                 "batch_id",
                 version_batch["batch_id"],
-                collection_name=TRAINING_COLLECTION_NAME,
+                metadata_updates={"status": "archived", "is_current": False},
             )
 
-    def _saved_chunk_preview(self, batch_id: str, *, safe_max_chars: int) -> dict[str, Any]:
-        """读取已经保存的切片预览，保证预览内容和后续发布内容一致。"""
+    def _mark_batch_vectors_current(self, *, batch: dict[str, Any]) -> int:
+        """把某个批次的正式向量点标记为当前发布版本。"""
 
-        stored_chunks = self.repository.list_chunks(batch_id)
+        return self.vector_service.update_metadata_by_metadata(
+            "batch_id",
+            batch["batch_id"],
+            metadata_updates={
+                "status": "published",
+                "is_current": True,
+                "version_group_id": batch.get("version_group_id") or batch["batch_id"],
+                "version_no": int(batch.get("version_no") or 1),
+            },
+        )
+
+    def _saved_chunk_preview(self, batch: dict[str, Any], *, safe_max_chars: int) -> dict[str, Any]:
+        """读取已经写入向量库的切片预览，保证预览内容和后续发布内容一致。"""
+
+        stored_chunks = self._list_batch_chunk_rows(batch)
         parts: list[str] = []
         total_chars = 0
         truncated = False
@@ -1946,26 +2138,6 @@ class SalesTrainingService:
         documents = FileProcessorFactory.load_documents(file_path)
         return "\n\n".join(document.page_content for document in documents).strip()
 
-    def _document_from_chunk_row(self, row: dict[str, Any], *, batch: dict[str, Any]) -> Document:
-        """把 SQLite 切片行转换成写入 Qdrant 的 Document。"""
-
-        chunk_metadata = self._load_json(row.get("metadata_json"), {})
-        metadata = self._compact_metadata({
-            "batch_id": batch["batch_id"],
-            "chunk_id": row["chunk_id"],
-            "content_type": "sales_training_case",
-            "source_type": row.get("source_type") or batch.get("source_type"),
-            "source_file": batch.get("source_file"),
-            "file_md5": batch.get("file_md5"),
-            "version_group_id": batch.get("version_group_id") or batch["batch_id"],
-            "version_no": int(batch.get("version_no") or 1),
-            "is_current": bool(batch.get("is_current")),
-            "case_part": row.get("case_part"),
-            "visibility": row.get("visibility"),
-            **chunk_metadata,
-        })
-        return Document(page_content=row["chunk_text"], metadata=metadata)
-
     @staticmethod
     def _batch_response(row: dict[str, Any]) -> TrainingKnowledgeBatchResponse:
         """把训练资料批次数据库行转换成前端响应。"""
@@ -1991,8 +2163,8 @@ class SalesTrainingService:
             error_message=row.get("error_message"),
             quality_report=SalesTrainingService._load_json(row.get("quality_report_json"), {}),
             created_by=row.get("created_by"),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+            created_at=_format_response_time(row["created_at"]),
+            updated_at=_format_response_time(row["updated_at"]),
         )
 
     def _get_active_batch(self, batch_id: str) -> dict[str, Any]:
@@ -2074,9 +2246,9 @@ class SalesTrainingService:
             answered_count=int(row.get("answered_count") or 0),
             total_score=row.get("total_score"),
             level=row.get("level"),
-            started_at=row["started_at"],
-            ended_at=row.get("ended_at"),
-            updated_at=row["updated_at"],
+            started_at=_format_response_time(row["started_at"]),
+            ended_at=_format_response_time(row.get("ended_at")),
+            updated_at=_format_response_time(row["updated_at"]),
         )
 
     def _turn_record(self, row: dict[str, Any]) -> TrainingTurnRecordResponse:
@@ -2094,7 +2266,7 @@ class SalesTrainingService:
             retrieved_chunk_ids=self._load_json(row.get("retrieved_chunk_ids_json"), []),
             stage_decision=self._load_json(row.get("stage_decision_json"), {}),
             coach_analysis=self._load_json(row.get("coach_analysis_json"), {}),
-            created_at=row["created_at"],
+            created_at=_format_response_time(row["created_at"]),
         )
 
     def _score_response(self, row: dict[str, Any]) -> TrainingScoreResponse:

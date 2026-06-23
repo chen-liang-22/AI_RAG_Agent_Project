@@ -1,7 +1,7 @@
 # RAG 知识库结构化入库、多意图识别与精排设计方案
 
-> 当前状态说明：本文最初描述的是“SQLite 保存结构化知识单元 + Qdrant 保存向量索引”的演进方案。
-> 项目当前实现已经进一步收敛为：SQLite 只保存文件、索引状态和会话等业务元数据；知识正文、FAQ、
+> 当前状态说明：本文最初描述的是“MySQL 保存结构化知识单元 + Qdrant 保存向量索引”的演进方案。
+> 项目当前实现已经进一步收敛为：MySQL 只保存文件、索引状态和会话等业务元数据；知识正文、FAQ、
 > chunk payload 和向量统一以 Qdrant 为准。本文中涉及 `knowledge_units` 表的内容保留为历史设计背景，
 > 不再代表当前落地方案。当前实现以 `ai_rag_agent_project_overall_design.md` 为准。
 >
@@ -91,7 +91,7 @@ flowchart TD
    保存用户上传的原始文件。
 
 2. 结构化知识层
-   使用 SQLite/Postgres 保存文件、章节、知识单元、索引状态。
+   使用 MySQL/Postgres 保存文件、章节、知识单元、索引状态。
 
 3. 向量索引层
    使用 Qdrant 保存知识单元的 embedding 和检索 metadata。
@@ -118,7 +118,7 @@ uploads/
 
 ### 4.2 数据库层
 
-第一阶段建议使用 SQLite，降低复杂度。
+第一阶段建议使用 MySQL，降低复杂度。
 
 后续生产环境可替换为 PostgreSQL。
 
@@ -126,7 +126,7 @@ uploads/
 
 ```text
 storage/
-  knowledge.db
+  ai_rag_agent MySQL database
 ```
 
 ### 4.3 Qdrant 层
@@ -712,7 +712,7 @@ rerank 分数
 
 目标：
 
-- 新增 SQLite。
+- 新增 MySQL。
 - 新增 documents 表。
 - 新增 knowledge_units 表。
 - 新增上传接口。

@@ -1,5 +1,6 @@
 import json
 import time
+from datetime import date, datetime
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -38,7 +39,7 @@ def _conversation_status(item_code: str) -> str:
 
 
 def _conversation_summary(row: dict) -> ConversationSummaryResponse:
-    """把 SQLite 会话行转换成前端列表响应。"""
+    """把数据库会话行转换成前端列表响应。"""
 
     return ConversationSummaryResponse(
         conversation_id=row["conversation_id"],
@@ -46,14 +47,14 @@ def _conversation_summary(row: dict) -> ConversationSummaryResponse:
         title=row.get("title"),
         status=row["status"],
         message_count=int(row.get("message_count") or 0),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        last_message_at=row.get("last_message_at"),
+        created_at=_datetime_to_text(row["created_at"]),
+        updated_at=_datetime_to_text(row["updated_at"]),
+        last_message_at=_datetime_to_text(row.get("last_message_at")),
     )
 
 
 def _conversation_message(row: dict) -> ConversationMessageResponse:
-    """把 SQLite 消息行转换成前端详情响应。"""
+    """把数据库消息行转换成前端详情响应。"""
 
     metadata = _read_message_metadata(row.get("metadata_json"))
     return ConversationMessageResponse(
@@ -67,8 +68,20 @@ def _conversation_message(row: dict) -> ConversationMessageResponse:
         token_count=row.get("token_count"),
         first_token_ms=_optional_float(metadata.get("first_token_ms")),
         total_ms=_optional_float(metadata.get("total_ms")),
-        created_at=row["created_at"],
+        created_at=_datetime_to_text(row["created_at"]),
     )
+
+
+def _datetime_to_text(value: object) -> str | None:
+    """把数据库返回的日期时间值转换成接口约定的字符串。"""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds", sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
 
 
 def _read_message_metadata(metadata_json: str | None) -> dict:
@@ -305,7 +318,7 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
     # 记录请求进入时间，用来统计“从接口收到请求到返回流”的准备耗时。
     request_start_time = time.perf_counter()
 
-    # 确保本次聊天有 conversation_id，并从 SQLite 读取最近的历史消息。
+    # 确保本次聊天有 conversation_id，并从 MySQL 读取最近的历史消息。
     # 如果前端没有传 conversation_id，这里会创建一个新的会话。
     conversation_id, history = _prepare_chat_conversation(request)
     selected_model_mode = normalize_chat_model_mode(request.model_mode)

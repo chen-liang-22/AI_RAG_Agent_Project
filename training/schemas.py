@@ -12,7 +12,7 @@ class TrainingKnowledgeUploadResponse(BaseModel):
 
     batch_id: str  # 上传批次 ID，用于后续查询本次文件拆出的切片。
     status: str  # 批次状态，例如 pending_review / duplicated。
-    chunk_count: int  # SQLite 中保存的切片数量。
+    chunk_count: int  # 本次上传解析出的切片数量。
     point_count: int  # 写入 Qdrant 的向量点数量；预览阶段通常为 0。
     source_file: str | None = None  # 原始文件名，方便前端展示“上传了哪个资料”。
     duplicate_of: str | None = None  # 如果命中 MD5 去重，这里返回已存在的批次 ID。

@@ -48,7 +48,7 @@ class RagSummarizeService(object):
     def __init__(self):
         self.vector_store: VectorStoreService | None = None  # Qdrant 向量库服务，懒加载，避免 Qdrant 不可用时整个 RAG 初始化失败
         self.vector_stores: dict[str, VectorStoreService] = {}  # 按 collection 缓存向量库服务，避免多知识库互相串用
-        self.knowledge_store = KnowledgeStore()  # SQLite 元数据仓库，用于文档、会话和系统字典管理
+        self.knowledge_store = KnowledgeStore()  # MySQL 业务元数据仓库，用于文档、会话和系统字典管理
         self.query_planner = QueryPlannerService()  # LLM Query Planner，负责把复杂问题拆成多个 search_query
         self.reranker = RuleBasedReranker()  # 规则版精排器
 
@@ -582,10 +582,10 @@ class RagSummarizeService(object):
         return "\n".join(f"第{index}个：{query}" for index, query in enumerate(queries, start=1))
 
     def _keyword_retrieve(self, analysis: QueryAnalysis, limit: int) -> list[Document]:
-        """从 SQLite 做关键词补充召回。
+        """旧版关系型数据库关键词补充召回入口。
 
         当前回答链路按要求只走 Qdrant。
-        这个方法保留为空实现，避免旧代码路径继续使用 SQLite LIKE 查询。
+        这个方法保留为空实现，避免旧代码路径继续使用关系型数据库 LIKE 查询知识正文。
         """
 
         return []

@@ -4,13 +4,12 @@
 1. 从 Qdrant 中按向量库、文件和一级目录筛选结构化 QA 题源；
 2. 开始考试时随机抽题，并优先调用 LLM 把原始 QA 润色成正式试题；
 3. 用户逐轮提交答案，后端用 LLM 分析得分、正确答案、命中点和遗漏点；
-4. 会话、题目、用户答案和分析结果全部写入 SQLite，供历史记录查看。
+4. 会话、题目、用户答案和分析结果全部写入业务数据库，供历史记录查看。
 """
 
 import json
 import random
 import re
-import sqlite3
 import time
 from typing import Any
 
@@ -36,6 +35,7 @@ from api.exam_schemas import (
 )
 from model.factory import get_chat_model
 from rag.knowledge_store import KnowledgeStore
+from utils.database_connection import IntegrityErrorTypes
 from utils.logger_handler import logger
 from utils.qdrant_options import get_qdrant_client_options, normalize_qdrant_collection_name
 
@@ -221,7 +221,7 @@ def _deduplicate_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def _session_summary(row: dict[str, Any]) -> ExamSessionSummary:
-    """把 SQLite 考试会话记录转换成响应模型。"""
+    """把数据库考试会话记录转换成响应模型。"""
 
     return ExamSessionSummary(
         session_id=row["session_id"],
@@ -244,7 +244,7 @@ def _session_summary(row: dict[str, Any]) -> ExamSessionSummary:
 
 
 def _parse_json_field(value: str | None, default: Any) -> Any:
-    """解析 SQLite JSON 字段，失败时返回默认值。"""
+    """解析数据库 JSON 字段，失败时返回默认值。"""
 
     if not value:
         return default
@@ -255,7 +255,7 @@ def _parse_json_field(value: str | None, default: Any) -> Any:
 
 
 def _question_from_row(row: dict[str, Any]) -> ExamConversationQuestion:
-    """把 SQLite 考试题目记录转换成前端展示题目。"""
+    """把数据库考试题目记录转换成前端展示题目。"""
 
     return ExamConversationQuestion(
         exam_question_id=row["exam_question_id"],
@@ -296,6 +296,68 @@ def _display_choice_options(options: list[str]) -> list[str]:
         else:
             result.append(f"{label}. {text}")
     return result
+
+
+def _strip_choice_label(option: object) -> str:
+    """去掉模型可能额外生成的 A./A、/A． 这类选项前缀。"""
+
+    text = str(option or "").strip()
+    return re.sub(r"^[A-Z][.、．]\s*", "", text, count=1, flags=re.IGNORECASE).strip()
+
+
+def _is_choice_label_text(value: object) -> bool:
+    """判断文本是否只是 A/B/C 这类选项编号，避免把编号误当成选项内容。"""
+
+    return bool(re.fullmatch(r"[A-Z]", str(value or "").strip(), flags=re.IGNORECASE))
+
+
+def _clean_generated_choice_options(options: list[str]) -> list[str]:
+    """清洗模型生成的选择题选项，统一去编号、去空值和去重。"""
+
+    clean_options: list[str] = []
+    for option in options:
+        clean_option = _strip_choice_label(option)
+        if not clean_option or _is_choice_label_text(clean_option):
+            continue
+        if clean_option not in clean_options:
+            clean_options.append(clean_option)
+    return clean_options
+
+
+def _resolve_generated_choice_answer(answer: object, raw_options: list[str], clean_options: list[str]) -> str:
+    """把模型返回的单选答案解析成真实选项文本，而不是直接保留 A/B/C。"""
+
+    clean_answer = str(answer or "").strip()
+    if not clean_answer:
+        return ""
+    stripped_answer = _strip_choice_label(clean_answer)
+    if stripped_answer in clean_options:
+        return stripped_answer
+    label_match = re.match(r"^([A-Z])(?:[.、．]|\s|$)", clean_answer, flags=re.IGNORECASE)
+    if label_match:
+        option_index = ord(label_match.group(1).upper()) - ord("A")
+        if 0 <= option_index < len(raw_options):
+            mapped_option = _strip_choice_label(raw_options[option_index])
+            if mapped_option and not _is_choice_label_text(mapped_option):
+                return mapped_option
+        if 0 <= option_index < len(clean_options):
+            return clean_options[option_index]
+    return stripped_answer
+
+
+def _resolve_generated_multiple_choice_answers(
+        answer: object,
+        raw_options: list[str],
+        clean_options: list[str],
+) -> list[str]:
+    """把模型返回的多选答案列表解析成真实选项文本列表。"""
+
+    resolved_answers: list[str] = []
+    for item in _normalize_string_list(answer, max_items=6):
+        resolved_answer = _resolve_generated_choice_answer(item, raw_options, clean_options)
+        if resolved_answer and resolved_answer not in resolved_answers:
+            resolved_answers.append(resolved_answer)
+    return resolved_answers
 
 
 def _option_label_map(options: list[str]) -> dict[str, str]:
@@ -379,7 +441,7 @@ def _previous_multiple_choice_questions_all_select(session_id: str, round_no: in
 
 
 def _analysis_from_row(row: dict[str, Any]) -> ExamAnswerAnalysis | None:
-    """把 SQLite 题目分析字段转换成响应模型。"""
+    """把数据库题目分析字段转换成响应模型。"""
 
     if row.get("analysis_json") is None:
         return None
@@ -573,11 +635,12 @@ def _validate_generated_question(raw_result: dict[str, Any], requested_type: str
     if not prompt:
         raise ValueError("模型生成题干为空")
 
-    options = _normalize_string_list(raw_result.get("options"), max_items=6)
+    raw_options = _normalize_string_list(raw_result.get("options"), max_items=6)
+    options = _clean_generated_choice_options(raw_options)
     correct_answer = raw_result.get("correct_answer")
 
     if requested_type == "single_choice":
-        correct_text = str(correct_answer or "").strip()
+        correct_text = _resolve_generated_choice_answer(correct_answer, raw_options, options)
         if len(options) < 4 or not correct_text:
             raise ValueError("单选题选项或答案不完整")
         if correct_text not in options:
@@ -585,7 +648,7 @@ def _validate_generated_question(raw_result: dict[str, Any], requested_type: str
         return prompt, options[:4], correct_text
 
     if requested_type == "multiple_choice":
-        correct_items = _normalize_string_list(correct_answer, max_items=6)
+        correct_items = _resolve_generated_multiple_choice_answers(correct_answer, raw_options, options)
         if len(options) < 4 or len(correct_items) < 2:
             raise ValueError("多选题选项或答案不完整")
         missing_answers = [item for item in correct_items if item not in options]
@@ -738,6 +801,7 @@ def _build_conversation_question(
         random_generator: random.Random,
         max_score: float,
         model_mode: str | None = None,
+        prefer_model: bool = True,
 ) -> dict[str, Any]:
     """先用模型把原始 QA 润色成正式考试题，失败时回退到规则生成。"""
 
@@ -749,6 +813,14 @@ def _build_conversation_question(
         random_generator=random_generator,
         max_score=max_score,
     )
+    if not prefer_model:
+        # 首题优先快速返回，避免用户点击“开始测评”后被 LLM 命题耗时卡住。
+        logger.info(
+            "[考试] 已使用快速规则生成题目 题型=%s 来源题目编号=%s",
+            fallback_question["question_type"],
+            fallback_question["source_question_id"],
+        )
+        return fallback_question
     try:
         prompt, options, correct_answer = _generate_question_with_model(
             question=str(item["metadata"].get("question") or "").strip(),
@@ -936,6 +1008,7 @@ def _build_exam_question_rows(
         seed: int | None,
         max_score: float,
         start_round: int = 1,
+        prefer_model: bool = True,
 ) -> None:
     """按轮次生成并保存考试题目，已存在的轮次会自动跳过。"""
 
@@ -952,6 +1025,7 @@ def _build_exam_question_rows(
             random_generator=question_random,
             max_score=max_score,
             model_mode=model_mode,
+            prefer_model=prefer_model,
         )
         if (
                 _is_all_select_multiple_choice(
@@ -975,7 +1049,7 @@ def _build_exam_question_rows(
             )
         try:
             _store().add_exam_question(session_id=session_id, round_no=round_no, **question_data)
-        except sqlite3.IntegrityError:
+        except IntegrityErrorTypes:
             logger.info("[考试] 题目已由其他任务生成，跳过重复写入 会话编号=%s 轮次=%s", session_id, round_no)
 
 
@@ -1147,7 +1221,7 @@ def start_exam_session(request: ExamStartRequest, background_tasks: BackgroundTa
         metadata={"seed": exam_seed, "user_seed": request.seed},
     )
 
-    # 第一轮同步生成，接口可以尽快把第一题返回给前端。
+    # 第一轮用规则快速生成，接口可以尽快把第一题返回给前端；后续题目仍交给后台模型润色。
     _build_exam_question_rows(
         session_id=session["session_id"],
         selected_items=selected_items[:1],
@@ -1157,6 +1231,7 @@ def start_exam_session(request: ExamStartRequest, background_tasks: BackgroundTa
         seed=exam_seed,
         max_score=max_score,
         start_round=1,
+        prefer_model=False,
     )
     # 第 2 轮之后放到后台继续生成，减少“开始测评”的等待时间。
     background_tasks.add_task(

@@ -53,7 +53,7 @@ PROFILE_DICTIONARY_CODES = (
 
 @lru_cache(maxsize=1)
 def _service() -> SalesTrainingService:
-    """训练服务单例，复用 Qdrant 和 SQLite 连接配置。
+    """训练服务单例，复用 Qdrant 和业务数据库连接配置。
 
     lru_cache(maxsize=1) 会把第一次创建的 SalesTrainingService 缓存起来，
     后续请求复用同一个对象。它在这里的作用类似一个轻量单例。
@@ -150,7 +150,7 @@ def preview_training_batch(
 def delete_training_batch(batch_id: str) -> TrainingKnowledgeDeleteResponse:
     """删除训练资料批次。
 
-    删除采用软删除：SQLite 批次标记为 deleted，同时删除 Qdrant 中该 batch_id 的向量点。
+    删除采用软删除：业务数据库批次标记为 deleted，同时删除 Qdrant 中该 batch_id 的向量点。
     原始上传文件暂时保留，方便以后做审计或恢复。
     """
 

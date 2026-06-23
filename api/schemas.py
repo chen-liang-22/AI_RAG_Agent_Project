@@ -95,6 +95,7 @@ class HealthResponse(BaseModel):
 
     status: str  # 整体状态；ok 表示全部可用，degraded 表示部分依赖不可用
     qdrant: str  # Qdrant 状态；ok 或 unavailable
+    redis: str = "unavailable"  # Redis 状态；ok 或 unavailable
     collection_name: str  # 当前项目使用的 Qdrant collection 名称
     collections: list[str] = Field(default_factory=list)  # Qdrant 中已有的 collection 列表
     collection_points: dict[str, int] = Field(default_factory=dict)  # 每个 collection 在 Qdrant 中的向量点数量
@@ -143,7 +144,7 @@ class DictionaryGroupResponse(BaseModel):
 class KnowledgeFileResponse(BaseModel):
     """知识库文件响应体。
 
-    这个模型对应 SQLite 里的 documents 表。
+    这个模型对应 MySQL 里的 documents 表。
     前端、Swagger、Postman 看到的文件列表和文件详情都会按这个结构返回。
     """
 

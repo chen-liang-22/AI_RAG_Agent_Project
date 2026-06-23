@@ -1,3 +1,5 @@
+from typing import Any
+
 from langchain_core.documents import Document  # LangChain 的文档对象，包含 page_content 和 metadata
 from langchain_qdrant import QdrantVectorStore  # LangChain 对 Qdrant 的向量库封装
 from langchain_text_splitters import RecursiveCharacterTextSplitter  # 递归文本切分器
@@ -172,6 +174,75 @@ class VectorStoreService:
 
         return documents
 
+    def list_documents_by_metadata(
+            self,
+            field_name: str,
+            field_value: str,
+            *,
+            limit: int = 1000,
+    ) -> list[Document]:
+        """从当前 collection 按 metadata 字段读取文档。
+
+        这个方法用于“上传预览”等不需要相似度搜索的场景：
+        - 前端要按 batch_id 看本次上传切出的所有片段；
+        - 服务端要把临时 collection 的片段复制到正式 collection。
+        """
+
+        return self.scroll_documents_by_metadata(
+            field_name,
+            field_value,
+            collection_name=self.collection_name,
+            limit=limit,
+        )
+
+    def delete_by_metadata(self, field_name: str, field_value: str) -> None:
+        """从当前 collection 按 metadata 字段删除向量点。"""
+
+        self.delete_vectors_by_metadata(field_name, field_value, collection_name=self.collection_name)
+
+    def copy_points_by_metadata_to(
+            self,
+            target_service: "VectorStoreService",
+            field_name: str,
+            field_value: str,
+            *,
+            metadata_updates: dict[str, Any] | None = None,
+            limit: int = 5000,
+    ) -> int:
+        """把当前 collection 中命中 metadata 的向量点复制到目标 collection。
+
+        复制时保留已有向量，不重新调用 embedding。
+        metadata_updates 用于把临时点标记成正式发布点，例如 status=published。
+        """
+
+        return self.copy_points_by_metadata(
+            source_collection_name=self.collection_name,
+            target_collection_name=target_service.collection_name,
+            field_name=field_name,
+            field_value=field_value,
+            metadata_updates=metadata_updates,
+            limit=limit,
+        )
+
+    def update_metadata_by_metadata(
+            self,
+            field_name: str,
+            field_value: str,
+            *,
+            metadata_updates: dict[str, Any],
+            limit: int = 5000,
+    ) -> int:
+        """更新当前 collection 中命中 metadata 的点 payload。"""
+
+        return self.copy_points_by_metadata(
+            source_collection_name=self.collection_name,
+            target_collection_name=self.collection_name,
+            field_name=field_name,
+            field_value=field_value,
+            metadata_updates=metadata_updates,
+            limit=limit,
+        )
+
     def preview_file(
             self,
             *,
@@ -181,7 +252,7 @@ class VectorStoreService:
     ) -> dict:
         """读取文件样本文本并识别文档类型。
 
-        这个方法用于上传预览接口，不写 SQLite，也不写 Qdrant。
+        这个方法用于上传预览接口，不写 MySQL，也不写 Qdrant。
         """
 
         documents = self.get_file_documents(file_path)
@@ -230,7 +301,7 @@ class VectorStoreService:
         """把原始 Document 切分成可写入 Qdrant 的文档。
 
         segments / qa_items 只在内存中用于构造 Qdrant payload。
-        SQLite 不再保存知识正文或 FAQ 答案。
+        MySQL 不再保存知识正文或 FAQ 答案。
         """
 
         segments, qa_items = self.document_parser.build_segments_and_qas(
@@ -302,8 +373,12 @@ class VectorStoreService:
         """
 
         client = QdrantClient(**get_qdrant_client_options())
+        normalized_collection_name = normalize_qdrant_collection_name(collection_name)
+        if not client.collection_exists(normalized_collection_name):
+            logger.info("[Qdrant] collection 不存在，跳过向量删除 collection=%s", normalized_collection_name)
+            return
         client.delete(
-            collection_name=normalize_qdrant_collection_name(collection_name),
+            collection_name=normalized_collection_name,
             points_selector=models.FilterSelector(
                 filter=models.Filter(
                     must=[
@@ -316,6 +391,126 @@ class VectorStoreService:
             ),
             wait=True,
         )
+
+    @staticmethod
+    def scroll_documents_by_metadata(
+            field_name: str,
+            field_value: str,
+            *,
+            collection_name: str | None = None,
+            limit: int = 1000,
+    ) -> list[Document]:
+        """按 metadata 字段从 Qdrant 滚动读取 Document。
+
+        LangChain QdrantVectorStore 默认把正文放在 payload.page_content，
+        把元数据放在 payload.metadata。这里按这个结构还原为 Document。
+        """
+
+        client = QdrantClient(**get_qdrant_client_options())
+        normalized_collection_name = normalize_qdrant_collection_name(collection_name)
+        if not client.collection_exists(normalized_collection_name):
+            logger.info("[Qdrant] collection 不存在，返回空文档列表 collection=%s", normalized_collection_name)
+            return []
+
+        documents: list[Document] = []
+        next_page_offset = None
+        safe_limit = max(1, limit)
+        while len(documents) < safe_limit:
+            page_limit = min(256, safe_limit - len(documents))
+            points, next_page_offset = client.scroll(
+                collection_name=normalized_collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key=f"metadata.{field_name}",
+                            match=models.MatchValue(value=field_value),
+                        )
+                    ]
+                ),
+                limit=page_limit,
+                offset=next_page_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in points:
+                payload = point.payload or {}
+                raw_metadata = payload.get("metadata") if isinstance(payload, dict) else {}
+                metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+                content = ""
+                if isinstance(payload, dict):
+                    content = str(payload.get("page_content") or payload.get("content") or payload.get("text") or "")
+                documents.append(Document(page_content=content, metadata=metadata))
+            if next_page_offset is None:
+                break
+
+        return documents
+
+    @staticmethod
+    def copy_points_by_metadata(
+            *,
+            source_collection_name: str | None,
+            target_collection_name: str | None,
+            field_name: str,
+            field_value: str,
+            metadata_updates: dict[str, Any] | None = None,
+            limit: int = 5000,
+    ) -> int:
+        """按 metadata 复制或更新 Qdrant 点。
+
+        source 和 target 不同时是跨 collection 复制；
+        source 和 target 相同时是原地更新 payload。
+        """
+
+        client = QdrantClient(**get_qdrant_client_options())
+        source_name = normalize_qdrant_collection_name(source_collection_name)
+        target_name = normalize_qdrant_collection_name(target_collection_name)
+        if not client.collection_exists(source_name):
+            logger.info("[Qdrant] 源 collection 不存在，跳过点复制 collection=%s", source_name)
+            return 0
+        if not client.collection_exists(target_name):
+            logger.info("[Qdrant] 目标 collection 不存在，跳过点复制 collection=%s", target_name)
+            return 0
+
+        copied_count = 0
+        next_page_offset = None
+        safe_limit = max(1, limit)
+        updates = metadata_updates or {}
+        while copied_count < safe_limit:
+            page_limit = min(256, safe_limit - copied_count)
+            points, next_page_offset = client.scroll(
+                collection_name=source_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key=f"metadata.{field_name}",
+                            match=models.MatchValue(value=field_value),
+                        )
+                    ]
+                ),
+                limit=page_limit,
+                offset=next_page_offset,
+                with_payload=True,
+                with_vectors=True,
+            )
+            upsert_points: list[models.PointStruct] = []
+            for point in points:
+                if point.vector is None:
+                    continue
+                payload = dict(point.payload or {})
+                raw_metadata = payload.get("metadata")
+                metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+                metadata.update(updates)
+                payload["metadata"] = metadata
+                upsert_points.append(models.PointStruct(id=point.id, vector=point.vector, payload=payload))
+
+            if upsert_points:
+                client.upsert(collection_name=target_name, points=upsert_points, wait=True)
+                copied_count += len(upsert_points)
+
+            if next_page_offset is None:
+                break
+
+        return copied_count
 
     @staticmethod
     def list_collections() -> list[str]:

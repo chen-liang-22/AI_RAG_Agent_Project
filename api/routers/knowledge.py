@@ -244,7 +244,7 @@ def recommend_knowledge_upload(request: KnowledgeUploadRecommendRequest) -> Know
 
 @router.post("/knowledge/upload/confirm", response_model=KnowledgeUploadResponse)
 def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeUploadResponse:
-    """确认预览结果，并正式写入 SQLite 和 Qdrant。"""
+    """确认预览结果，并正式写入 MySQL 业务表和 Qdrant。"""
 
     upload_id = request.upload_id.strip()
     preview_dir, preview_path = _get_preview_file(upload_id)
@@ -375,7 +375,7 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
 
     这里的“删除”是知识库层面的删除：
     - Qdrant 中该 document_id 的 points 会被删除。
-    - SQLite documents 中该文件会标记为 deleted。
+    - MySQL documents 中该文件会标记为 deleted。
 
     原始上传文件暂时保留在 uploads/ 目录中，方便排查和审计。
     如果后续希望物理删除原始文件，可以在这个接口里追加文件删除逻辑。

@@ -1,11 +1,10 @@
 import json
-import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterator
 
-from utils.path_tool import get_abs_path
+from utils.database_connection import database_context, is_mysql_runtime
 
 
 def utc_now_text() -> str:
@@ -15,24 +14,24 @@ def utc_now_text() -> str:
     timespec="seconds" 表示只保留到秒，避免数据库里出现太长的小数秒。
     """
 
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.utcnow().isoformat(timespec="seconds", sep=" ")
 
 
 class TrainingRepository:
-    """销售训练 SQLite 仓储。
+    """销售训练业务仓储。
 
     训练域表较多，独立仓储能避免把 KnowledgeStore 继续膨胀。
     """
 
     def __init__(self, db_path: str | None = None):
-        # db_path 允许测试时传入临时数据库；线上默认复用 storage/knowledge.db。
-        self.db_path = db_path or get_abs_path("storage/knowledge.db")
+        # db_path 只给单元测试传入临时兼容库；运行时默认走 config/database.yml 中的 MySQL。
+        self.db_path = db_path
         # 对象创建时确保表存在，类似 Java 构造器里初始化 DAO 依赖。
         self.init_db()
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        """打开 SQLite 连接，自动提交或回滚。
+    def connect(self) -> Iterator[Any]:
+        """打开业务数据库连接，自动提交或回滚。
 
         @contextmanager 让这个函数可以写成：
 
@@ -45,28 +44,19 @@ class TrainingRepository:
         - 最后都会 close 连接。
         """
 
-        conn = sqlite3.connect(self.db_path)
-        # row_factory 设置后，查询结果可以用 row["字段名"] 读取，比 tuple 下标更清晰。
-        conn.row_factory = sqlite3.Row
-        # SQLite 默认不强制外键，这里显式开启，避免脏数据。
-        conn.execute("PRAGMA foreign_keys = ON")
-        try:
+        with database_context(self.db_path) as conn:
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def init_db(self) -> None:
         """初始化一期需要的训练表。
 
-        SQLite 的 CREATE TABLE IF NOT EXISTS 是幂等操作，重复执行不会清空旧数据。
-        这里没有引入 Alembic 迁移工具，是因为一期表结构还比较轻。
+        MySQL 模式下，表结构由 docs/mysql初始化建表和基础数据.sql 管理。
+        显式传入 db_path 的测试场景仍使用临时兼容库自动建表。
         """
 
         with self.connect() as conn:
+            if is_mysql_runtime(self.db_path):
+                return
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS training_knowledge_batches (
@@ -104,28 +94,7 @@ class TrainingRepository:
             self._ensure_column(conn, "training_knowledge_batches", "previous_batch_id", "TEXT")
             self._ensure_column(conn, "training_knowledge_batches", "is_current", "INTEGER NOT NULL DEFAULT 0")
             self._migrate_training_batch_versions(conn)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS training_knowledge_chunks (
-                    chunk_id TEXT PRIMARY KEY,
-                    batch_id TEXT NOT NULL,
-                    qdrant_point_id TEXT,
-                    chunk_text TEXT NOT NULL,
-                    source_type TEXT,
-                    profile_type TEXT,
-                    task_type TEXT,
-                    industry TEXT,
-                    difficulty TEXT,
-                    case_part TEXT,
-                    visibility TEXT,
-                    metadata_json TEXT,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(batch_id) REFERENCES training_knowledge_batches(batch_id)
-                )
-                """
-            )
-            # training_knowledge_chunks：保存训练知识切片明细。
-            # Qdrant 负责向量检索；SQLite 负责可追溯的结构化记录。
+            self._drop_training_knowledge_chunks(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS training_role_profiles (
@@ -272,10 +241,10 @@ class TrainingRepository:
         return json.dumps(data, ensure_ascii=False)
 
     @staticmethod
-    def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_definition: str) -> None:
-        """给旧 SQLite 表补字段。
+    def _ensure_column(conn: Any, table_name: str, column_name: str, column_definition: str) -> None:
+        """给测试兼容库的旧表补字段。
 
-        SQLite 没有 ADD COLUMN IF NOT EXISTS，所以先用 PRAGMA table_info 读取已有字段。
+        本地兼容库没有 ADD COLUMN IF NOT EXISTS，所以先用 PRAGMA table_info 读取已有字段。
         table_name 和 column_name 都是代码里的固定值，不接收外部输入。
         """
 
@@ -285,10 +254,10 @@ class TrainingRepository:
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
 
     @staticmethod
-    def _migrate_training_plans_allow_duplicate_names(conn: sqlite3.Connection) -> None:
+    def _migrate_training_plans_allow_duplicate_names(conn: Any) -> None:
         """把旧训练方案表迁移为允许同名训练。
 
-        SQLite 不能直接删除 UNIQUE 约束，所以检测到旧表仍然把 plan_name 作为唯一字段时，
+        本地兼容库不能直接删除 UNIQUE 约束，所以检测到旧表仍然把 plan_name 作为唯一字段时，
         需要建临时表、复制数据、替换旧表。每场训练仍然由 plan_id 保证唯一。
         """
 
@@ -348,7 +317,7 @@ class TrainingRepository:
         conn.execute("ALTER TABLE training_plans_new RENAME TO training_plans")
 
     @staticmethod
-    def _migrate_training_batch_versions(conn: sqlite3.Connection) -> None:
+    def _migrate_training_batch_versions(conn: Any) -> None:
         """给历史训练资料批次补齐版本字段。
 
         老数据没有 version_group_id 和 is_current。
@@ -379,8 +348,18 @@ class TrainingRepository:
         )
 
     @staticmethod
-    def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
-        # sqlite3.Row 不是普通 dict，转成 dict 后业务层更好处理。
+    def _drop_training_knowledge_chunks(conn: Any) -> None:
+        """删除旧的训练知识切片表。
+
+        新方案把待审核切片放在临时 Qdrant，发布后复制到正式 Qdrant。
+        关系型数据库不再保存切片正文，旧表可以直接清理。
+        """
+
+        conn.execute("DROP TABLE IF EXISTS training_knowledge_chunks")
+
+    @staticmethod
+    def _row(row: Any | None) -> dict[str, Any] | None:
+        # 数据库行对象转成 dict 后，业务层更好处理。
         return dict(row) if row is not None else None
 
     def create_batch(self, **values: Any) -> dict[str, Any]:
@@ -404,7 +383,7 @@ class TrainingRepository:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    # SQLite 使用 ? 作为参数占位符，避免手动拼 SQL 导致注入风险。
+                    # 统一使用 ? 作为仓储层参数占位符，MySQL 连接层会自动转换，避免手动拼 SQL。
                     batch_id,
                     values.get("source_type"),
                     values.get("source_file"),
@@ -626,101 +605,10 @@ class TrainingRepository:
             )
         return True
 
-    def add_chunk(self, **values: Any) -> dict[str, Any]:
-        """保存一个训练知识切片明细。
-
-        注意：正文会同时写入 Qdrant 和 SQLite。
-        Qdrant 用于相似度检索；SQLite 用于前端预览、排查和追踪。
-        """
-
-        chunk_id = values.get("chunk_id") or f"chunk_{uuid.uuid4().hex}"
-        metadata = values.get("metadata") or {}
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO training_knowledge_chunks (
-                    chunk_id, batch_id, qdrant_point_id, chunk_text, source_type,
-                    profile_type, task_type, industry, difficulty, case_part,
-                    visibility, metadata_json, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    chunk_id,
-                    values["batch_id"],
-                    values.get("qdrant_point_id"),
-                    values["chunk_text"],
-                    values.get("source_type"),
-                    values.get("profile_type"),
-                    values.get("task_type"),
-                    values.get("industry"),
-                    values.get("difficulty"),
-                    values.get("case_part"),
-                    values.get("visibility"),
-                    self._json(metadata),
-                    utc_now_text(),
-                ),
-            )
-        return self.get_chunk(chunk_id) or {}
-
-    def replace_chunks(self, batch_id: str, chunks: list[dict[str, Any]]) -> None:
-        """替换某个批次的切片明细。
-
-        预览阶段会先保存切片；确认发布时如果重新解析，也可以用这个方法覆盖旧切片。
-        """
-
-        with self.connect() as conn:
-            conn.execute("DELETE FROM training_knowledge_chunks WHERE batch_id = ?", (batch_id,))
-            for values in chunks:
-                metadata = values.get("metadata") or {}
-                conn.execute(
-                    """
-                    INSERT INTO training_knowledge_chunks (
-                        chunk_id, batch_id, qdrant_point_id, chunk_text, source_type,
-                        profile_type, task_type, industry, difficulty, case_part,
-                        visibility, metadata_json, created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        values.get("chunk_id"),
-                        batch_id,
-                        values.get("qdrant_point_id"),
-                        values.get("chunk_text"),
-                        values.get("source_type"),
-                        values.get("profile_type"),
-                        values.get("task_type"),
-                        values.get("industry"),
-                        values.get("difficulty"),
-                        values.get("case_part"),
-                        values.get("visibility"),
-                        self._json(metadata),
-                        utc_now_text(),
-                    ),
-                )
-
     def get_batch(self, batch_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM training_knowledge_batches WHERE batch_id = ?", (batch_id,)).fetchone()
         return self._row(row)
-
-    def get_chunk(self, chunk_id: str) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM training_knowledge_chunks WHERE chunk_id = ?", (chunk_id,)).fetchone()
-        return self._row(row)
-
-    def list_chunks(self, batch_id: str) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM training_knowledge_chunks
-                WHERE batch_id = ?
-                ORDER BY created_at, chunk_id
-                """,
-                (batch_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
 
     def create_plan(self, **values: Any) -> dict[str, Any]:
         """创建训练方案。

@@ -98,7 +98,7 @@ flowchart TD
 
     A --> R["VectorIndexService"]
     R --> S["Qdrant"]
-    A --> T["KnowledgeStore SQLite"]
+    A --> T["KnowledgeStore MySQL"]
 ```
 
 ## 五、文件处理策略设计

@@ -1,6 +1,5 @@
 import json
 import os
-import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -8,7 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from rag.profile_dictionaries import PROFILE_DICTIONARY_ITEMS
-from utils.path_tool import get_abs_path
+from utils.database_connection import database_context, is_mysql_runtime
 
 
 DEFAULT_DICTIONARY_ITEMS = [
@@ -164,12 +163,13 @@ DEFAULT_DICTIONARY_ITEMS = [
         "items": [
             ("parsing", "解析中", None, 1, "文件已保存，正在解析和切片", {"tag_type": "warning"}),
             ("pending_review", "待确认", None, 2, "切片和质量评估已完成，等待人工确认发布", {"tag_type": "warning"}),
-            ("embedding", "发布中", None, 3, "正在生成向量并写入 Qdrant", {"tag_type": "warning"}),
+            ("embedding", "发布中", None, 3, "正在从临时向量库发布到正式向量库", {"tag_type": "warning"}),
             ("published", "已发布", None, 4, "训练资料已完成向量入库，可以参与训练检索", {"tag_type": "success"}),
             ("archived", "历史版本", None, 5, "同一资料的新版本已发布，该版本不再参与训练检索，可按需回滚", {"tag_type": "info"}),
-            ("parsing_failed", "解析失败", None, 6, "文件解析、切片或向量入库失败，需要查看错误信息", {"tag_type": "danger"}),
-            ("deleted", "已删除", None, 7, "批次已软删除，列表不再展示，相关向量点会被删除", {"tag_type": "info"}),
-            ("duplicated", "重复复用", None, 8, "上传响应状态，表示文件 MD5 命中已发布批次并复用历史数据", {"tag_type": "info"}),
+            ("parsing_failed", "解析失败", None, 6, "文件解析或临时向量库写入失败，需要查看错误信息", {"tag_type": "danger"}),
+            ("publish_failed", "发布失败", None, 7, "从临时向量库发布到正式向量库失败，可重试发布", {"tag_type": "danger"}),
+            ("deleted", "已删除", None, 8, "批次已软删除，列表不再展示，相关向量点会被删除", {"tag_type": "info"}),
+            ("duplicated", "重复复用", None, 9, "上传响应状态，表示文件 MD5 命中已发布批次并复用历史数据", {"tag_type": "info"}),
         ],
     },
 ] + PROFILE_DICTIONARY_ITEMS
@@ -178,13 +178,13 @@ DEFAULT_DICTIONARY_ITEMS = [
 def utc_now_text() -> str:
     """返回统一格式的 UTC 时间字符串。"""
 
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.utcnow().isoformat(timespec="seconds", sep=" ")
 
 
 class KnowledgeStore:
-    """SQLite 业务元数据存储。
+    """业务元数据存储。
 
-    最终设计里，SQLite 只保存业务状态：
+    最终设计里，关系型数据库只保存业务状态：
     - documents：文件管理、索引状态、版本、chunk_count。
     - conversations / conversation_messages：会话历史。
 
@@ -192,29 +192,24 @@ class KnowledgeStore:
     """
 
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or get_abs_path("storage/knowledge.db")
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.db_path = db_path
+        if self.db_path:
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self.init_db()
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        """打开 SQLite 连接，并在 SQL 执行结束后自动提交和关闭。"""
+    def connect(self) -> Iterator[Any]:
+        """打开业务数据库连接，并在 SQL 执行结束后自动提交和关闭。"""
 
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-
-        try:
+        with database_context(self.db_path) as conn:
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def init_db(self) -> None:
         with self.connect() as conn:
+            if is_mysql_runtime(self.db_path):
+                # MySQL 表结构由 docs/mysql初始化建表和基础数据.sql 管理，启动时只同步默认字典。
+                self.seed_default_dictionaries(conn)
+                return
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
@@ -412,7 +407,7 @@ class KnowledgeStore:
             conn.execute("DROP TABLE IF EXISTS document_segments")
             conn.execute("DROP TABLE IF EXISTS knowledge_units")
 
-    def seed_default_dictionaries(self, conn: sqlite3.Connection) -> None:
+    def seed_default_dictionaries(self, conn: Any) -> None:
         """初始化系统默认字典项，已有字典项只更新展示信息。"""
 
         # 清理已经废弃的旧字典，避免旧库升级后前端继续展示过期口径。
@@ -628,7 +623,7 @@ class KnowledgeStore:
 
     @staticmethod
     def _resolve_dictionary_parent_id(
-            conn: sqlite3.Connection,
+            conn: Any,
             dictionary_code: str,
             parent_item_id: str | None,
             parent_item_code: str | None,
@@ -663,7 +658,7 @@ class KnowledgeStore:
         return str(row["dictionary_item_id"])
 
     @staticmethod
-    def _resolve_dictionary_item_level(conn: sqlite3.Connection, parent_item_id: str | None) -> int:
+    def _resolve_dictionary_item_level(conn: Any, parent_item_id: str | None) -> int:
         """根据父级字典项计算当前字典项层级。"""
 
         if not parent_item_id:
@@ -730,7 +725,9 @@ class KnowledgeStore:
         return default_code
 
     @staticmethod
-    def _ensure_document_columns(conn: sqlite3.Connection) -> None:
+    def _ensure_document_columns(conn: Any) -> None:
+        if is_mysql_runtime():
+            return
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
         migrations = {
             "collection_name": "ALTER TABLE documents ADD COLUMN collection_name TEXT NOT NULL DEFAULT 'agent'",
@@ -742,7 +739,7 @@ class KnowledgeStore:
                 conn.execute(statement)
 
     @staticmethod
-    def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    def row_to_dict(row: Any | None) -> dict[str, Any] | None:
         return dict(row) if row else None
 
     def create_document(

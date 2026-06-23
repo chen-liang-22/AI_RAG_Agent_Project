@@ -108,7 +108,7 @@ def _save_chat_exchange(
         model_name: str | None = None,
         metadata: dict | None = None,
 ) -> None:
-    """把一轮用户问题和助手回答保存到 SQLite 会话历史。"""
+    """把一轮用户问题和助手回答保存到业务数据库会话历史。"""
 
     store = _get_knowledge_store()
     store.save_chat_exchange(

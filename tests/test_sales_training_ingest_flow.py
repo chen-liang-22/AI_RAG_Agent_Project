@@ -11,32 +11,86 @@ from training.strategies.knowledge_ingest_strategy import TrainingChunk
 class FakeVectorStore:
     """测试用向量库，记录写入文档但不调用真实 embedding。"""
 
-    def __init__(self):
-        self.documents = []
+    def __init__(self, owner):
+        self.owner = owner
 
     def add_documents(self, documents):
         """模拟 Qdrant 写入。"""
 
-        self.documents.extend(documents)
+        self.owner.documents.extend(documents)
 
 
 class FakeVectorService:
     """测试用向量服务。"""
 
-    def __init__(self):
-        self.vector_store = FakeVectorStore()
+    def __init__(self, collection_name="fake_collection"):
+        self.collection_name = collection_name
+        self.documents = []
+        self.vector_store = FakeVectorStore(self)
+
+    def delete_by_metadata(self, field_name, field_value):
+        """模拟按 metadata 删除向量点。"""
+
+        self.documents = [
+            document
+            for document in self.documents
+            if document.metadata.get(field_name) != field_value
+        ]
+
+    def list_documents_by_metadata(self, field_name, field_value, *, limit=1000):
+        """模拟按 metadata 读取向量点。"""
+
+        return [
+            document
+            for document in self.documents
+            if document.metadata.get(field_name) == field_value
+        ][:limit]
+
+    def copy_points_by_metadata_to(self, target_service, field_name, field_value, *, metadata_updates=None, limit=5000):
+        """模拟从临时库复制向量点到正式库。"""
+
+        copied = []
+        for document in self.list_documents_by_metadata(field_name, field_value, limit=limit):
+            metadata = dict(document.metadata)
+            metadata.update(metadata_updates or {})
+            copied.append(type(document)(page_content=document.page_content, metadata=metadata))
+        target_service.documents.extend(copied)
+        return len(copied)
+
+    def update_metadata_by_metadata(self, field_name, field_value, *, metadata_updates, limit=5000):
+        """模拟原地更新 metadata。"""
+
+        updated_count = 0
+        for document in self.documents:
+            if document.metadata.get(field_name) != field_value:
+                continue
+            document.metadata.update(metadata_updates)
+            updated_count += 1
+            if updated_count >= limit:
+                break
+        return updated_count
 
     def search_documents(self, query, *, k=None, filters=None):
         """模拟按 batch_id 过滤后的向量检索。"""
 
         batch_ids = (filters or {}).get("batch_id") or []
         documents = []
-        for document in self.vector_store.documents:
+        for document in self.documents:
             if batch_ids and document.metadata.get("batch_id") not in batch_ids:
                 continue
             document.metadata["_vector_score"] = 0.99
             documents.append(document)
         return documents[: k or 3]
+
+
+def attach_fake_vector_services(service):
+    """给服务挂上测试用正式库和临时库。"""
+
+    published_service = FakeVectorService("sales_training_cases")
+    staging_service = FakeVectorService("sales_training_cases_staging")
+    service.vector_service = published_service
+    service.staging_vector_service = staging_service
+    return published_service, staging_service
 
 
 def test_training_ingest_quality_detects_weak_split():
@@ -60,12 +114,11 @@ def test_training_ingest_quality_detects_weak_split():
 
 
 def test_training_upload_waits_for_manual_publish(tmp_path):
-    """上传阶段只生成预览切片，确认发布后才写入向量库。"""
+    """上传阶段只写临时向量库，确认发布后才进入正式向量库。"""
 
     repository = TrainingRepository(str(tmp_path / "training.db"))
     service = SalesTrainingService(repository=repository)
-    fake_vector_service = FakeVectorService()
-    service.vector_service = fake_vector_service
+    fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     content = "\n".join([
         "一、客户案例",
         "企业：某外贸公司",
@@ -85,18 +138,24 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
     )
 
     assert upload_result.status == "pending_review"
-    assert upload_result.point_count == 0
+    assert upload_result.point_count == upload_result.chunk_count
     assert upload_result.quality_report["score"] > 0
-    assert fake_vector_service.vector_store.documents == []
+    assert fake_vector_service.documents == []
+    assert len(fake_staging_service.documents) == upload_result.chunk_count
     batch = repository.get_batch(upload_result.batch_id)
     assert batch["status"] == "pending_review"
-    assert len(repository.list_chunks(upload_result.batch_id)) > 0
+    with repository.connect() as conn:
+        chunk_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'training_knowledge_chunks'"
+        ).fetchone()
+    assert chunk_table is None
 
     publish_result = service.publish_batch(upload_result.batch_id)
 
     assert publish_result.status == "published"
     assert publish_result.point_count == upload_result.chunk_count
-    assert len(fake_vector_service.vector_store.documents) == upload_result.chunk_count
+    assert len(fake_vector_service.documents) == upload_result.chunk_count
+    assert fake_staging_service.documents == []
     published_batch = repository.get_batch(upload_result.batch_id)
     assert published_batch["status"] == "published"
 
@@ -106,7 +165,7 @@ def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeyp
 
     repository = TrainingRepository(str(tmp_path / "training.db"))
     service = SalesTrainingService(repository=repository)
-    service.vector_service = FakeVectorService()
+    fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     captured_model_modes = []
 
     class FakeFallbackSplitter:
@@ -161,7 +220,8 @@ def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeyp
     assert upload_result.status == "pending_review"
     assert upload_result.quality_report["selected_splitter"] == "llm_fallback"
     assert upload_result.quality_report["llm_fallback_used"] is True
-    assert len(repository.list_chunks(upload_result.batch_id)) == 4
+    assert len(fake_staging_service.documents) == 4
+    assert fake_vector_service.documents == []
     assert captured_model_modes == ["medium"]
 
 
@@ -170,7 +230,7 @@ def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
 
     repository = TrainingRepository(str(tmp_path / "training.db"))
     service = SalesTrainingService(repository=repository)
-    service.vector_service = FakeVectorService()
+    fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     captured_model_modes = []
 
     class FakeFallbackSplitter:
@@ -237,10 +297,12 @@ def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
     assert reparse_result.status == "pending_review"
     assert reparse_result.quality_report["selected_splitter"] == "llm_fallback"
     assert reparse_result.quality_report["manual_reparse"] is True
-    assert reparse_result.point_count == 0
-    saved_chunks = repository.list_chunks(upload_result.batch_id)
+    assert reparse_result.point_count == 4
+    saved_chunks = service.list_chunks(upload_result.batch_id).chunks
     assert len(saved_chunks) == 4
-    assert all("LLM" in row["chunk_text"] for row in saved_chunks)
+    assert all("LLM" in row.chunk_text for row in saved_chunks)
+    assert fake_vector_service.documents == []
+    assert len(fake_staging_service.documents) == 4
     saved_batch = repository.get_batch(upload_result.batch_id)
     assert saved_batch["status"] == "pending_review"
     assert captured_model_modes == ["low"]
@@ -251,6 +313,7 @@ def test_training_preview_uses_saved_chunks(tmp_path):
 
     repository = TrainingRepository(str(tmp_path / "training.db"))
     service = SalesTrainingService(repository=repository)
+    attach_fake_vector_services(service)
     content = "\n".join([
         "一、客户案例",
         "企业：某外贸公司",
@@ -274,7 +337,7 @@ def test_training_publish_writes_validation_report(tmp_path):
 
     repository = TrainingRepository(str(tmp_path / "training.db"))
     service = SalesTrainingService(repository=repository)
-    service.vector_service = FakeVectorService()
+    attach_fake_vector_services(service)
     content = "\n".join([
         "一、客户案例",
         "企业：某外贸公司",
@@ -295,18 +358,12 @@ def test_training_publish_writes_validation_report(tmp_path):
     assert saved_report["publish_validation"]["hit_count"] > 0
 
 
-def test_training_publish_archives_previous_version_and_rollback(tmp_path, monkeypatch):
+def test_training_publish_archives_previous_version_and_rollback(tmp_path):
     """同名资料发布新版本后旧版本应归档，并支持回滚为当前版本。"""
 
     repository = TrainingRepository(str(tmp_path / "training.db"))
     service = SalesTrainingService(repository=repository)
-    service.vector_service = FakeVectorService()
-    deleted_batch_ids = []
-
-    monkeypatch.setattr(
-        "training.services.sales_training_service.VectorStoreService.delete_vectors_by_metadata",
-        lambda key, value, collection_name=None: deleted_batch_ids.append(value),
-    )
+    fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
 
     first_content = "\n".join([
         "一、客户案例",
@@ -340,29 +397,32 @@ def test_training_publish_archives_previous_version_and_rollback(tmp_path, monke
     assert second_batch["status"] == "published"
     assert second_batch["is_current"] == 1
     assert second_batch["version_no"] == 2
-    assert first_publish.batch_id in deleted_batch_ids
+    first_documents = fake_vector_service.list_documents_by_metadata("batch_id", first_publish.batch_id)
+    assert first_documents
+    assert all(document.metadata["status"] == "archived" for document in first_documents)
+    assert fake_staging_service.documents == []
 
     rollback_result = service.rollback_batch(first_publish.batch_id)
 
     rolled_back_batch = repository.get_batch(first_publish.batch_id)
     archived_second_batch = repository.get_batch(second_publish.batch_id)
+    rolled_back_documents = fake_vector_service.list_documents_by_metadata("batch_id", first_publish.batch_id)
+    second_documents = fake_vector_service.list_documents_by_metadata("batch_id", second_publish.batch_id)
     assert rollback_result.version_no == 1
     assert rolled_back_batch["status"] == "published"
     assert rolled_back_batch["is_current"] == 1
     assert archived_second_batch["status"] == "archived"
     assert archived_second_batch["is_current"] == 0
+    assert all(document.metadata["status"] == "published" for document in rolled_back_documents)
+    assert all(document.metadata["status"] == "archived" for document in second_documents)
 
 
-def test_training_list_batch_versions_returns_version_chain(tmp_path, monkeypatch):
+def test_training_list_batch_versions_returns_version_chain(tmp_path):
     """版本链接口应返回同一版本组内的全部未删除版本。"""
 
     repository = TrainingRepository(str(tmp_path / "training.db"))
     service = SalesTrainingService(repository=repository)
-    service.vector_service = FakeVectorService()
-    monkeypatch.setattr(
-        "training.services.sales_training_service.VectorStoreService.delete_vectors_by_metadata",
-        lambda key, value, collection_name=None: None,
-    )
+    attach_fake_vector_services(service)
 
     first_content = "\n".join([
         "一、客户案例",

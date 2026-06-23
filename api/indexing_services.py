@@ -28,7 +28,7 @@ def _index_document(
 ) -> dict:
     """把 documents 表中的文件解析、分片、向量化并写入 Qdrant。
 
-    这个函数把“修改 SQLite 状态”和“写 Qdrant”封装在一起，上传和重建索引都复用它。
+    这个函数把“修改业务数据库状态”和“写 Qdrant”封装在一起，上传和重建索引都复用它。
     """
 
     document_id = document["document_id"]

@@ -16,3 +16,6 @@ pyyaml==6.0.3
 numpy==2.4.6
 pydantic==2.13.4
 pydantic-core==2.46.4
+sqlalchemy==2.0.45
+pymysql==1.1.2
+redis==7.1.0

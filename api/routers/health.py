@@ -5,6 +5,7 @@ from api.schemas import HealthResponse
 from rag.knowledge_store import KnowledgeStore
 from utils.logger_handler import logger
 from utils.qdrant_options import get_qdrant_client_options, get_qdrant_collection_name
+from utils.redis_client import get_redis_client
 
 router = APIRouter()
 
@@ -35,10 +36,17 @@ def health() -> HealthResponse:
         collection_points = {}  # Qdrant 不可用时无法统计点数，返回空字典
         qdrant_status = _service_status("unavailable")  # 标记 Qdrant 不可用
 
-    status = _service_status("ok") if qdrant_status == _service_status("ok") else _service_status("degraded")
+    # Redis 是缓存和任务状态加速层，不可用时主业务仍可降级运行。
+    redis_status = _service_status("ok") if get_redis_client().is_available() else _service_status("unavailable")
+    status = (
+        _service_status("ok")
+        if qdrant_status == _service_status("ok") and redis_status == _service_status("ok")
+        else _service_status("degraded")
+    )
     return HealthResponse(
         status=status,  # 返回整体状态
         qdrant=qdrant_status,  # 返回 Qdrant 状态
+        redis=redis_status,  # 返回 Redis 状态
         collection_name=collection_name,  # 返回当前 collection 名称
         collections=collections,  # 返回 Qdrant collection 列表
         collection_points=collection_points,  # 返回每个 collection 的真实向量点数量

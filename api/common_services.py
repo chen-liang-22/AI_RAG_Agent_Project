@@ -1,3 +1,5 @@
+from datetime import date, datetime
+
 from fastapi import HTTPException
 
 from api.schemas import KnowledgeFileResponse
@@ -8,7 +10,6 @@ from utils.qdrant_options import get_qdrant_collection_name
 def _get_knowledge_store() -> KnowledgeStore:
     """创建知识库元数据仓库。
 
-    KnowledgeStore 内部使用 SQLite。
     每次请求创建一个轻量对象即可，真正的数据库连接只在执行 SQL 时短暂打开。
     """
 
@@ -44,10 +45,20 @@ def _normalize_document_structure_type(
     raise HTTPException(status_code=400, detail=f"文档结构类型只支持：{supported_text}")
 
 
-def _document_to_response(document: dict) -> KnowledgeFileResponse:
-    """把 SQLite 文档记录转换成 FastAPI 响应模型。
+def _format_response_time(value: object) -> str:
+    """把数据库时间字段统一转换成响应字符串。"""
 
-    SQLite 取出来的数字字段有时可能是字符串或兼容类型，这里统一转成 int，
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds", sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
+def _document_to_response(document: dict) -> KnowledgeFileResponse:
+    """把数据库文档记录转换成 FastAPI 响应模型。
+
+    数据库取出来的数字字段有时可能是字符串或兼容类型，这里统一转成 int，
     这样前端拿到的数据类型更稳定。
     """
 
@@ -67,7 +78,7 @@ def _document_to_response(document: dict) -> KnowledgeFileResponse:
             document.get("split_strategy"),
         ),
         split_strategy=_normalize_split_strategy(document.get("split_strategy")),
-        created_at=document["created_at"],
-        updated_at=document["updated_at"],
+        created_at=_format_response_time(document["created_at"]),
+        updated_at=_format_response_time(document["updated_at"]),
         error_message=document.get("error_message"),
     )

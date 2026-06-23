@@ -1,0 +1,13 @@
+# Redis 缓存与任务状态配置。
+# 生产环境建议只在环境变量里保存密码；本地开发可使用 docker run 命令里的默认密码。
+enabled: true
+host: "127.0.0.1"
+port: 6379
+db: 0
+password_env: "REDIS_PASSWORD"
+password: "1234qwer"
+socket_timeout_seconds: 2
+socket_connect_timeout_seconds: 2
+key_prefix: "ai_rag_agent"
+default_ttl_seconds: 1800
+lock_timeout_seconds: 30

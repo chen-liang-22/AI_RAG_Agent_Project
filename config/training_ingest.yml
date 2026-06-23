@@ -1,5 +1,12 @@
 # 销售训练资料入库配置。
 
+# 销售训练向量库配置。
+# published：正式训练资料向量库，只有人工发布成功的数据参与训练检索。
+# staging：临时待审核向量库，上传和重新切分后的切片先写这里，发布成功后会清理对应 batch_id。
+collections:
+  published: "sales_training_cases"
+  staging: "sales_training_cases_staging"
+
 # LMS 场景案例资料切分配置。
 lms_case:
   # 中文编号标题识别规则。

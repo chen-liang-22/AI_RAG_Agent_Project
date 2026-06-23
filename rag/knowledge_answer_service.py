@@ -179,7 +179,7 @@ class KnowledgeAnswerService:
 
     @staticmethod
     def _history_to_messages(history: list[dict]) -> list[AnyMessage]:
-        """把 SQLite 会话历史转换成 LangChain 消息。"""
+        """把数据库会话历史转换成 LangChain 消息。"""
 
         messages: list[AnyMessage] = []
         for item in history[-12:]:

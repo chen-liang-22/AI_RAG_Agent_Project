@@ -16,7 +16,7 @@ Docker 部署
 
 ```text
 知识答案只走 Qdrant。
-SQLite 只做业务元数据。
+MySQL 只做业务元数据。
 LLM 负责 query planning 和自然回答。
 ```
 
@@ -36,18 +36,18 @@ LLM 负责 query planning 和自然回答。
 | FastAPI 基础接口 | 已完成 | 已有 `/chat`、`/chat/stream`、`/knowledge/*`、`/health` 等接口 |
 | Vue 3 前端 | 已完成 | 已有聊天页面、知识库上传、流式/非流式切换 |
 | Qdrant 服务 | 已完成 | 已支持 Docker / Docker Compose 启动 |
-| Qdrant 入库 | 已完成 | 已能写入 Qdrant points，入库流程不再写 SQLite 知识表 |
+| Qdrant 入库 | 已完成 | 已能写入 Qdrant points，入库流程不再写关系型知识正文表 |
 | FAQ 一问一答切分 | 已完成 | FAQ / 100问 文档按一问一答写入 Qdrant |
 | 普通文档切分 | 已完成 | 普通文档按 RecursiveCharacterTextSplitter 切分 |
-| 用户答案检索只走 Qdrant | 已完成 | 回答链路和 FAQ 精确查询均以 Qdrant 为知识来源，SQLite 只保留业务元数据 |
+| 用户答案检索只走 Qdrant | 已完成 | 回答链路和 FAQ 精确查询均以 Qdrant 为知识来源，MySQL 只保留业务元数据 |
 | direct_rag 知识直答 | 已完成 | 普通知识问答默认不走 Agent 工具判断，直接执行 RAG 检索和最终模型流式回答 |
 | adaptive Query Planner | 已完成 | 先用原问题召回并评估质量，质量不足才调用 `QueryPlannerService` 做 LLM 改写/拆分 |
 | 多 query 并行召回 | 已完成 | 已实现每个 `search_query` 单独查 Qdrant top5，多个 query 使用线程池并行召回 |
 | 精排每 query 保留 top2 | 已完成 | 已实现按子问题分组精排，每个 query 保留 2 条 |
 | LLM 最终客服回答 | 已完成 | 最终回答由 LLM 生成，要求像资深中文客服，不暴露内部资料编号或检索痕迹 |
-| SQLite 知识表清理 | 已完成 | `document_segments`、`faq_items`、`knowledge_units` 已停用，并在启动初始化时清理 |
+| 关系型知识表清理 | 已完成 | `document_segments`、`faq_items`、`knowledge_units` 已停用，不再作为运行时知识正文来源 |
 | `documents` 文件管理表 | 已完成 | 用于文件记录、状态、版本、chunk_count |
-| 会话历史 SQLite 持久化 | 已完成 | 已新增 `conversations`、`conversation_messages` 并保存 user / assistant 消息 |
+| 会话历史 MySQL 持久化 | 已完成 | 已新增 `conversations`、`conversation_messages` 并保存 user / assistant 消息 |
 | 前端 conversation_id 支持 | 已完成 | 前端会保存后端返回的 `conversation_id` 并在后续请求中携带 |
 
 ## 0. 项目整体架构
@@ -68,7 +68,7 @@ flowchart TD
 
     RAG --> QD["Qdrant 向量库"]
     RAG --> LLM["通义千问 Chat Model"]
-    API --> DB["SQLite 业务库"]
+    API --> DB["MySQL 业务库"]
 
     API --> UPLOAD["知识库上传/重建接口"]
     UPLOAD --> QD
@@ -92,7 +92,7 @@ flowchart TD
 | KnowledgeAnswerService | 默认知识直答链路，负责 RAG 上下文准备和最终模型流式回答 |
 | LangGraph Agent | 可选复杂工具编排链路，管理工具调用、会话上下文、流式输出 |
 | Qdrant | 保存知识向量和 payload，作为唯一知识检索来源 |
-| SQLite | 保存文件记录、上传状态、会话历史等业务元数据 |
+| MySQL | 保存文件记录、上传状态、会话历史等业务元数据 |
 | DashScope Chat Model | Query planning 和最终自然语言回答 |
 | DashScope Embedding Model | 文档入库和用户 query 向量化 |
 
@@ -110,7 +110,7 @@ flowchart TD
 | `rag/reranker.py` | 候选资料精排 |
 | `rag/query_planner.py` | LLM Query Planner，负责在召回质量不足时改写/拆分 search_query |
 | `rag/query_pipeline.py` | QueryAnalysis 兼容数据结构；规则意图硬匹配已停用 |
-| `rag/knowledge_store.py` | SQLite 业务元数据存储，最终只保留文件/会话管理 |
+| `rag/knowledge_store.py` | MySQL 业务元数据存储，最终只保留文件/会话管理 |
 | `model/factory.py` | Chat 模型和 Embedding 模型创建 |
 | `config/qdrant.yml` | Qdrant、切分、topK 等配置 |
 | `config/rag.yml` | 模型、聊天路由、adaptive 阈值、Query Planner 历史等配置 |
@@ -121,7 +121,7 @@ flowchart TD
 | `docker-compose.yml` | API、Qdrant、前端组合部署 |
 | `data/` | 内置知识库文件目录 |
 | `uploads/` | 用户上传文件保存目录 |
-| `storage/knowledge.db` | SQLite 本地业务数据库 |
+| `config/database.yml` | MySQL 业务数据库连接配置 |
 
 ## 1. 设计结论
 
@@ -132,8 +132,8 @@ flowchart TD
 关系型数据库只做业务元数据，不做知识答案查询。
 ```
 
-保留 SQLite 的原因是管理业务状态，例如文件上传记录、索引状态、会话历史。
-但用户问答不能再依赖 SQLite `LIKE`、`faq_items`、`document_segments` 这类关系型查询。
+保留 MySQL 业务库的原因是管理业务状态，例如文件上传记录、索引状态、会话历史。
+但用户问答不能再依赖关系型数据库 `LIKE`、`faq_items`、`document_segments` 这类关系型查询。
 
 最终职责边界：
 
@@ -141,7 +141,7 @@ flowchart TD
 | --- | --- |
 | Qdrant | 保存知识 chunk / FAQ / payload / vector，负责知识检索 |
 | LLM | 在必要时拆解用户问题、生成检索 query，并结合可用信息生成自然客服回答 |
-| SQLite | 保存文件记录、上传状态、会话历史等业务元数据 |
+| MySQL | 保存文件记录、上传状态、会话历史等业务元数据 |
 | FastAPI | 提供上传、检索、聊天、会话接口 |
 
 ## 2. 为什么不用关系型表查知识答案
@@ -164,7 +164,7 @@ flowchart TD
 
 这类问题本质是语义匹配，不是字符串匹配。
 
-如果用 SQLite：
+如果用关系型数据库做知识正文检索：
 
 ```sql
 WHERE question LIKE '%中国市场啥时候开始普及%'
@@ -180,7 +180,7 @@ query -> embedding -> Qdrant similarity search -> payload -> LLM answer
 
 ## 3. 数据存储边界
 
-### 3.1 SQLite 保留表
+### 3.1 MySQL 保留表
 
 只保留文件管理表：
 
@@ -201,7 +201,7 @@ documents
 | chunk_count | 写入 Qdrant 的 point 数量 |
 | error_message | 入库失败原因 |
 
-### 3.2 SQLite 废弃表
+### 3.2 关系型知识正文废弃表
 
 以下表不再作为最终设计保留：
 
@@ -215,12 +215,12 @@ knowledge_units
 
 ```text
 Qdrant 已经保存 page_content + metadata + vector。
-再存一份到 SQLite 会造成双写、数据不一致和查询路径混乱。
+再存一份到 MySQL 会造成双写、数据不一致和查询路径混乱。
 ```
 
 ### 3.3 会话历史表
 
-会话历史可以用 SQLite，但它和知识库答案无关。
+会话历史可以用 MySQL，但它和知识库答案无关。
 
 后续可以新增：
 
@@ -815,7 +815,7 @@ metadata.content_type = faq
 metadata.question_no = 95
 ```
 
-注意：仍然是查 Qdrant，不查 SQLite。
+注意：仍然是查 Qdrant，不查关系型数据库知识正文表。
 
 ### 7.8 100问列表
 
@@ -928,7 +928,7 @@ Qdrant 只负责找资料，不直接把 payload 原样返回给用户。
 4. 回答完成后保存 user / assistant 两条消息。
 ```
 
-会话历史可以存 SQLite。
+会话历史可以存 MySQL。
 
 这类表是业务数据，不是知识答案。
 
@@ -1144,7 +1144,7 @@ GET /knowledge/files/{document_id}
 数据来源：
 
 ```text
-SQLite documents 表。
+MySQL documents 表。
 ```
 
 用途：
@@ -1156,13 +1156,13 @@ SQLite documents 表。
 注意：
 
 ```text
-这里查 SQLite 是合理的。
+这里查 MySQL 是合理的。
 因为它查的是文件管理元数据，不是知识答案。
 ```
 
 ## 12. 代码改造清单
 
-### 12.1 删除/停用 SQLite 知识表
+### 12.1 删除/停用关系型知识正文表
 
 需要清理：
 
@@ -1426,7 +1426,7 @@ documents
 
 ```text
 1. 知识检索只走 Qdrant。
-2. SQLite 不查知识答案。
+2. MySQL 不查知识答案正文。
 3. 默认聊天走 direct_rag 知识直答，Agent 作为复杂工具编排可选链路。
 4. adaptive 模式先查原问题，召回质量不足才调用 LLM Query Planner。
 5. LLM Query Planner 只负责生成 search_query，不负责生成答案。
@@ -1434,7 +1434,7 @@ documents
 7. Qdrant payload 支持编号、来源、分类等结构化过滤。
 8. 多问题必须多 query 召回，每个 query 获取 5 条，精排保留 2 条。
 9. 二次召回复用首轮原问题结果，只查询新增 query。
-10. 会话历史可以存 SQLite，但它不是知识库。
+10. 会话历史可以存 MySQL，但它不是知识库。
 11. 最终回答要像专业客服，不暴露参考资料编号、来源编号或内部检索痕迹。
 12. 基础大众常识可以回答，具体产品能力、路径、价格、参数不能编造。
 ```

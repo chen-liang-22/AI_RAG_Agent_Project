@@ -1137,9 +1137,14 @@ LMS 案例
 产品包适配依据
 ```
 
-### 11.2 SQLite
+### 11.2 MySQL
 
-SQLite 保存业务过程。
+MySQL 保存业务过程。
+
+> 当前实现说明：本节早期设计里曾规划 MySQL 切片表保存切片正文。
+> 现在已经调整为“临时 Qdrant 预览 + 正式 Qdrant 发布”的方案：
+> MySQL 只保留 `training_knowledge_batches` 等批次元数据；
+> 旧 MySQL 切片表已取消，启动初始化会清理旧表；旧资料需要重新上传。
 
 建议新增表：
 
@@ -1147,7 +1152,6 @@ SQLite 保存业务过程。
 trainee_profiles
 customer_profile_templates
 training_knowledge_batches
-training_knowledge_chunks
 training_knowledge_supplements
 customer_profiles
 role_generation_records
@@ -1237,27 +1241,6 @@ trainee_profile_update_suggestions
 | created_by | 上传人 |
 | created_at | 创建时间 |
 | updated_at | 更新时间 |
-
-#### training_knowledge_chunks
-
-保存训练知识切片明细，保证评分证据和对话依据能追溯到具体 chunk。
-
-| 字段 | 说明 |
-| --- | --- |
-| chunk_id | 切片编号 |
-| batch_id | 所属上传批次 |
-| supplement_id | 所属知识补充记录 |
-| qdrant_point_id | 对应 Qdrant point 编号 |
-| chunk_text | 切片文本，供后台预览和证据追溯 |
-| source_type | 资料类型 |
-| profile_type | 适用画像类型 |
-| task_type | 适用训练任务 |
-| industry | 行业 |
-| difficulty | 难度 |
-| case_part | case_profile / task_requirement / standard_answer / hidden_psychology / scoring_rubric / product_fact / faq / competitor / success_case / glossary |
-| visibility | visible / hidden / scoring_only |
-| metadata_json | 额外 metadata，例如页码、标题路径、问题编号、案例编号 |
-| created_at | 创建时间 |
 
 #### training_knowledge_supplements
 
@@ -2470,7 +2453,7 @@ flowchart TD
     A["管理员上传训练知识"] --> B["后端选择上传入库策略"]
     B --> C["解析、切分、抽取 metadata"]
     C --> D[("Qdrant 训练证据库")]
-    C --> E[("SQLite 业务数据")]
+    C --> E[("MySQL 业务数据")]
 
     F["选择学员画像"] --> G["选择客户画像模板"]
     G --> H["填写场景描述和补充细节"]
@@ -2994,7 +2977,7 @@ flowchart TD
     E --> F["抽取 metadata"]
     F --> G["生成 embedding"]
     G --> H["写入 Qdrant"]
-    H --> I["写入 SQLite 批次和知识补充记录"]
+    H --> I["写入 MySQL 批次和知识补充记录"]
     I --> J["返回入库结果"]
 ```
 
@@ -3075,7 +3058,7 @@ JSON 校验
 评分计算
 最大余数法
 Qdrant 入库
-SQLite 持久化
+MySQL 持久化
 ```
 
 前端负责：
@@ -3153,7 +3136,7 @@ SQLite 持久化
 | 自查项 | 原风险 | 修正结论 |
 | --- | --- | --- |
 | 学员画像更新 | 前文容易理解成自动更新画像 | 改为生成画像更新建议，管理员确认后才更新 |
-| 训练知识落库 | 只有知识补充表，不够追踪上传过程和 chunk 证据 | 新增 training_knowledge_batches 和 training_knowledge_chunks |
+| 训练知识落库 | 关系库保存切片正文会和向量库重复，维护成本高 | 保留 training_knowledge_batches 记录批次元数据；待审核切片写入临时 Qdrant，发布后复制到正式 Qdrant |
 | 每轮检索证据 | 只在流程里提到每轮检索，轮次表没有承接字段 | sales_training_turns 增加 retrieved_chunk_ids_json 和 retrieved_evidence_json |
 | 文字响应时效 | 评分规则有响应时效，但轮次表没有耗时字段 | sales_training_turns 增加 started_at、submitted_at、response_seconds |
 | 人工复核 | 评分表有人工调整字段，但没有复核状态 | sales_training_scores 增加 review_status、confirmed_by、confirmed_at |
