@@ -7,7 +7,18 @@ from datetime import datetime
 from typing import Any
 
 from rag.profile_dictionaries import PROFILE_DICTIONARY_ITEMS
+from domain.entities import (
+    ConversationEntity,
+    ConversationMessageEntity,
+    DictionaryItemEntity,
+    DocumentEntity,
+    ExamQuestionEntity,
+    ExamSessionEntity,
+    KnowledgeStoreRow,
+)
 from utils.database_connection import database_context, is_mysql_runtime
+from utils.logger_handler import logger
+from utils.redis_client import get_redis_client
 
 
 DEFAULT_DICTIONARY_ITEMS = [
@@ -174,6 +185,10 @@ DEFAULT_DICTIONARY_ITEMS = [
     },
 ] + PROFILE_DICTIONARY_ITEMS
 
+_MYSQL_DEFAULT_DICTIONARY_SYNCED = False
+DICTIONARY_CACHE_TTL_SECONDS = 3600
+DEPRECATED_DICTIONARY_CODES = {"collection_domain_keyword", "sales_customer_profile_template"}
+
 
 def utc_now_text() -> str:
     """返回统一格式的 UTC 时间字符串。"""
@@ -205,10 +220,21 @@ class KnowledgeStore:
             yield conn
 
     def init_db(self) -> None:
+        global _MYSQL_DEFAULT_DICTIONARY_SYNCED
+
+        should_refresh_dictionary_cache = False
         with self.connect() as conn:
             if is_mysql_runtime(self.db_path):
-                # MySQL 表结构由 docs/mysql初始化建表和基础数据.sql 管理，启动时只同步默认字典。
-                self.seed_default_dictionaries(conn)
+                # MySQL 表结构由 docs/mysql初始化建表和基础数据.sql 管理。
+                # 默认字典同步是批量写操作，进程内只执行一次，避免每次创建仓储对象都拖慢接口。
+                if not _MYSQL_DEFAULT_DICTIONARY_SYNCED:
+                    self.seed_default_dictionaries(conn)
+                    _MYSQL_DEFAULT_DICTIONARY_SYNCED = True
+                    should_refresh_dictionary_cache = True
+                if should_refresh_dictionary_cache:
+                    # 默认字典同步属于写操作，先提交再用新连接刷新 Redis 缓存。
+                    conn.commit()
+                    self.refresh_all_dictionary_cache()
                 return
             conn.execute(
                 """
@@ -403,9 +429,12 @@ class KnowledgeStore:
                 """
             )
             self.seed_default_dictionaries(conn)
+            should_refresh_dictionary_cache = True
             conn.execute("DROP TABLE IF EXISTS qa_items")
             conn.execute("DROP TABLE IF EXISTS document_segments")
             conn.execute("DROP TABLE IF EXISTS knowledge_units")
+        if should_refresh_dictionary_cache:
+            self.refresh_all_dictionary_cache()
 
     def seed_default_dictionaries(self, conn: Any) -> None:
         """初始化系统默认字典项，已有字典项只更新展示信息。"""
@@ -488,8 +517,20 @@ class KnowledgeStore:
                     )
                 item_id_by_code[item_code] = dictionary_item_id
 
-    def list_dictionary_items(self, dictionary_code: str | None = None) -> list[dict[str, Any]]:
+    def list_dictionary_items(self, dictionary_code: str | None = None) -> list[DictionaryItemEntity]:
         """查询字典项列表，支持按字典编码过滤。"""
+
+        clean_dictionary_code = dictionary_code.strip() if dictionary_code else None
+        cached_rows = self._load_dictionary_items_cache(clean_dictionary_code)
+        if cached_rows is not None:
+            return cached_rows
+
+        rows = self._list_dictionary_items_from_db(clean_dictionary_code)
+        self._write_dictionary_items_cache(clean_dictionary_code, rows)
+        return rows
+
+    def _list_dictionary_items_from_db(self, dictionary_code: str | None = None) -> list[DictionaryItemEntity]:
+        """直接从数据库查询字典项，供缓存未命中或刷新缓存时使用。"""
 
         with self.connect() as conn:
             if dictionary_code:
@@ -510,21 +551,81 @@ class KnowledgeStore:
                     ORDER BY dictionary_code, item_level, sort_order, item_code
                     """
                 ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._serialize_dictionary_row(dict(row)) for row in rows]
 
-    def get_dictionary_item_by_code(self, dictionary_code: str, item_code: str) -> dict[str, Any] | None:
+    def _dictionary_items_cache_key(self, dictionary_code: str | None = None) -> str:
+        """生成字典项列表缓存 key，空编码表示全部字典。"""
+
+        cache_code = dictionary_code or "all"
+        return get_redis_client().build_key("dictionary", "items", cache_code)
+
+    def _load_dictionary_items_cache(self, dictionary_code: str | None = None) -> list[DictionaryItemEntity] | None:
+        """从 Redis 读取字典项缓存，Redis 不可用或内容异常时返回 None。"""
+
+        cache_key = self._dictionary_items_cache_key(dictionary_code)
+        cached_rows = get_redis_client().get_json(cache_key, default=None)
+        if isinstance(cached_rows, list) and all(isinstance(row, dict) for row in cached_rows):
+            logger.debug("[字典表] 命中Redis缓存 字典编码=%s 数量=%s", dictionary_code or "全部", len(cached_rows))
+            return cached_rows
+        return None
+
+    def _write_dictionary_items_cache(
+            self,
+            dictionary_code: str | None,
+            rows: list[dict[str, Any]],
+    ) -> None:
+        """把字典项列表写入 Redis，写入失败时只记录日志，不影响主流程。"""
+
+        cache_key = self._dictionary_items_cache_key(dictionary_code)
+        if get_redis_client().set_json(cache_key, rows, ttl_seconds=DICTIONARY_CACHE_TTL_SECONDS):
+            logger.debug("[字典表] 写入Redis缓存 字典编码=%s 数量=%s", dictionary_code or "全部", len(rows))
+
+    def refresh_dictionary_cache(self, dictionary_code: str) -> None:
+        """刷新某个字典和全部字典缓存，用于新增或修改字典项后保持 Redis 最新。"""
+
+        clean_dictionary_code = dictionary_code.strip()
+        all_rows = self._list_dictionary_items_from_db(None)
+        self._write_dictionary_items_cache(None, all_rows)
+        code_rows = [row for row in all_rows if row.get("dictionary_code") == clean_dictionary_code]
+        self._write_dictionary_items_cache(clean_dictionary_code, code_rows)
+
+    def refresh_all_dictionary_cache(self) -> None:
+        """刷新全部字典缓存，并按字典编码同步写入各自的 Redis key。"""
+
+        all_rows = self._list_dictionary_items_from_db(None)
+        redis_client = get_redis_client()
+        stale_keys = [
+            self._dictionary_items_cache_key(code)
+            for code in DEPRECATED_DICTIONARY_CODES
+        ]
+        redis_client.delete(*stale_keys)
+        self._write_dictionary_items_cache(None, all_rows)
+        rows_by_dictionary: dict[str, list[dict[str, Any]]] = {}
+        for row in all_rows:
+            rows_by_dictionary.setdefault(str(row["dictionary_code"]), []).append(row)
+        for dictionary_code, rows in rows_by_dictionary.items():
+            self._write_dictionary_items_cache(dictionary_code, rows)
+
+    @staticmethod
+    def _serialize_dictionary_row(row: dict[str, Any]) -> dict[str, Any]:
+        """把数据库字典行转换为 Redis JSON 可保存的基础类型。"""
+
+        serialized_row: dict[str, Any] = {}
+        for key, value in row.items():
+            if isinstance(value, datetime):
+                serialized_row[key] = value.isoformat(timespec="seconds", sep=" ")
+            else:
+                serialized_row[key] = value
+        return serialized_row
+
+    def get_dictionary_item_by_code(self, dictionary_code: str, item_code: str) -> DictionaryItemEntity | None:
         """按字典编码和字典项编码查询单个字典项。"""
 
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM dictionary_items
-                WHERE dictionary_code = ? AND item_code = ?
-                """,
-                (dictionary_code, item_code),
-            ).fetchone()
-        return self.row_to_dict(row)
+        clean_item_code = item_code.strip()
+        for row in self.list_dictionary_items(dictionary_code=dictionary_code):
+            if str(row.get("item_code") or "") == clean_item_code:
+                return row
+        return None
 
     def upsert_dictionary_item(
             self,
@@ -539,7 +640,7 @@ class KnowledgeStore:
             enabled: bool = True,
             description: str | None = None,
             metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> DictionaryItemEntity:
         """新增或更新字典项。"""
 
         clean_dictionary_code = dictionary_code.strip()
@@ -619,6 +720,7 @@ class KnowledgeStore:
                     ),
                 )
 
+        self.refresh_dictionary_cache(clean_dictionary_code)
         return self.get_dictionary_item_by_code(clean_dictionary_code, clean_item_code) or {}
 
     @staticmethod
@@ -717,8 +819,11 @@ class KnowledgeStore:
     def normalize_dictionary_code(self, dictionary_code: str, value: str | None = None) -> str:
         """按字典表归一化编码；非法或空值时返回该字典的默认编码。"""
 
-        enabled_codes = set(self.list_enabled_dictionary_codes(dictionary_code))
-        default_code = self.get_default_dictionary_code(dictionary_code)
+        rows = self.list_dictionary_items(dictionary_code=dictionary_code)
+        enabled_codes = [str(row["item_code"]) for row in rows if int(row.get("enabled") or 0) == 1]
+        if not enabled_codes:
+            raise ValueError(f"字典没有可用项：{dictionary_code}")
+        default_code = enabled_codes[0]
         normalized_value = str(value or default_code).strip().lower()
         if normalized_value in enabled_codes:
             return normalized_value
@@ -739,7 +844,9 @@ class KnowledgeStore:
                 conn.execute(statement)
 
     @staticmethod
-    def row_to_dict(row: Any | None) -> dict[str, Any] | None:
+    def row_to_dict(row: Any | None) -> KnowledgeStoreRow | None:
+        """把数据库行对象转换成轻量实体字典。"""
+
         return dict(row) if row else None
 
     def create_document(
@@ -755,7 +862,7 @@ class KnowledgeStore:
             collection_name: str = "agent",
             document_type: str = "text",
             split_strategy: str = "recursive",
-    ) -> dict[str, Any]:
+    ) -> DocumentEntity:
         now = utc_now_text()
         with self.connect() as conn:
             conn.execute(
@@ -792,7 +899,7 @@ class KnowledgeStore:
             self,
             file_md5: str,
             collection_name: str | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> DocumentEntity | None:
         """按文件 MD5 查找未删除文档；传入 collection 时只在该 collection 内去重。"""
 
         if collection_name:
@@ -820,7 +927,7 @@ class KnowledgeStore:
             ).fetchone()
         return self.row_to_dict(row)
 
-    def get_document(self, document_id: str) -> dict[str, Any] | None:
+    def get_document(self, document_id: str) -> DocumentEntity | None:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM documents WHERE document_id = ?",
@@ -828,7 +935,7 @@ class KnowledgeStore:
             ).fetchone()
         return self.row_to_dict(row)
 
-    def list_documents(self) -> list[dict[str, Any]]:
+    def list_documents(self) -> list[DocumentEntity]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -892,7 +999,7 @@ class KnowledgeStore:
             user_id: str | None = None,
             title: str | None = None,
             metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> ConversationEntity:
         clean_conversation_id = (conversation_id or "").strip()
         if clean_conversation_id:
             existing = self.get_conversation(clean_conversation_id)
@@ -923,7 +1030,7 @@ class KnowledgeStore:
             raise RuntimeError(f"Conversation {clean_conversation_id} was not created")
         return conversation
 
-    def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+    def get_conversation(self, conversation_id: str) -> ConversationEntity | None:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM conversations WHERE conversation_id = ?",
@@ -972,7 +1079,7 @@ class KnowledgeStore:
             page_size: int = 10,
             user_id: str | None = None,
             keyword: str | None = None,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[ConversationEntity], int]:
         """分页查询会话列表。"""
 
         final_page = max(1, int(page))
@@ -1018,7 +1125,7 @@ class KnowledgeStore:
 
         return keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    def list_recent_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    def list_recent_messages(self, conversation_id: str, limit: int = 20) -> list[ConversationMessageEntity]:
         final_limit = max(1, min(int(limit), 100))
         with self.connect() as conn:
             rows = conn.execute(
@@ -1033,7 +1140,7 @@ class KnowledgeStore:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
-    def list_conversation_messages(self, conversation_id: str) -> list[dict[str, Any]]:
+    def list_conversation_messages(self, conversation_id: str) -> list[ConversationMessageEntity]:
         """查询某个会话的全部消息。"""
 
         with self.connect() as conn:
@@ -1058,7 +1165,7 @@ class KnowledgeStore:
             model_name: str | None = None,
             token_count: int | None = None,
             metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> ConversationMessageEntity:
         if self.get_conversation(conversation_id) is None:
             self.ensure_conversation(conversation_id=conversation_id)
 
@@ -1121,7 +1228,7 @@ class KnowledgeStore:
             "created_at": now,
         }
 
-    def get_message(self, message_id: str) -> dict[str, Any] | None:
+    def get_message(self, message_id: str) -> ConversationMessageEntity | None:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM conversation_messages WHERE message_id = ?",
@@ -1165,7 +1272,7 @@ class KnowledgeStore:
             question_types: list[str],
             model_mode: str | None = None,
             metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> ExamSessionEntity:
         """创建一场对话式考试会话。"""
 
         now = utc_now_text()
@@ -1223,7 +1330,7 @@ class KnowledgeStore:
             correct_answer: Any,
             reference_answer: str,
             max_score: float,
-    ) -> dict[str, Any]:
+    ) -> ExamQuestionEntity:
         """保存考试会话中的单轮题目。"""
 
         now = utc_now_text()
@@ -1266,7 +1373,7 @@ class KnowledgeStore:
             raise RuntimeError(f"考试题目保存失败：{exam_question_id}")
         return question
 
-    def get_exam_session(self, session_id: str) -> dict[str, Any] | None:
+    def get_exam_session(self, session_id: str) -> ExamSessionEntity | None:
         """按考试会话编号查询考试会话。"""
 
         with self.connect() as conn:
@@ -1282,7 +1389,7 @@ class KnowledgeStore:
             exam_question_id: str | None = None,
             session_id: str | None = None,
             round_no: int | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> ExamQuestionEntity | None:
         """查询单道考试题目，支持按题目编号或会话轮次定位。"""
 
         with self.connect() as conn:
@@ -1304,7 +1411,7 @@ class KnowledgeStore:
                 row = None
         return self.row_to_dict(row)
 
-    def list_exam_questions(self, session_id: str) -> list[dict[str, Any]]:
+    def list_exam_questions(self, session_id: str) -> list[ExamQuestionEntity]:
         """查询某场考试的全部题目。"""
 
         with self.connect() as conn:
@@ -1328,7 +1435,7 @@ class KnowledgeStore:
             is_correct: bool,
             score: float,
             analysis: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> ExamQuestionEntity:
         """保存用户单轮作答和分析结果，并刷新考试会话分数。"""
 
         now = utc_now_text()
@@ -1406,7 +1513,7 @@ class KnowledgeStore:
             page_size: int = 10,
             user_id: str | None = None,
             keyword: str | None = None,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[ExamSessionEntity], int]:
         """分页查询考试会话记录。"""
 
         final_page = max(1, int(page))

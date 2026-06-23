@@ -11,6 +11,7 @@ import json
 import random
 import re
 import time
+from datetime import date, datetime
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
@@ -110,6 +111,18 @@ def _optional_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _format_response_time(value: object) -> str | None:
+    """把数据库时间字段统一转换成接口响应字符串。"""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds", sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
 
 
 def _metadata_section_path(metadata: dict[str, Any]) -> str:
@@ -237,9 +250,9 @@ def _session_summary(row: dict[str, Any]) -> ExamSessionSummary:
         max_score=round(float(row.get("max_score") or 100), 2),
         status=row["status"],
         current_round=int(row.get("current_round") or 1),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        completed_at=row.get("completed_at"),
+        created_at=_format_response_time(row["created_at"]),
+        updated_at=_format_response_time(row["updated_at"]),
+        completed_at=_format_response_time(row.get("completed_at")),
     )
 
 
@@ -1352,7 +1365,7 @@ def get_exam_session_detail(session_id: str) -> ExamSessionDetailResponse:
             question=_question_from_row(row),
             user_answer=row.get("user_answer"),
             analysis=_analysis_from_row(row),
-            answered_at=row.get("answered_at"),
+            answered_at=_format_response_time(row.get("answered_at")),
         )
         for row in _store().list_exam_questions(session_id)
     ]

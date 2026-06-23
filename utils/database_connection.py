@@ -11,9 +11,11 @@ import sqlite3
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 from typing import Any, Iterator
 
 import yaml
+from sqlalchemy.pool import QueuePool
 
 from utils.path_tool import get_abs_path
 
@@ -31,6 +33,10 @@ DatabaseErrorTypes = (sqlite3.DatabaseError,)
 if pymysql is not None:
     IntegrityErrorTypes = (sqlite3.IntegrityError, pymysql.err.IntegrityError)
     DatabaseErrorTypes = (sqlite3.DatabaseError, pymysql.err.DatabaseError)
+
+_mysql_pool: QueuePool | None = None
+_mysql_pool_signature: tuple[Any, ...] | None = None
+_mysql_pool_lock = Lock()
 
 
 def _load_env_file(env_path: str = get_abs_path(".env")) -> None:
@@ -73,6 +79,14 @@ def load_database_config() -> dict[str, Any]:
         "user": os.getenv("MYSQL_USER", mysql_config.get("user", "root")),
         "password": os.getenv(password_env, os.getenv("MYSQL_PASSWORD", mysql_config.get("password", ""))),
         "charset": os.getenv("MYSQL_CHARSET", mysql_config.get("charset", "utf8mb4")),
+        "pool_size": int(os.getenv("MYSQL_POOL_SIZE", mysql_config.get("pool_size", 5))),
+        "max_overflow": int(os.getenv("MYSQL_MAX_OVERFLOW", mysql_config.get("max_overflow", 10))),
+        "pool_timeout_seconds": float(
+            os.getenv("MYSQL_POOL_TIMEOUT_SECONDS", mysql_config.get("pool_timeout_seconds", 5))
+        ),
+        "pool_recycle_seconds": int(
+            os.getenv("MYSQL_POOL_RECYCLE_SECONDS", mysql_config.get("pool_recycle_seconds", 1800))
+        ),
     })
 
     sqlite_config = dict(config.get("sqlite") or {})
@@ -130,19 +144,8 @@ def _convert_sqlite_placeholders(sql: str) -> str:
 class MySqlConnection:
     """仿 DB-API Connection 的 MySQL 连接包装。"""
 
-    def __init__(self, config: dict[str, Any]):
-        if pymysql is None or DictCursor is None:
-            raise RuntimeError("缺少 MySQL 驱动 PyMySQL，请先执行 pip install -r requirements.txt")
-        self._conn = pymysql.connect(
-            host=str(config["host"]),
-            port=int(config["port"]),
-            user=str(config["user"]),
-            password=str(config.get("password") or ""),
-            database=str(config["database"]),
-            charset=str(config.get("charset") or "utf8mb4"),
-            cursorclass=DictCursor,
-            autocommit=False,
-        )
+    def __init__(self, raw_connection: Any):
+        self._conn = raw_connection
 
     def execute(self, sql: str, parameters: Any = None):
         """执行 SQL，并返回 PyMySQL DictCursor。"""
@@ -163,9 +166,76 @@ class MySqlConnection:
         self._conn.rollback()
 
     def close(self) -> None:
-        """关闭连接。"""
+        """归还池化连接；非池化连接则关闭。"""
 
         self._conn.close()
+
+
+def _create_raw_mysql_connection(config: dict[str, Any]):
+    """创建真正的 PyMySQL 连接，供连接池按需调用。"""
+
+    if pymysql is None or DictCursor is None:
+        raise RuntimeError("缺少 MySQL 驱动 PyMySQL，请先执行 pip install -r requirements.txt")
+    return pymysql.connect(
+        host=str(config["host"]),
+        port=int(config["port"]),
+        user=str(config["user"]),
+        password=str(config.get("password") or ""),
+        database=str(config["database"]),
+        charset=str(config.get("charset") or "utf8mb4"),
+        cursorclass=DictCursor,
+        autocommit=False,
+    )
+
+
+def _mysql_pool_config_signature(config: dict[str, Any]) -> tuple[Any, ...]:
+    """生成连接池配置签名，配置变化时自动重建连接池。"""
+
+    return (
+        config.get("host"),
+        int(config.get("port") or 3306),
+        config.get("database"),
+        config.get("user"),
+        config.get("password"),
+        config.get("charset"),
+        int(config.get("pool_size") or 5),
+        int(config.get("max_overflow") or 10),
+        float(config.get("pool_timeout_seconds") or 5),
+        int(config.get("pool_recycle_seconds") or 1800),
+    )
+
+
+def _get_mysql_pool(config: dict[str, Any]) -> QueuePool:
+    """获取进程级 MySQL 连接池。"""
+
+    global _mysql_pool, _mysql_pool_signature
+
+    signature = _mysql_pool_config_signature(config)
+    with _mysql_pool_lock:
+        if _mysql_pool is None or _mysql_pool_signature != signature:
+            if pymysql is None or DictCursor is None:
+                raise RuntimeError("缺少 MySQL 驱动 PyMySQL，请先执行 pip install -r requirements.txt")
+            if _mysql_pool is not None:
+                _mysql_pool.dispose()
+            _mysql_pool = QueuePool(
+                creator=lambda: _create_raw_mysql_connection(config),
+                pool_size=int(config.get("pool_size") or 5),
+                max_overflow=int(config.get("max_overflow") or 10),
+                timeout=float(config.get("pool_timeout_seconds") or 5),
+                recycle=int(config.get("pool_recycle_seconds") or 1800),
+            )
+            _mysql_pool_signature = signature
+    return _mysql_pool
+
+
+def reset_mysql_pool() -> None:
+    """重置 MySQL 连接池，主要用于测试或配置切换后重新加载。"""
+
+    global _mysql_pool, _mysql_pool_signature
+    if _mysql_pool is not None:
+        _mysql_pool.dispose()
+    _mysql_pool = None
+    _mysql_pool_signature = None
 
 
 def open_database_connection(db_path: str | None = None):
@@ -186,7 +256,8 @@ def open_database_connection(db_path: str | None = None):
         sqlite_conn.execute("PRAGMA foreign_keys = ON")
         return sqlite_conn
 
-    return MySqlConnection(config["mysql"])
+    pool = _get_mysql_pool(config["mysql"])
+    return MySqlConnection(pool.connect())
 
 
 @contextmanager

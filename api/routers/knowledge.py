@@ -16,7 +16,7 @@ from api.schemas import (
     KnowledgeUploadRecommendResponse,
     KnowledgeUploadResponse,
 )
-from api.common_services import _document_to_response, _get_knowledge_store
+from api.common_services import _document_to_response, _get_knowledge_store, build_document_dictionary_snapshot
 from api.indexing_services import _index_document, _sync_data_files_to_documents
 from api.upload_services import (
     _get_preview_file,
@@ -310,7 +310,11 @@ def list_knowledge_files() -> list[KnowledgeFileResponse]:
 
     logger.info("[知识库] 查询文件列表")
     store = _get_knowledge_store()
-    return [_document_to_response(document) for document in store.list_documents()]
+    dictionary_snapshot = build_document_dictionary_snapshot(store)
+    return [
+        _document_to_response(document, dictionary_snapshot)
+        for document in store.list_documents()
+    ]
 
 
 @router.get("/knowledge/files/{document_id}", response_model=KnowledgeFileResponse)

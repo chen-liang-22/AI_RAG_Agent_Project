@@ -1,4 +1,42 @@
+from rag import knowledge_store
 from rag.knowledge_store import KnowledgeStore
+
+
+class FakeDictionaryRedisClient:
+    """测试用 Redis 替身，只记录 JSON 缓存读写删除行为。"""
+
+    def __init__(self):
+        self.values: dict[str, object] = {}
+        self.set_calls: list[tuple[str, object, int | None]] = []
+        self.deleted_keys: list[str] = []
+
+    def build_key(self, *parts: object) -> str:
+        """按项目 Redis key 规则拼接测试 key。"""
+
+        return ":".join(["test", *[str(part) for part in parts]])
+
+    def get_json(self, key: str, default=None):
+        """模拟读取 JSON 缓存。"""
+
+        return self.values.get(key, default)
+
+    def set_json(self, key: str, value, ttl_seconds: int | None = None) -> bool:
+        """模拟写入 JSON 缓存。"""
+
+        self.values[key] = value
+        self.set_calls.append((key, value, ttl_seconds))
+        return True
+
+    def delete(self, *keys: str) -> int:
+        """模拟删除 Redis key。"""
+
+        self.deleted_keys.extend(keys)
+        count = 0
+        for key in keys:
+            if key in self.values:
+                count += 1
+                del self.values[key]
+        return count
 
 
 def test_conversation_exchange_is_persisted_in_sequence(tmp_path):
@@ -60,6 +98,59 @@ def test_conversations_can_be_filtered_by_keyword(tmp_path):
     assert user_matches[0]["conversation_id"] == "conv_report"
     assert id_total == 1
     assert id_matches[0]["conversation_id"] == "conv_robot"
+
+
+def test_dictionary_items_use_redis_cache(monkeypatch, tmp_path):
+    """验证字典列表第一次查库并写 Redis，后续相同查询直接命中 Redis。"""
+
+    fake_redis = FakeDictionaryRedisClient()
+    monkeypatch.setattr(knowledge_store, "get_redis_client", lambda: fake_redis)
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    fake_redis.values.clear()
+    fake_redis.set_calls.clear()
+
+    first_rows = store.list_dictionary_items("document_structure")
+    cached_key = fake_redis.build_key("dictionary", "items", "document_structure")
+
+    assert first_rows
+    assert cached_key in fake_redis.values
+
+    def fail_database_query(dictionary_code=None):
+        """如果第二次没有命中 Redis，这个替身会让测试失败。"""
+
+        raise AssertionError("字典缓存命中时不应该再次查询数据库")
+
+    monkeypatch.setattr(store, "_list_dictionary_items_from_db", fail_database_query)
+    second_rows = store.list_dictionary_items("document_structure")
+
+    assert second_rows == first_rows
+
+
+def test_upsert_dictionary_item_refreshes_redis_cache(monkeypatch, tmp_path):
+    """验证新增或更新字典项后，会刷新全部字典和当前字典的 Redis 缓存。"""
+
+    fake_redis = FakeDictionaryRedisClient()
+    monkeypatch.setattr(knowledge_store, "get_redis_client", lambda: fake_redis)
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    fake_redis.values.clear()
+    fake_redis.set_calls.clear()
+
+    store.upsert_dictionary_item(
+        dictionary_code="demo_dictionary",
+        dictionary_name="演示字典",
+        item_code="demo_item",
+        item_name="演示项",
+        sort_order=1,
+        enabled=True,
+        description="用于验证字典缓存刷新",
+    )
+
+    all_key = fake_redis.build_key("dictionary", "items", "all")
+    code_key = fake_redis.build_key("dictionary", "items", "demo_dictionary")
+    assert all_key in fake_redis.values
+    assert code_key in fake_redis.values
+    assert any(row["item_code"] == "demo_item" for row in fake_redis.values[all_key])
+    assert fake_redis.values[code_key][0]["item_code"] == "demo_item"
 
 
 def test_exam_session_questions_and_answers_are_persisted(tmp_path):

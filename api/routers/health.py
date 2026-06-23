@@ -1,3 +1,5 @@
+import time
+
 from fastapi import APIRouter
 from qdrant_client import QdrantClient
 
@@ -9,25 +11,35 @@ from utils.redis_client import get_redis_client
 
 router = APIRouter()
 
+HEALTH_CACHE_SECONDS = 10
+_health_cache: tuple[float, HealthResponse] | None = None
+
 
 def _service_status(item_code: str) -> str:
-    """从服务状态字典读取状态码，避免健康检查里写散落状态值。"""
+    """从服务状态字典读取状态码，统一走字典 Redis 缓存，避免进程内旧值残留。"""
 
     return KnowledgeStore().normalize_dictionary_code("service_status", item_code)
 
 
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
+    global _health_cache
+
     logger.info("[接口] 健康检查请求")  # 记录健康检查访问日志
+    now = time.monotonic()
+    if _health_cache and now - _health_cache[0] <= HEALTH_CACHE_SECONDS:
+        logger.info("[接口] 健康检查命中缓存 缓存秒数=%s", HEALTH_CACHE_SECONDS)
+        return _health_cache[1]
+
     collection_name = get_qdrant_collection_name()  # 读取当前配置中的 collection 名称
 
     try:
         client = QdrantClient(**get_qdrant_client_options())  # 按配置连接 Qdrant
         collections = [collection.name for collection in client.get_collections().collections]  # 获取全部 collection 名称
         collection_points = {
-            # count(exact=True) 读取 Qdrant 当前 collection 的真实向量点数量。
-            # 首页需要这个数字区分“普通文件列表为空”和“向量库确实为空”。
-            collection_name: int(client.count(collection_name=collection_name, exact=True).count)
+            # 首页只需要概览数字，不需要每次做精确统计。
+            # exact=False 能显著降低 Qdrant 大 collection 的统计成本。
+            collection_name: int(client.count(collection_name=collection_name, exact=False).count)
             for collection_name in collections
         }
         qdrant_status = _service_status("ok")  # 能正常连接和读取 collection，说明 Qdrant 可用
@@ -43,7 +55,7 @@ def health() -> HealthResponse:
         if qdrant_status == _service_status("ok") and redis_status == _service_status("ok")
         else _service_status("degraded")
     )
-    return HealthResponse(
+    response = HealthResponse(
         status=status,  # 返回整体状态
         qdrant=qdrant_status,  # 返回 Qdrant 状态
         redis=redis_status,  # 返回 Redis 状态
@@ -51,3 +63,5 @@ def health() -> HealthResponse:
         collections=collections,  # 返回 Qdrant collection 列表
         collection_points=collection_points,  # 返回每个 collection 的真实向量点数量
     )
+    _health_cache = (now, response)
+    return response

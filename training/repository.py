@@ -4,6 +4,16 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterator
 
+from domain.entities import (
+    SalesTrainingScoreEntity,
+    SalesTrainingSessionEntity,
+    SalesTrainingTurnEntity,
+    TrainingGoalSettingEntity,
+    TrainingKnowledgeBatchEntity,
+    TrainingPlanEntity,
+    TrainingRepositoryRow,
+    TrainingRoleProfileEntity,
+)
 from utils.database_connection import database_context, is_mysql_runtime
 
 
@@ -358,11 +368,11 @@ class TrainingRepository:
         conn.execute("DROP TABLE IF EXISTS training_knowledge_chunks")
 
     @staticmethod
-    def _row(row: Any | None) -> dict[str, Any] | None:
+    def _row(row: Any | None) -> TrainingRepositoryRow | None:
         # 数据库行对象转成 dict 后，业务层更好处理。
         return dict(row) if row is not None else None
 
-    def create_batch(self, **values: Any) -> dict[str, Any]:
+    def create_batch(self, **values: Any) -> TrainingKnowledgeBatchEntity:
         """创建训练知识上传批次。
 
         **values 是 Python 的关键字参数收集写法，类似 Java 里传一个 Map。
@@ -451,7 +461,7 @@ class TrainingRepository:
                 ),
             )
 
-    def get_latest_batch_for_version(self, *, source_type: str, source_file: str) -> dict[str, Any] | None:
+    def get_latest_batch_for_version(self, *, source_type: str, source_file: str) -> TrainingKnowledgeBatchEntity | None:
         """按资料类型和文件名查询最新版本批次。"""
 
         with self.connect() as conn:
@@ -486,7 +496,7 @@ class TrainingRepository:
             version_group_id: str,
             *,
             exclude_batch_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[TrainingKnowledgeBatchEntity]:
         """查询同一版本组内已发布或已归档的批次。"""
 
         params: list[Any] = [version_group_id]
@@ -508,7 +518,7 @@ class TrainingRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_batches_in_version_group(self, version_group_id: str) -> list[dict[str, Any]]:
+    def list_batches_in_version_group(self, version_group_id: str) -> list[TrainingKnowledgeBatchEntity]:
         """查询同一版本组内的全部未删除批次。"""
 
         with self.connect() as conn:
@@ -541,7 +551,7 @@ class TrainingRepository:
                 (utc_now_text(), version_group_id, current_batch_id),
             )
 
-    def get_published_batch_by_md5(self, file_md5: str) -> dict[str, Any] | None:
+    def get_published_batch_by_md5(self, file_md5: str) -> TrainingKnowledgeBatchEntity | None:
         """按文件 MD5 查询已经成功入库的训练资料。
 
         只复用 published 批次，避免解析失败或半入库数据被误当成可用资料。
@@ -560,7 +570,7 @@ class TrainingRepository:
             ).fetchone()
         return self._row(row)
 
-    def list_batches(self, *, page: int, page_size: int) -> tuple[list[dict[str, Any]], int]:
+    def list_batches(self, *, page: int, page_size: int) -> tuple[list[TrainingKnowledgeBatchEntity], int]:
         """分页查询训练资料上传批次。"""
 
         offset = (page - 1) * page_size
@@ -605,12 +615,12 @@ class TrainingRepository:
             )
         return True
 
-    def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+    def get_batch(self, batch_id: str) -> TrainingKnowledgeBatchEntity | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM training_knowledge_batches WHERE batch_id = ?", (batch_id,)).fetchone()
         return self._row(row)
 
-    def create_plan(self, **values: Any) -> dict[str, Any]:
+    def create_plan(self, **values: Any) -> TrainingPlanEntity:
         """创建训练方案。
 
         训练方案是角色、训练阶段、评分规则的上层聚合。
@@ -651,7 +661,7 @@ class TrainingRepository:
             )
         return self.get_plan(plan_id) or {}
 
-    def list_plans(self, *, page: int, page_size: int, keyword: str | None = None) -> tuple[list[dict[str, Any]], int]:
+    def list_plans(self, *, page: int, page_size: int, keyword: str | None = None) -> tuple[list[TrainingPlanEntity], int]:
         """分页查询训练方案列表。"""
 
         offset = (page - 1) * page_size
@@ -677,14 +687,14 @@ class TrainingRepository:
             ).fetchall()
         return [dict(row) for row in rows], int(total_row["total"] or 0)
 
-    def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+    def get_plan(self, plan_id: str) -> TrainingPlanEntity | None:
         """按 ID 查询训练方案。"""
 
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM training_plans WHERE plan_id = ?", (plan_id,)).fetchone()
         return self._row(row)
 
-    def update_plan(self, plan_id: str, **values: Any) -> dict[str, Any]:
+    def update_plan(self, plan_id: str, **values: Any) -> TrainingPlanEntity:
         """更新训练方案基础信息和状态。
 
         这里使用动态 SQL，但字段白名单来自代码固定集合，不接收外部字段名。
@@ -723,7 +733,7 @@ class TrainingRepository:
             )
         return self.get_plan(plan_id) or {}
 
-    def attach_role_to_plan(self, plan_id: str, profile_id: str) -> dict[str, Any]:
+    def attach_role_to_plan(self, plan_id: str, profile_id: str) -> TrainingPlanEntity:
         """把生成好的 AI 角色关联到训练方案，并标记阶段/评分需要重新生成。"""
 
         return self.update_plan(
@@ -735,7 +745,7 @@ class TrainingRepository:
             score_status="stale",
         )
 
-    def attach_goal_to_plan(self, plan_id: str, setting_id: str) -> dict[str, Any]:
+    def attach_goal_to_plan(self, plan_id: str, setting_id: str) -> TrainingPlanEntity:
         """把生成好的训练阶段关联到训练方案，并标记评分规则已随阶段生成。"""
 
         return self.update_plan(
@@ -745,7 +755,7 @@ class TrainingRepository:
             score_status="generated",
         )
 
-    def save_role_profile(self, **values: Any) -> dict[str, Any]:
+    def save_role_profile(self, **values: Any) -> TrainingRoleProfileEntity:
         """保存一次 AI 陪练角色。"""
 
         now = utc_now_text()
@@ -781,7 +791,7 @@ class TrainingRepository:
             )
         return self.get_role_profile(profile_id) or {}
 
-    def get_role_profile(self, profile_id: str) -> dict[str, Any] | None:
+    def get_role_profile(self, profile_id: str) -> TrainingRoleProfileEntity | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM training_role_profiles WHERE profile_id = ?", (profile_id,)).fetchone()
         return self._row(row)
@@ -794,7 +804,7 @@ class TrainingRepository:
             hidden_profile: dict | None = None,
             role_profile: dict | None = None,
             role_confirm_card: dict | None = None,
-    ) -> dict[str, Any]:
+    ) -> TrainingRoleProfileEntity:
         """人工修改 AI 客户角色的某些 JSON 字段。"""
 
         updates: dict[str, str] = {}
@@ -817,7 +827,7 @@ class TrainingRepository:
             )
         return self.get_role_profile(profile_id) or {}
 
-    def save_goal_setting(self, **values: Any) -> dict[str, Any]:
+    def save_goal_setting(self, **values: Any) -> TrainingGoalSettingEntity:
         """保存开放式训练设置。"""
 
         now = utc_now_text()
@@ -848,7 +858,7 @@ class TrainingRepository:
             )
         return self.get_goal_setting(setting_id) or {}
 
-    def get_goal_setting(self, setting_id: str) -> dict[str, Any] | None:
+    def get_goal_setting(self, setting_id: str) -> TrainingGoalSettingEntity | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM training_goal_settings WHERE setting_id = ?", (setting_id,)).fetchone()
         return self._row(row)
@@ -861,7 +871,7 @@ class TrainingRepository:
             round_limit: int | None = None,
             stages: list[dict[str, Any]] | None = None,
             scoring_rules: dict | None = None,
-    ) -> dict[str, Any]:
+    ) -> TrainingGoalSettingEntity:
         """人工修改训练宗旨、轮数、阶段或评分规则。"""
 
         updates: dict[str, Any] = {}
@@ -884,7 +894,7 @@ class TrainingRepository:
             )
         return self.get_goal_setting(setting_id) or {}
 
-    def create_session(self, **values: Any) -> dict[str, Any]:
+    def create_session(self, **values: Any) -> SalesTrainingSessionEntity:
         """创建一次开放式训练会话。"""
 
         now = utc_now_text()
@@ -915,7 +925,7 @@ class TrainingRepository:
             )
         return self.get_session(session_id) or {}
 
-    def get_session(self, session_id: str) -> dict[str, Any] | None:
+    def get_session(self, session_id: str) -> SalesTrainingSessionEntity | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM sales_training_sessions WHERE session_id = ?", (session_id,)).fetchone()
         return self._row(row)
@@ -926,11 +936,11 @@ class TrainingRepository:
             page: int,
             page_size: int,
             trainee_id: str | None = None,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[SalesTrainingSessionEntity], int]:
         """分页查询训练会话历史，并统计学员已回答轮数。
 
-        返回值是 tuple[list[dict], int]：
-        - 第一个元素是当前页数据；
+        返回值是 tuple[list[SalesTrainingSessionEntity], int]：
+        - 第一个元素是当前页训练会话实体列表；
         - 第二个元素是符合条件的总数。
 
         Python 的 tuple 类似 Java 里简单返回 Pair，不过这里用类型注解明确结构。
@@ -1004,7 +1014,7 @@ class TrainingRepository:
                 ),
             )
 
-    def add_turn(self, **values: Any) -> dict[str, Any]:
+    def add_turn(self, **values: Any) -> SalesTrainingTurnEntity:
         """保存训练对话轮次。
 
         role 字段当前会出现：
@@ -1048,12 +1058,12 @@ class TrainingRepository:
             )
         return self.get_turn(turn_id) or {}
 
-    def get_turn(self, turn_id: str) -> dict[str, Any] | None:
+    def get_turn(self, turn_id: str) -> SalesTrainingTurnEntity | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM sales_training_turns WHERE turn_id = ?", (turn_id,)).fetchone()
         return self._row(row)
 
-    def list_turns(self, session_id: str) -> list[dict[str, Any]]:
+    def list_turns(self, session_id: str) -> list[SalesTrainingTurnEntity]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -1084,7 +1094,7 @@ class TrainingRepository:
             ).fetchone()
         return int(row["max_round"] or 0) + 1
 
-    def save_score(self, **values: Any) -> dict[str, Any]:
+    def save_score(self, **values: Any) -> SalesTrainingScoreEntity:
         """保存训练评分结果。
 
         一期先保留多评分记录能力，方便后续“AI 自动评分 + 人工复核”。
@@ -1120,12 +1130,12 @@ class TrainingRepository:
             )
         return self.get_score(score_id) or {}
 
-    def get_score(self, score_id: str) -> dict[str, Any] | None:
+    def get_score(self, score_id: str) -> SalesTrainingScoreEntity | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM sales_training_scores WHERE score_id = ?", (score_id,)).fetchone()
         return self._row(row)
 
-    def get_latest_score_by_session(self, session_id: str) -> dict[str, Any] | None:
+    def get_latest_score_by_session(self, session_id: str) -> SalesTrainingScoreEntity | None:
         """查询某个训练会话最新的一份评分报告。
 
         如果未来允许人工复核产生新版本评分，这里始终取 updated_at 最新的一份。

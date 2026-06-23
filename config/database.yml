@@ -16,3 +16,12 @@ mysql:
   password: "1234qwer"
   # 字符集固定 utf8mb4，支持中文和 emoji。
   charset: "utf8mb4"
+  # MySQL 连接池常驻连接数。
+  # 首页会并发请求多个接口，连接池可以避免每个 SQL 都重新握手认证。
+  pool_size: 5
+  # 连接池不够用时允许临时额外创建的连接数。
+  max_overflow: 10
+  # 从连接池等待可用连接的最长秒数。
+  pool_timeout_seconds: 5
+  # 连接回收秒数，避免 MySQL wait_timeout 后拿到失效连接。
+  pool_recycle_seconds: 1800

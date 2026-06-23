@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from dataclasses import dataclass
 
 from fastapi import HTTPException
 
@@ -16,23 +17,74 @@ def _get_knowledge_store() -> KnowledgeStore:
     return KnowledgeStore()
 
 
-def _normalize_split_strategy(split_strategy: str | None = None) -> str:
+@dataclass(frozen=True)
+class DictionaryCodeSnapshot:
+    """一次性加载字典编码，避免列表接口为每条记录反复访问 MySQL。"""
+
+    enabled_codes_by_dictionary: dict[str, set[str]]
+    default_code_by_dictionary: dict[str, str]
+
+    @classmethod
+    def load(cls, store: KnowledgeStore, dictionary_codes: set[str]) -> "DictionaryCodeSnapshot":
+        """按字典编码批量读取启用项和默认项。"""
+
+        enabled_codes_by_dictionary: dict[str, set[str]] = {}
+        default_code_by_dictionary: dict[str, str] = {}
+        for dictionary_code in dictionary_codes:
+            rows = store.list_dictionary_items(dictionary_code=dictionary_code)
+            enabled_rows = [row for row in rows if int(row.get("enabled") or 0) == 1]
+            enabled_codes = {str(row["item_code"]) for row in enabled_rows}
+            enabled_codes_by_dictionary[dictionary_code] = enabled_codes
+            if enabled_rows:
+                default_code_by_dictionary[dictionary_code] = str(enabled_rows[0]["item_code"])
+        return cls(
+            enabled_codes_by_dictionary=enabled_codes_by_dictionary,
+            default_code_by_dictionary=default_code_by_dictionary,
+        )
+
+    def normalize(self, dictionary_code: str, value: str | None = None) -> str:
+        """使用内存快照归一化字典编码。"""
+
+        enabled_codes = self.enabled_codes_by_dictionary.get(dictionary_code) or set()
+        default_code = self.default_code_by_dictionary.get(dictionary_code)
+        if not default_code:
+            raise ValueError(f"字典没有可用项：{dictionary_code}")
+        normalized_value = str(value or default_code).strip().lower()
+        if normalized_value in enabled_codes:
+            return normalized_value
+        return default_code
+
+    def enabled_codes(self, dictionary_code: str) -> set[str]:
+        """返回某个字典的启用编码集合。"""
+
+        return set(self.enabled_codes_by_dictionary.get(dictionary_code) or set())
+
+
+def _normalize_split_strategy(
+        split_strategy: str | None = None,
+        dictionary_snapshot: DictionaryCodeSnapshot | None = None,
+) -> str:
     """从字典表归一化切分策略。"""
 
+    if dictionary_snapshot is not None:
+        return dictionary_snapshot.normalize("split_strategy", split_strategy)
     return _get_knowledge_store().normalize_dictionary_code("split_strategy", split_strategy)
 
 
 def _normalize_document_structure_type(
         document_type: str | None = None,
         split_strategy: str | None = None,
+        dictionary_snapshot: DictionaryCodeSnapshot | None = None,
 ) -> str:
     """从字典表归一化文档结构类型。"""
 
-    store = _get_knowledge_store()
-    enabled_codes = set(store.list_enabled_dictionary_codes("document_structure"))
-    default_code = store.normalize_dictionary_code("document_structure", None)
+    if dictionary_snapshot is None:
+        store = _get_knowledge_store()
+        dictionary_snapshot = DictionaryCodeSnapshot.load(store, {"document_structure", "split_strategy"})
+    enabled_codes = dictionary_snapshot.enabled_codes("document_structure")
+    default_code = dictionary_snapshot.normalize("document_structure", None)
     value = str(document_type or "").strip().lower()
-    normalized_split_strategy = _normalize_split_strategy(split_strategy)
+    normalized_split_strategy = _normalize_split_strategy(split_strategy, dictionary_snapshot)
     if normalized_split_strategy in {"numbered_qa", "outline_qa"} and "qa" in enabled_codes:
         return "qa"
     if normalized_split_strategy == "numbered_segments" and "numbered" in enabled_codes:
@@ -55,7 +107,19 @@ def _format_response_time(value: object) -> str:
     return str(value)
 
 
-def _document_to_response(document: dict) -> KnowledgeFileResponse:
+def build_document_dictionary_snapshot(store: KnowledgeStore | None = None) -> DictionaryCodeSnapshot:
+    """构建文档列表响应所需的字典快照。"""
+
+    return DictionaryCodeSnapshot.load(
+        store or _get_knowledge_store(),
+        {"document_structure", "split_strategy"},
+    )
+
+
+def _document_to_response(
+        document: dict,
+        dictionary_snapshot: DictionaryCodeSnapshot | None = None,
+) -> KnowledgeFileResponse:
     """把数据库文档记录转换成 FastAPI 响应模型。
 
     数据库取出来的数字字段有时可能是字符串或兼容类型，这里统一转成 int，
@@ -76,8 +140,9 @@ def _document_to_response(document: dict) -> KnowledgeFileResponse:
         document_type=_normalize_document_structure_type(
             document.get("document_type"),
             document.get("split_strategy"),
+            dictionary_snapshot,
         ),
-        split_strategy=_normalize_split_strategy(document.get("split_strategy")),
+        split_strategy=_normalize_split_strategy(document.get("split_strategy"), dictionary_snapshot),
         created_at=_format_response_time(document["created_at"]),
         updated_at=_format_response_time(document["updated_at"]),
         error_message=document.get("error_message"),
