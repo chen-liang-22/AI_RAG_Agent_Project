@@ -1,4 +1,4 @@
-import json
+﻿import json
 import time
 from datetime import date, datetime
 
@@ -15,7 +15,7 @@ from api.schemas import (
     ConversationSummaryResponse,
     DebugRetrieveRequest,
 )
-from api.chat_services import (
+from api.services.chat_services import (
     _get_agent,
     _get_knowledge_answer_service,
     _prepare_chat_conversation,
@@ -24,7 +24,7 @@ from api.chat_services import (
     _stream_agent,
     _stream_direct_rag,
 )
-from api.common_services import _get_knowledge_store
+from api.services.common_services import _get_knowledge_store
 from model.factory import get_chat_model_name_for_mode, normalize_chat_model_mode
 from utils.logger_handler import logger
 from utils.qdrant_options import normalize_qdrant_collection_name
@@ -168,17 +168,7 @@ def delete_conversation(conversation_id: str) -> ConversationDeleteResponse:
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
-    """一次性聊天接口。
-
-    调用流程：
-    1. 前端发送 POST `/chat`，请求体包含 message 和 user_id。
-    2. 后端调用 `ReactAgent.execute()`。
-    3. Agent 内部可能会调用 RAG、天气、用户数据等工具。
-    4. 后端等待 Agent 全部执行完，只取最后一条 AIMessage 作为最终回答。
-    5. 返回 JSON：`{"answer": "...完整回答..."}`
-
-    这个接口适合“不关心首 token 速度，只想一次拿到完整结果”的场景。
-    """
+    """一次性聊天接口。"""
 
     request_start_time = time.perf_counter()
     conversation_id, history = _prepare_chat_conversation(request)
@@ -433,7 +423,7 @@ def debug_retrieve(request: DebugRetrieveRequest) -> dict:
     logger.info(f"[接口] 检索调试请求 问题={request.query}")
 
     try:
-        from rag.rag_service import RagSummarizeService  # 延迟导入，避免普通接口启动时就初始化向量库
+        from rag.services.rag_service import RagSummarizeService  # 延迟导入，避免普通接口启动时就初始化向量库
 
         rag_service = RagSummarizeService()
         return rag_service.debug_retrieve(request.query)

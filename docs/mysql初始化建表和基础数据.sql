@@ -147,10 +147,11 @@ CREATE TABLE IF NOT EXISTS exam_questions (
 
 CREATE TABLE IF NOT EXISTS training_knowledge_batches (
   batch_id VARCHAR(64) NOT NULL COMMENT '训练资料上传批次编号',
+  document_id VARCHAR(64) NULL COMMENT '关联 documents.document_id，文件基础信息统一保存在 documents 表',
   source_type VARCHAR(64) NOT NULL COMMENT '资料来源类型，例如 lms_case',
-  source_file VARCHAR(255) NOT NULL COMMENT '原始文件名',
-  file_path VARCHAR(1024) NULL COMMENT '服务端保存路径',
-  file_md5 CHAR(32) NULL COMMENT '文件 MD5',
+  source_file VARCHAR(255) NOT NULL COMMENT '历史兼容文件名，新数据优先读取 documents.filename',
+  file_path VARCHAR(1024) NULL COMMENT '历史兼容保存路径，新数据优先读取 documents.file_path',
+  file_md5 CHAR(32) NULL COMMENT '历史兼容文件 MD5，新数据优先读取 documents.file_md5',
   version_group_id VARCHAR(64) NULL COMMENT '版本组编号，同一资料多版本共享',
   version_no INT NOT NULL DEFAULT 1 COMMENT '版本号，从 1 递增',
   previous_batch_id VARCHAR(64) NULL COMMENT '上一版本批次编号',
@@ -169,9 +170,13 @@ CREATE TABLE IF NOT EXISTS training_knowledge_batches (
   created_at DATETIME NOT NULL COMMENT '创建时间',
   updated_at DATETIME NOT NULL COMMENT '更新时间',
   PRIMARY KEY (batch_id),
+  KEY idx_training_batches_document (document_id),
   KEY idx_training_batches_md5_status (file_md5, status),
   KEY idx_training_batches_version_group (version_group_id, version_no),
-  KEY idx_training_batches_current_status (status, is_current, updated_at)
+  KEY idx_training_batches_current_status (status, is_current, updated_at),
+  CONSTRAINT fk_training_batches_document
+    FOREIGN KEY (document_id) REFERENCES documents (document_id)
+    ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='销售训练资料上传批次表';
 
 CREATE TABLE IF NOT EXISTS training_plans (

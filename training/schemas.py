@@ -11,6 +11,7 @@ class TrainingKnowledgeUploadResponse(BaseModel):
     """训练知识上传预览响应。"""
 
     batch_id: str  # 上传批次 ID，用于后续查询本次文件拆出的切片。
+    document_id: str | None = None  # 关联的 documents 文件 ID，文件基础信息统一保存在 documents 表。
     status: str  # 批次状态，例如 pending_review / duplicated。
     chunk_count: int  # 本次上传解析出的切片数量。
     point_count: int  # 写入 Qdrant 的向量点数量；预览阶段通常为 0。
@@ -26,6 +27,7 @@ class TrainingKnowledgeBatchResponse(BaseModel):
     """训练资料上传批次摘要。"""
 
     batch_id: str  # 批次 ID，用于点击后查询切片。
+    document_id: str | None = None  # 关联的 documents 文件 ID。
     source_type: str  # 来源类型，例如 lms_case。
     source_file: str  # 上传文件名。
     file_path: str | None = None  # 原始文件在服务端的保存路径，用于预览和排查。

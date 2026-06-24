@@ -157,7 +157,7 @@ def test_adaptive_plan_skips_llm_when_score_is_very_low_without_business_keyword
     assert groups == [("reacjhnio", weak_documents)]
 
 
-def test_adaptive_plan_keeps_llm_for_business_keyword_even_when_score_is_low(monkeypatch):
+def test_adaptive_plan_skips_llm_for_low_score_without_domain_hardcoding(monkeypatch):
     service = RagSummarizeService()
     analysis = QueryAnalysis(original_query="没电还能跑吗")
     weak_documents = [
@@ -172,13 +172,17 @@ def test_adaptive_plan_keeps_llm_for_business_keyword_even_when_score_is_low(mon
         return [(query, weak_documents) for query in queries]
 
     monkeypatch.setattr(service, "retrieve_for_queries", fake_retrieve)
-    monkeypatch.setattr(service.query_planner, "plan_with_config", lambda *args, **kwargs: ["低电量清扫能力"])
+    monkeypatch.setattr(
+        service.query_planner,
+        "plan_with_config",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("planner should be skipped")),
+    )
 
     queries, groups = service._adaptive_plan_and_retrieve("没电还能跑吗", analysis)
 
-    assert queries == ["没电还能跑吗", "低电量清扫能力"]
-    assert len(calls) == 2
-    assert len(groups) == 2
+    assert queries == ["没电还能跑吗"]
+    assert len(calls) == 1
+    assert groups == [("没电还能跑吗", weak_documents)]
 
 
 def test_retrieve_one_query_skips_metadata_filter_when_disabled(monkeypatch):

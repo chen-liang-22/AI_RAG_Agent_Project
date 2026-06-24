@@ -149,7 +149,7 @@ def _warmup_services() -> None:
     """
 
     # 延迟导入可以避免模块加载时就触发模型和向量库初始化，只有真正预热时才执行。
-    from api.chat_services import _get_knowledge_answer_service
+    from api.services.chat_services import _get_knowledge_answer_service
 
     service = _get_knowledge_answer_service()
     service.rag._get_vector_store()

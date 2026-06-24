@@ -138,12 +138,23 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
     )
 
     assert upload_result.status == "pending_review"
+    assert upload_result.document_id
     assert upload_result.point_count == upload_result.chunk_count
     assert upload_result.quality_report["score"] > 0
     assert fake_vector_service.documents == []
     assert len(fake_staging_service.documents) == upload_result.chunk_count
     batch = repository.get_batch(upload_result.batch_id)
     assert batch["status"] == "pending_review"
+    assert batch["document_id"] == upload_result.document_id
+    assert batch["file_path"] is None
+    assert batch["file_md5"] is None
+    document = service.knowledge_store.get_document(upload_result.document_id)
+    assert document is not None
+    assert document["filename"] == "case.txt"
+    assert document["collection_name"] == "sales_training_cases"
+    assert document["status"] == "indexed"
+    assert document["chunk_count"] == upload_result.chunk_count
+    assert all(item.metadata["document_id"] == upload_result.document_id for item in fake_staging_service.documents)
     with repository.connect() as conn:
         chunk_table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'training_knowledge_chunks'"
@@ -158,6 +169,7 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
     assert fake_staging_service.documents == []
     published_batch = repository.get_batch(upload_result.batch_id)
     assert published_batch["status"] == "published"
+    assert all(item.metadata["document_id"] == upload_result.document_id for item in fake_vector_service.documents)
 
 
 def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeypatch):
@@ -332,6 +344,40 @@ def test_training_preview_uses_saved_chunks(tmp_path):
     assert "standard_answer" in preview.content
 
 
+def test_training_duplicate_upload_uses_document_md5(tmp_path):
+    """重复上传应通过 documents 文件台账中的 MD5 复用已发布批次。"""
+
+    repository = TrainingRepository(str(tmp_path / "training.db"))
+    service = SalesTrainingService(repository=repository)
+    attach_fake_vector_services(service)
+    content = "\n".join([
+        "一、客户案例",
+        "企业：某外贸公司",
+        "任务要求",
+        "请完成需求挖掘。",
+        "匹配答案",
+        "可以先询问客户当前获客渠道。",
+        "命中点",
+        "确认客户预算和决策链。",
+    ])
+
+    first_upload = service.upload_knowledge(
+        file=UploadFile(filename="duplicate.txt", file=BytesIO(content.encode("utf-8"))),
+        source_type="lms_case",
+        created_by="tester",
+    )
+    service.publish_batch(first_upload.batch_id)
+    duplicate_upload = service.upload_knowledge(
+        file=UploadFile(filename="duplicate.txt", file=BytesIO(content.encode("utf-8"))),
+        source_type="lms_case",
+        created_by="tester",
+    )
+
+    assert duplicate_upload.status == "duplicated"
+    assert duplicate_upload.batch_id == first_upload.batch_id
+    assert duplicate_upload.document_id == first_upload.document_id
+
+
 def test_training_publish_writes_validation_report(tmp_path):
     """发布完成后，应把抽样检索验证结果写回质量报告。"""
 
@@ -356,6 +402,39 @@ def test_training_publish_writes_validation_report(tmp_path):
     assert publish_result.quality_report["publish_validation"]["passed"] is True
     saved_report = service._load_json(repository.get_batch(upload_result.batch_id)["quality_report_json"], {})
     assert saved_report["publish_validation"]["hit_count"] > 0
+
+
+def test_training_delete_batch_marks_document_deleted(tmp_path):
+    """删除训练批次时，应同步软删除 documents 文件台账记录。"""
+
+    repository = TrainingRepository(str(tmp_path / "training.db"))
+    service = SalesTrainingService(repository=repository)
+    fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
+    content = "\n".join([
+        "一、客户案例",
+        "企业：某外贸公司",
+        "任务要求",
+        "请完成需求挖掘。",
+        "匹配答案",
+        "可以先询问客户当前获客渠道。",
+        "命中点",
+        "确认客户预算和决策链。",
+    ])
+    upload_result = service.upload_knowledge(
+        file=UploadFile(filename="delete.txt", file=BytesIO(content.encode("utf-8"))),
+        source_type="lms_case",
+        created_by="tester",
+    )
+
+    delete_result = service.delete_batch(upload_result.batch_id)
+    batch = repository.get_batch(upload_result.batch_id)
+    document = service.knowledge_store.get_document(upload_result.document_id)
+
+    assert delete_result.status == "deleted"
+    assert batch["status"] == "deleted"
+    assert document["status"] == "deleted"
+    assert fake_vector_service.documents == []
+    assert fake_staging_service.documents == []
 
 
 def test_training_publish_archives_previous_version_and_rollback(tmp_path):

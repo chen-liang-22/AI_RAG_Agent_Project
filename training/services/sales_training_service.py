@@ -13,9 +13,10 @@ from fastapi import HTTPException, UploadFile
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from infrastructure.vector_store_service import VectorStoreService
 from model.factory import get_chat_model
 from rag.file_processors import FileProcessorFactory
-from rag.vector_store import VectorStoreService
+from rag.knowledge_store import KnowledgeStore
 from training.factories.knowledge_ingest_strategy_factory import KnowledgeIngestStrategyFactory
 from training.llm_ingest import TrainingLlmFallbackSplitter
 from training.publish_validation import TrainingPublishValidator
@@ -119,9 +120,15 @@ class SalesTrainingService:
     前端能理解的训练流程接口。一期流程较短，暂不引入 Graph。
     """
 
-    def __init__(self, repository: TrainingRepository | None = None):
+    def __init__(
+            self,
+            repository: TrainingRepository | None = None,
+            knowledge_store: KnowledgeStore | None = None,
+    ):
         # repository 支持注入，主要是为了单元测试可以传临时数据库。
         self.repository = repository or TrainingRepository()
+        # 文件台账复用知识库 documents 表；测试注入 SQLite 仓储时，文件台账也指向同一个临时库。
+        self.knowledge_store = knowledge_store or KnowledgeStore(self.repository.db_path)
         collection_config = _load_training_collection_config()
         self.training_collection_name = collection_config["published"]
         self.staging_collection_name = collection_config["staging"]
@@ -156,11 +163,12 @@ class SalesTrainingService:
         if file_type not in ALLOWED_TRAINING_FILE_TYPES:
             raise HTTPException(status_code=400, detail=f"训练知识暂不支持该文件类型：{file_type}")
 
-        # 阶段 2：为本次上传生成 batch_id，并把原始文件保存到 uploads/{batch_id}/。
-        # batch_id 是训练资料后续查询、预览、删除、向量过滤的主线索。
+        # 阶段 2：为本次上传生成 document_id 和 batch_id。
+        # document_id 管文件台账，batch_id 管训练资料的审核、发布、回滚流程。
+        document_id = f"doc_{uuid.uuid4().hex}"
         batch_id = f"batch_{uuid.uuid4().hex}"
-        # 拼出本批次上传目录的绝对路径，例如 uploads/batch_xxx，用来隔离保存每次上传的原始文件。
-        upload_dir = get_abs_path(os.path.join("uploads", batch_id))
+        # 拼出本文件上传目录的绝对路径，例如 uploads/doc_xxx，用来按文件维度保存原始资料。
+        upload_dir = get_abs_path(os.path.join("uploads", document_id))
         # 确保上传目录存在；exist_ok=True 表示目录已存在时不报错，便于重复执行或异常重试。
         os.makedirs(upload_dir, exist_ok=True)
         # 拼出原始文件最终保存路径，把清洗后的文件名放到本批次上传目录下。
@@ -189,29 +197,43 @@ class SalesTrainingService:
             )
             return TrainingKnowledgeUploadResponse(
                 batch_id=existing_batch["batch_id"],
+                document_id=existing_batch.get("document_id"),
                 status="duplicated",
                 chunk_count=int(existing_batch.get("chunk_count") or 0),
                 point_count=int(existing_batch.get("point_count") or 0),
-                source_file=existing_batch.get("source_file"),
+                source_file=self._batch_file_info(existing_batch).get("source_file"),
                 duplicate_of=existing_batch["batch_id"],
                 quality_report=self._load_json(existing_batch.get("quality_report_json"), {}),
             )
 
         version_info = self._next_training_batch_version(source_type=source_type, source_file=filename)
-        # 阶段 4：先创建业务数据库批次记录，状态置为 parsing。
+        # 阶段 4：先创建 documents 文件台账，再创建训练批次记录，状态置为 parsing。
         # 这样即使后续解析失败，也能在后台和日志里追踪到失败原因。
+        self.knowledge_store.create_document(
+            document_id=document_id,
+            filename=filename,
+            file_path=file_path,
+            file_type=file_type,
+            file_md5=file_md5,
+            file_size=os.path.getsize(file_path),
+            status="indexing",
+            collection_name=self.training_collection_name,
+            document_type="text",
+            split_strategy="recursive",
+        )
         # self.repository 是当前服务的仓储成员变量，专门负责读写训练相关的关系型数据。
         batch = self.repository.create_batch(
             # 本次上传批次的唯一编号，后续查切片、删向量、预览文件都靠它关联。
             batch_id=batch_id,
+            # 文件基础信息统一保存在 documents 表，训练批次只保留关联 ID。
+            document_id=document_id,
             # 资料来源类型，例如 lms_case，用来决定后续采用哪一种解析切片策略。
             source_type=source_type,
             # 用户上传的原始文件名，保存到数据库后用于列表展示和文件预览。
             source_file=filename,
-            # 原始文件在服务器本地的保存路径，后续预览或重新解析时会用到。
-            file_path=file_path,
-            # 原始文件内容的 MD5 指纹，用于判断是否上传过完全相同的文件。
-            file_md5=file_md5,
+            # 新链路不再把文件路径和 MD5 冗余写入训练批次表。
+            file_path=None,
+            file_md5=None,
             version_group_id=version_info["version_group_id"],
             version_no=version_info["version_no"],
             previous_batch_id=version_info.get("previous_batch_id"),
@@ -263,6 +285,15 @@ class SalesTrainingService:
                 point_count=point_count,
                 quality_report=quality_report,
             )
+            self.knowledge_store.update_document_status(
+                document_id,
+                "indexed",
+                chunk_count=len(chunks),
+                error_message=None,
+                collection_name=self.training_collection_name,
+                document_type="text",
+                split_strategy="recursive",
+            )
             logger.info(
                 "[销售训练] 训练知识预览生成完成 批次编号=%s 临时向量库=%s 切片数量=%s 向量点数量=%s 质量分=%s 切分方式=%s",
                 batch_id,
@@ -274,6 +305,7 @@ class SalesTrainingService:
             )
             return TrainingKnowledgeUploadResponse(
                 batch_id=batch["batch_id"],
+                document_id=document_id,
                 status="pending_review",
                 chunk_count=len(chunks),
                 point_count=point_count,
@@ -282,6 +314,14 @@ class SalesTrainingService:
             )
         except Exception as exc:
             # 任意阶段失败都把批次标记为 parsing_failed，并保留错误消息。
+            self.knowledge_store.update_document_status(
+                document_id,
+                "failed",
+                error_message=str(exc),
+                collection_name=self.training_collection_name,
+                document_type="text",
+                split_strategy="recursive",
+            )
             self.repository.update_batch_status(batch_id, status="parsing_failed", error_message=str(exc))
             logger.error("[销售训练] 训练知识预览生成失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"训练知识预览生成失败：{exc}") from exc
@@ -308,7 +348,8 @@ class SalesTrainingService:
 
         batch = self._get_active_batch(batch_id)
         file_path = self._resolve_batch_file_path(batch)
-        file_type = str(batch["source_file"]).rsplit(".", 1)[-1].lower() if "." in str(batch["source_file"]) else ""
+        source_file = str(self._batch_file_info(batch).get("source_file") or batch.get("source_file") or "")
+        file_type = source_file.rsplit(".", 1)[-1].lower() if "." in source_file else ""
         safe_max_chars = max(500, min(100000, max_chars))
 
         stored_preview = self._saved_chunk_preview(batch, safe_max_chars=safe_max_chars)
@@ -326,7 +367,7 @@ class SalesTrainingService:
             strategy = KnowledgeIngestStrategyFactory.create(batch.get("source_type") or "lms_case")
             chunks = strategy.parse_chunks(file_path, {
                 "batch_id": batch_id,
-                "source_file": batch.get("source_file"),
+                "source_file": source_file,
                 "source_type": batch.get("source_type"),
                 "visibility_default": batch.get("visibility_default") or DEFAULT_TRAINING_VISIBILITY,
             })
@@ -351,21 +392,18 @@ class SalesTrainingService:
         2. 业务数据库批次状态改成 deleted，原文件暂时保留。
         """
 
-        self._get_active_batch(batch_id)
+        batch = self._get_active_batch(batch_id)
         try:
-            VectorStoreService.delete_vectors_by_metadata(
-                "batch_id",
-                batch_id,
-                collection_name=self.training_collection_name,
-            )
-            VectorStoreService.delete_vectors_by_metadata(
-                "batch_id",
-                batch_id,
-                collection_name=self.staging_collection_name,
-            )
+            # ??????????????? fake ????????????? collection ???
+            self.vector_service.delete_by_metadata("batch_id", batch_id)
+            self.staging_vector_service.delete_by_metadata("batch_id", batch_id)
             deleted = self.repository.mark_batch_deleted(batch_id)
             if not deleted:
                 raise HTTPException(status_code=404, detail=f"训练资料不存在：{batch_id}")
+            # 文件基础信息统一保存在 documents 表，删除批次时同步软删除文件台账记录。
+            document_id = str(batch.get("document_id") or "").strip()
+            if document_id:
+                self.knowledge_store.mark_document_deleted(document_id)
         except HTTPException:
             raise
         except Exception as exc:
@@ -1900,11 +1938,12 @@ class SalesTrainingService:
 
         metadata = self._compact_metadata({
             "batch_id": batch["batch_id"],
+            "document_id": batch.get("document_id"),
             "chunk_id": chunk.chunk_id,
             "content_type": "sales_training_case",
             "source_type": source_type,
-            "source_file": batch.get("source_file"),
-            "file_md5": batch.get("file_md5"),
+            "source_file": self._batch_file_info(batch).get("source_file"),
+            "file_md5": self._batch_file_info(batch).get("file_md5"),
             "version_group_id": batch.get("version_group_id") or batch["batch_id"],
             "version_no": int(batch.get("version_no") or 1),
             "status": status,
@@ -2138,16 +2177,38 @@ class SalesTrainingService:
         documents = FileProcessorFactory.load_documents(file_path)
         return "\n\n".join(document.page_content for document in documents).strip()
 
-    @staticmethod
-    def _batch_response(row: dict[str, Any]) -> TrainingKnowledgeBatchResponse:
+    def _batch_file_info(self, row: dict[str, Any]) -> dict[str, Any]:
+        """读取训练资料关联的文件基础信息。
+
+        新数据以 documents 表为准；历史批次可能没有 document_id，
+        因此仍保留 source_file、file_path、file_md5 旧字段兜底。
+        """
+
+        document_id = str(row.get("document_id") or "").strip()
+        document = None
+        joined_source_file = row.get("document_filename")
+        joined_file_path = row.get("document_file_path")
+        joined_file_md5 = row.get("document_file_md5")
+        if document_id and not any((joined_source_file, joined_file_path, joined_file_md5)):
+            document = self.knowledge_store.get_document(document_id)
+        return {
+            "document_id": document_id or None,
+            "source_file": joined_source_file or (document or {}).get("filename") or row.get("source_file"),
+            "file_path": joined_file_path or (document or {}).get("file_path") or row.get("file_path"),
+            "file_md5": joined_file_md5 or (document or {}).get("file_md5") or row.get("file_md5"),
+        }
+
+    def _batch_response(self, row: dict[str, Any]) -> TrainingKnowledgeBatchResponse:
         """把训练资料批次数据库行转换成前端响应。"""
 
+        file_info = self._batch_file_info(row)
         return TrainingKnowledgeBatchResponse(
             batch_id=row["batch_id"],
+            document_id=file_info.get("document_id"),
             source_type=row["source_type"],
-            source_file=row["source_file"],
-            file_path=row.get("file_path"),
-            file_md5=row.get("file_md5"),
+            source_file=file_info.get("source_file") or row["source_file"],
+            file_path=file_info.get("file_path"),
+            file_md5=file_info.get("file_md5"),
             version_group_id=row.get("version_group_id") or row["batch_id"],
             version_no=int(row.get("version_no") or 1),
             previous_batch_id=row.get("previous_batch_id"),
@@ -2178,11 +2239,12 @@ class SalesTrainingService:
     def _resolve_batch_file_path(self, batch: dict[str, Any]) -> str:
         """获取训练资料原文件路径。
 
-        新版本上传会把 file_path 写入数据库；旧批次可能没有这个字段。
+        新数据从 documents 读取文件路径；旧批次可能没有 document_id。
         为了兼容已经上传过的老资料，这里按 uploads/{batch_id}/{source_file} 再兜底找一次。
         """
 
-        file_path = str(batch.get("file_path") or "").strip()
+        file_info = self._batch_file_info(batch)
+        file_path = str(file_info.get("file_path") or "").strip()
         if not file_path:
             file_path = get_abs_path(os.path.join("uploads", batch["batch_id"], batch["source_file"]))
         return self._validate_training_file_path(file_path)

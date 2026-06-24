@@ -18,7 +18,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from langchain_core.messages import HumanMessage, SystemMessage
 from qdrant_client import QdrantClient, models
 
-from api.common_services import _get_knowledge_store
+from api.services.common_services import _get_knowledge_store
 from api.exam_schemas import (
     ExamAnswerAnalysis,
     ExamAnswerRequest,

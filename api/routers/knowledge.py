@@ -16,9 +16,9 @@ from api.schemas import (
     KnowledgeUploadRecommendResponse,
     KnowledgeUploadResponse,
 )
-from api.common_services import _document_to_response, _get_knowledge_store, build_document_dictionary_snapshot
-from api.indexing_services import _index_document, _sync_data_files_to_documents
-from api.upload_services import (
+from api.services.common_services import _document_to_response, _get_knowledge_store, build_document_dictionary_snapshot
+from api.services.indexing_services import _index_document, _sync_data_files_to_documents
+from api.services.upload_services import (
     _get_preview_file,
     _move_upload_file,
     _recommend_upload_split_strategy,
@@ -202,7 +202,7 @@ def preview_knowledge_file(file: UploadFile = File(...)) -> KnowledgeUploadPrevi
     duplicate_document = store.find_active_document_by_md5(file_md5)
 
     try:
-        from rag.vector_store import VectorStoreService
+        from infrastructure.vector_store_service import VectorStoreService
 
         preview = VectorStoreService().preview_file(filename=filename, file_path=file_path)
     except Exception as exc:
@@ -393,7 +393,7 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
         raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
     try:
-        from rag.vector_store import VectorStoreService  # 延迟导入，只在删除 Qdrant points 时加载
+        from infrastructure.vector_store_service import VectorStoreService  # 延迟导入，只在删除 Qdrant points 时加载
 
         VectorStoreService.delete_document_vectors(document_id, collection_name=document.get("collection_name"))
         store.mark_document_deleted(document_id)
@@ -424,7 +424,7 @@ def reindex_all_knowledge_files() -> KnowledgeBulkReindexResponse:
     failed = 0
 
     try:
-        from rag.vector_store import VectorStoreService
+        from infrastructure.vector_store_service import VectorStoreService
 
         vector_stores: dict[str, VectorStoreService] = {}
     except Exception as exc:
@@ -515,7 +515,7 @@ def reload_knowledge() -> dict:
     store = _get_knowledge_store()
 
     try:
-        from rag.vector_store import VectorStoreService  # 延迟导入，只有重载知识库时才加载向量库服务
+        from infrastructure.vector_store_service import VectorStoreService  # 延迟导入，只有重载知识库时才加载向量库服务
 
         _sync_data_files_to_documents(store)
         documents = store.list_documents()

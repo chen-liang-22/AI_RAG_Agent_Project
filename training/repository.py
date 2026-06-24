@@ -66,11 +66,14 @@ class TrainingRepository:
 
         with self.connect() as conn:
             if is_mysql_runtime(self.db_path):
+                self._ensure_mysql_training_batch_document_column(conn)
                 return
+            self._ensure_sqlite_documents_table(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS training_knowledge_batches (
                     batch_id TEXT PRIMARY KEY,
+                    document_id TEXT,
                     source_type TEXT NOT NULL,
                     source_file TEXT NOT NULL,
                     file_path TEXT,
@@ -96,7 +99,8 @@ class TrainingRepository:
                 """
             )
             # training_knowledge_batches：一次文件上传对应一条批次记录。
-            # 它主要保存文件级元数据和处理状态，不保存大段正文。
+            # 文件基础信息统一放在 documents 表，本表只保存训练批次、版本、审核发布等业务状态。
+            self._ensure_column(conn, "training_knowledge_batches", "document_id", "TEXT")
             self._ensure_column(conn, "training_knowledge_batches", "file_path", "TEXT")
             self._ensure_column(conn, "training_knowledge_batches", "quality_report_json", "TEXT")
             self._ensure_column(conn, "training_knowledge_batches", "version_group_id", "TEXT")
@@ -264,6 +268,62 @@ class TrainingRepository:
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
 
     @staticmethod
+    def _ensure_sqlite_documents_table(conn: Any) -> None:
+        """给训练仓储的 SQLite 测试库补齐 documents 文件台账表。
+
+        运行时 MySQL 由初始化 SQL 管理表结构；SQLite 测试库可能只实例化 TrainingRepository。
+        因为训练批次需要 LEFT JOIN documents 展示文件基础信息，这里创建轻量兼容表。
+        """
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                document_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                file_md5 TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                collection_name TEXT NOT NULL DEFAULT 'agent',
+                document_type TEXT NOT NULL DEFAULT 'text',
+                split_strategy TEXT NOT NULL DEFAULT 'recursive',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                error_message TEXT
+            )
+            """
+        )
+
+    @staticmethod
+    def _ensure_mysql_training_batch_document_column(conn: Any) -> None:
+        """给 MySQL 运行库补齐训练批次到 documents 的关联字段。
+
+        生产库表结构主要由 SQL 脚本维护；这里做小范围兼容迁移，
+        避免老库升级代码后缺少 document_id 字段导致上传失败。
+        """
+
+        table_rows = conn.execute("SHOW TABLES LIKE 'training_knowledge_batches'").fetchall()
+        if not table_rows:
+            return
+        column_rows = conn.execute("SHOW COLUMNS FROM training_knowledge_batches LIKE 'document_id'").fetchall()
+        if not column_rows:
+            conn.execute(
+                """
+                ALTER TABLE training_knowledge_batches
+                ADD COLUMN document_id VARCHAR(64) NULL COMMENT '关联 documents.document_id，文件基础信息统一保存在 documents 表'
+                AFTER batch_id
+                """
+            )
+        index_rows = conn.execute(
+            "SHOW INDEX FROM training_knowledge_batches WHERE Key_name = 'idx_training_batches_document'"
+        ).fetchall()
+        if not index_rows:
+            conn.execute("CREATE INDEX idx_training_batches_document ON training_knowledge_batches(document_id)")
+
+    @staticmethod
     def _migrate_training_plans_allow_duplicate_names(conn: Any) -> None:
         """把旧训练方案表迁移为允许同名训练。
 
@@ -385,16 +445,17 @@ class TrainingRepository:
             conn.execute(
                 """
                 INSERT INTO training_knowledge_batches (
-                    batch_id, source_type, source_file, file_path, file_md5,
+                    batch_id, document_id, source_type, source_file, file_path, file_md5,
                     version_group_id, version_no, previous_batch_id, is_current,
                     profile_type, task_type, industry, difficulty, visibility_default, status,
                     error_message, quality_report_json, created_by, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     # 统一使用 ? 作为仓储层参数占位符，MySQL 连接层会自动转换，避免手动拼 SQL。
                     batch_id,
+                    values.get("document_id"),
                     values.get("source_type"),
                     values.get("source_file"),
                     values.get("file_path"),
@@ -467,10 +528,18 @@ class TrainingRepository:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT *
-                FROM training_knowledge_batches
-                WHERE source_type = ? AND source_file = ? AND status != 'deleted'
-                ORDER BY version_no DESC, updated_at DESC, created_at DESC
+                SELECT
+                    b.*,
+                    d.filename AS document_filename,
+                    d.file_path AS document_file_path,
+                    d.file_md5 AS document_file_md5,
+                    d.file_type AS document_file_type,
+                    d.file_size AS document_file_size,
+                    d.status AS document_status
+                FROM training_knowledge_batches b
+                LEFT JOIN documents d ON d.document_id = b.document_id
+                WHERE b.source_type = ? AND b.source_file = ? AND b.status != 'deleted'
+                ORDER BY b.version_no DESC, b.updated_at DESC, b.created_at DESC
                 LIMIT 1
                 """,
                 (source_type, source_file),
@@ -502,17 +571,25 @@ class TrainingRepository:
         params: list[Any] = [version_group_id]
         exclude_sql = ""
         if exclude_batch_id:
-            exclude_sql = "AND batch_id != ?"
+            exclude_sql = "AND b.batch_id != ?"
             params.append(exclude_batch_id)
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT *
-                FROM training_knowledge_batches
-                WHERE version_group_id = ?
-                  AND status IN ('published', 'archived')
+                SELECT
+                    b.*,
+                    d.filename AS document_filename,
+                    d.file_path AS document_file_path,
+                    d.file_md5 AS document_file_md5,
+                    d.file_type AS document_file_type,
+                    d.file_size AS document_file_size,
+                    d.status AS document_status
+                FROM training_knowledge_batches b
+                LEFT JOIN documents d ON d.document_id = b.document_id
+                WHERE b.version_group_id = ?
+                  AND b.status IN ('published', 'archived')
                   {exclude_sql}
-                ORDER BY version_no DESC, updated_at DESC
+                ORDER BY b.version_no DESC, b.updated_at DESC
                 """,
                 params,
             ).fetchall()
@@ -524,11 +601,19 @@ class TrainingRepository:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT *
-                FROM training_knowledge_batches
-                WHERE version_group_id = ?
-                  AND status != 'deleted'
-                ORDER BY version_no DESC, updated_at DESC, created_at DESC
+                SELECT
+                    b.*,
+                    d.filename AS document_filename,
+                    d.file_path AS document_file_path,
+                    d.file_md5 AS document_file_md5,
+                    d.file_type AS document_file_type,
+                    d.file_size AS document_file_size,
+                    d.status AS document_status
+                FROM training_knowledge_batches b
+                LEFT JOIN documents d ON d.document_id = b.document_id
+                WHERE b.version_group_id = ?
+                  AND b.status != 'deleted'
+                ORDER BY b.version_no DESC, b.updated_at DESC, b.created_at DESC
                 """,
                 (version_group_id,),
             ).fetchall()
@@ -560,10 +645,18 @@ class TrainingRepository:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT *
-                FROM training_knowledge_batches
-                WHERE file_md5 = ? AND status = 'published'
-                ORDER BY updated_at DESC, created_at DESC
+                SELECT
+                    b.*,
+                    d.filename AS document_filename,
+                    d.file_path AS document_file_path,
+                    d.file_md5 AS document_file_md5,
+                    d.file_type AS document_file_type,
+                    d.file_size AS document_file_size,
+                    d.status AS document_status
+                FROM training_knowledge_batches b
+                LEFT JOIN documents d ON d.document_id = b.document_id
+                WHERE COALESCE(d.file_md5, b.file_md5) = ? AND b.status = 'published'
+                ORDER BY b.updated_at DESC, b.created_at DESC
                 LIMIT 1
                 """,
                 (file_md5,),
@@ -580,10 +673,18 @@ class TrainingRepository:
             ).fetchone()
             rows = conn.execute(
                 """
-                SELECT *
-                FROM training_knowledge_batches
-                WHERE status != 'deleted'
-                ORDER BY updated_at DESC, created_at DESC
+                SELECT
+                    b.*,
+                    d.filename AS document_filename,
+                    d.file_path AS document_file_path,
+                    d.file_md5 AS document_file_md5,
+                    d.file_type AS document_file_type,
+                    d.file_size AS document_file_size,
+                    d.status AS document_status
+                FROM training_knowledge_batches b
+                LEFT JOIN documents d ON d.document_id = b.document_id
+                WHERE b.status != 'deleted'
+                ORDER BY b.updated_at DESC, b.created_at DESC
                 LIMIT ? OFFSET ?
                 """,
                 (page_size, offset),
@@ -617,7 +718,22 @@ class TrainingRepository:
 
     def get_batch(self, batch_id: str) -> TrainingKnowledgeBatchEntity | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM training_knowledge_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+            row = conn.execute(
+                """
+                SELECT
+                    b.*,
+                    d.filename AS document_filename,
+                    d.file_path AS document_file_path,
+                    d.file_md5 AS document_file_md5,
+                    d.file_type AS document_file_type,
+                    d.file_size AS document_file_size,
+                    d.status AS document_status
+                FROM training_knowledge_batches b
+                LEFT JOIN documents d ON d.document_id = b.document_id
+                WHERE b.batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
         return self._row(row)
 
     def create_plan(self, **values: Any) -> TrainingPlanEntity:

@@ -131,10 +131,11 @@ class TrainingKnowledgeBatchEntity(TypedDict):
     """training_knowledge_batches 表实体，记录销售训练资料上传批次。"""
 
     batch_id: str  # 上传批次编号
+    document_id: str | None  # 关联 documents.document_id，统一保存文件基础信息
     source_type: str  # 资料来源类型
     source_file: str  # 原始文件名
-    file_path: str | None  # 本地文件路径
-    file_md5: str | None  # 文件 MD5
+    file_path: str | None  # 历史兼容字段，新上传优先读取 documents.file_path
+    file_md5: str | None  # 历史兼容字段，新上传优先读取 documents.file_md5
     version_group_id: str | None  # 版本组编号
     version_no: int  # 版本号
     previous_batch_id: str | None  # 上一个批次编号

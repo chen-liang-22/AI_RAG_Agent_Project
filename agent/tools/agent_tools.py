@@ -2,7 +2,7 @@ import os
 from utils.logger_handler import logger
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
-from rag.rag_service import RagSummarizeService
+from rag.services.rag_service import RagSummarizeService
 import random
 from utils.config_handler import agent_conf
 from utils.path_tool import get_abs_path

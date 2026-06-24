@@ -34,6 +34,17 @@ def test_training_repository_allows_duplicate_plan_names(tmp_path):
     assert {plan["plan_name"] for plan in plans} == {"海外 BD 异议处理"}
 
 
+def test_training_repository_batch_has_document_id_column(tmp_path):
+    """训练资料批次表应通过 document_id 关联 documents 文件台账。"""
+
+    repository = TrainingRepository(str(tmp_path / "training.db"))
+
+    with repository.connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(training_knowledge_batches)").fetchall()}
+
+    assert "document_id" in columns
+
+
 def test_training_repository_migrates_old_unique_plan_name_table(tmp_path):
     """旧库如果还带 plan_name 唯一约束，初始化时应自动迁移为允许同名。"""
 
