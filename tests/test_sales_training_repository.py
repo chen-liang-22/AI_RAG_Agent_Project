@@ -6,7 +6,7 @@ from training.services.sales_training_service import SalesTrainingService
 def test_training_repository_allows_duplicate_plan_names(tmp_path):
     """训练名称允许重复，训练记录通过 plan_id 区分。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     base_payload = {
         "plan_name": "海外 BD 异议处理",
         "trainee": {
@@ -34,81 +34,10 @@ def test_training_repository_allows_duplicate_plan_names(tmp_path):
     assert {plan["plan_name"] for plan in plans} == {"海外 BD 异议处理"}
 
 
-def test_training_repository_batch_has_document_id_column(tmp_path):
-    """训练资料批次表应通过 document_id 关联 documents 文件台账。"""
-
-    repository = TrainingRepository(str(tmp_path / "training.db"))
-
-    with repository.connect() as conn:
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(training_knowledge_batches)").fetchall()}
-
-    assert "document_id" in columns
-
-
-def test_training_repository_migrates_old_unique_plan_name_table(tmp_path):
-    """旧库如果还带 plan_name 唯一约束，初始化时应自动迁移为允许同名。"""
-
-    db_path = tmp_path / "training.db"
-    repository = TrainingRepository(str(db_path))
-    payload = {
-        "plan_name": "成本异议训练",
-        "trainee": {
-            "trainee_id": "trainee-1",
-            "trainee_name": "销售学员",
-            "position_role": "overseas_bd",
-            "experience_level": "junior",
-            "task_goal": "goal_junior",
-            "weakness_tags": [],
-            "student_portrait_other": "",
-        },
-        "profile_type": "overseas_bd",
-        "selected_fields": {},
-        "scenario_description": "客户关注成本。",
-        "extra_details": "",
-        "model_mode": "high",
-    }
-    repository.create_plan(**payload)
-
-    with repository.connect() as conn:
-        conn.execute("ALTER TABLE training_plans RENAME TO training_plans_backup")
-        conn.execute(
-            """
-            CREATE TABLE training_plans (
-                plan_id TEXT PRIMARY KEY,
-                plan_name TEXT NOT NULL UNIQUE,
-                trainee_id TEXT NOT NULL,
-                trainee_name TEXT NOT NULL,
-                profile_type TEXT NOT NULL,
-                trainee_json TEXT NOT NULL,
-                selected_fields_json TEXT NOT NULL,
-                scenario_description TEXT NOT NULL,
-                extra_details TEXT,
-                model_mode TEXT,
-                active_profile_id TEXT,
-                active_setting_id TEXT,
-                role_status TEXT NOT NULL,
-                goal_status TEXT NOT NULL,
-                score_status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute("INSERT INTO training_plans SELECT * FROM training_plans_backup")
-        conn.execute("DROP TABLE training_plans_backup")
-
-    migrated_repository = TrainingRepository(str(db_path))
-    migrated_repository.create_plan(**payload)
-    plans, total = migrated_repository.list_plans(page=1, page_size=10, keyword="成本异议")
-
-    assert total == 2
-    assert len({plan["plan_id"] for plan in plans}) == 2
-
-
 def test_training_repository_persists_history_and_score(tmp_path):
     """训练仓储应能保存会话、开场白、学员轮次和评分，供前端复盘使用。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     role = repository.save_role_profile(
         trainee_id="trainee-1",
         profile_type="overseas_bd",
@@ -198,7 +127,7 @@ def test_training_repository_persists_history_and_score(tmp_path):
 def test_training_plan_snapshot_is_independent_and_only_real_changes_mark_stale(tmp_path):
     """训练方案允许同名独立保存；只有画像或场景真实变化时才标记后续内容需重新生成。"""
 
-    service = SalesTrainingService(repository=TrainingRepository(str(tmp_path / "training.db")))
+    service = SalesTrainingService(repository=TrainingRepository())
     base_trainee = {
         "trainee_id": "trainee-1",
         "trainee_name": "张三",

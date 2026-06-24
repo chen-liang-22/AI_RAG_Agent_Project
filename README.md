@@ -119,29 +119,26 @@ MySQL 初始化建表和基础字典数据在：
 docs/mysql初始化建表和基础数据.sql
 ```
 
-当前 SQLite 业务数据导入脚本在：
+当前 MySQL 业务数据导入脚本在：
 
 ```text
-docs/mysql业务数据导入.sql
+docs/mysql纯业务数据导入.sql
 ```
 
 推荐执行顺序：
 
 ```powershell
 mysql -u root -p < docs/mysql初始化建表和基础数据.sql
-mysql -u root -p < docs/mysql业务数据导入.sql
+mysql -u root -p < docs/mysql纯业务数据导入.sql
 ```
 
-这两个脚本都不包含 Qdrant 向量数据。业务数据导入脚本会先清空目标业务表，再导入迁移时
-旧本地库中的数据，适合一次性迁移。
-
-完成迁移后，项目运行时不再依赖本地 SQLite 文件；旧本地库可以删除，业务数据以 MySQL 为准。
+这两个脚本都不包含 Qdrant 向量数据。业务数据导入脚本会先清空目标业务表，再导入 MySQL 业务数据。
+项目运行时业务数据以 MySQL 为准。
 
 重新生成 SQL：
 
 ```powershell
 .\.venv312\Scripts\python.exe scripts\generate_mysql_init_sql.py
-.\.venv312\Scripts\python.exe scripts\export_sqlite_data_to_mysql_sql.py
 ```
 
 ## Vue Frontend

@@ -1,483 +1,146 @@
 import json
 import uuid
-from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Iterator
+from typing import Any
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session
 
 from domain.entities import (
+    DocumentEntity,
     SalesTrainingScoreEntity,
     SalesTrainingSessionEntity,
     SalesTrainingTurnEntity,
     TrainingGoalSettingEntity,
     TrainingKnowledgeBatchEntity,
     TrainingPlanEntity,
-    TrainingRepositoryRow,
     TrainingRoleProfileEntity,
 )
-from utils.database_connection import database_context, is_mysql_runtime
+from infrastructure.orm_session import orm_session_context
 
 
 def utc_now_text() -> str:
-    """返回统一格式的 UTC 时间字符串。
-
-    Python 的 datetime.utcnow() 返回 UTC 时间。
-    timespec="seconds" 表示只保留到秒，避免数据库里出现太长的小数秒。
-    """
+    """返回统一格式的 UTC 时间字符串。"""
 
     return datetime.utcnow().isoformat(timespec="seconds", sep=" ")
+
+
+def utc_now() -> datetime:
+    """返回去掉微秒的 UTC 时间，便于写入 MySQL DATETIME 字段。"""
+
+    return datetime.utcnow().replace(microsecond=0)
+
+
+def to_datetime(value: Any) -> datetime | None:
+    """把 service 层传入的时间字符串转换为 ORM DateTime 可写入的对象。"""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(microsecond=0)
+    if isinstance(value, str):
+        clean_value = value.strip()
+        if not clean_value:
+            return None
+        try:
+            return datetime.fromisoformat(clean_value).replace(microsecond=0)
+        except ValueError:
+            return utc_now()
+    return utc_now()
 
 
 class TrainingRepository:
     """销售训练业务仓储。
 
-    训练域表较多，独立仓储能避免把 KnowledgeStore 继续膨胀。
+    这个类是训练域访问 MySQL 的唯一入口，职责类似 Java 项目里的
+    Service 依赖 Mapper/Repository。所有关系型数据库读写都通过
+    SQLAlchemy ORM Entity 完成，不再手写 cursor SQL。
     """
 
-    def __init__(self, db_path: str | None = None):
-        # db_path 只给单元测试传入临时兼容库；运行时默认走 config/database.yml 中的 MySQL。
-        self.db_path = db_path
-        # 对象创建时确保表存在，类似 Java 构造器里初始化 DAO 依赖。
-        self.init_db()
-
-    @contextmanager
-    def connect(self) -> Iterator[Any]:
-        """打开业务数据库连接，自动提交或回滚。
-
-        @contextmanager 让这个函数可以写成：
-
-            with self.connect() as conn:
-                ...
-
-        这和 Java 的 try-with-resources 很像：
-        - 正常执行：yield 后面的 conn.commit() 会提交事务；
-        - 出现异常：except 里 rollback；
-        - 最后都会 close 连接。
-        """
-
-        with database_context(self.db_path) as conn:
-            yield conn
-
-    def init_db(self) -> None:
-        """初始化一期需要的训练表。
-
-        MySQL 模式下，表结构由 docs/mysql初始化建表和基础数据.sql 管理。
-        显式传入 db_path 的测试场景仍使用临时兼容库自动建表。
-        """
-
-        with self.connect() as conn:
-            if is_mysql_runtime(self.db_path):
-                self._ensure_mysql_training_batch_document_column(conn)
-                return
-            self._ensure_sqlite_documents_table(conn)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS training_knowledge_batches (
-                    batch_id TEXT PRIMARY KEY,
-                    document_id TEXT,
-                    source_type TEXT NOT NULL,
-                    source_file TEXT NOT NULL,
-                    file_path TEXT,
-                    file_md5 TEXT,
-                    version_group_id TEXT,
-                    version_no INTEGER NOT NULL DEFAULT 1,
-                    previous_batch_id TEXT,
-                    is_current INTEGER NOT NULL DEFAULT 0,
-                    profile_type TEXT,
-                    task_type TEXT,
-                    industry TEXT,
-                    difficulty TEXT,
-                    visibility_default TEXT,
-                    status TEXT NOT NULL,
-                    chunk_count INTEGER NOT NULL DEFAULT 0,
-                    point_count INTEGER NOT NULL DEFAULT 0,
-                    error_message TEXT,
-                    quality_report_json TEXT,
-                    created_by TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            # training_knowledge_batches：一次文件上传对应一条批次记录。
-            # 文件基础信息统一放在 documents 表，本表只保存训练批次、版本、审核发布等业务状态。
-            self._ensure_column(conn, "training_knowledge_batches", "document_id", "TEXT")
-            self._ensure_column(conn, "training_knowledge_batches", "file_path", "TEXT")
-            self._ensure_column(conn, "training_knowledge_batches", "quality_report_json", "TEXT")
-            self._ensure_column(conn, "training_knowledge_batches", "version_group_id", "TEXT")
-            self._ensure_column(conn, "training_knowledge_batches", "version_no", "INTEGER NOT NULL DEFAULT 1")
-            self._ensure_column(conn, "training_knowledge_batches", "previous_batch_id", "TEXT")
-            self._ensure_column(conn, "training_knowledge_batches", "is_current", "INTEGER NOT NULL DEFAULT 0")
-            self._migrate_training_batch_versions(conn)
-            self._drop_training_knowledge_chunks(conn)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS training_role_profiles (
-                    profile_id TEXT PRIMARY KEY,
-                    trainee_id TEXT NOT NULL,
-                    plan_id TEXT,
-                    profile_type TEXT NOT NULL,
-                    visible_profile_json TEXT NOT NULL,
-                    hidden_profile_json TEXT NOT NULL,
-                    role_profile_json TEXT NOT NULL,
-                    role_confirm_card_json TEXT NOT NULL,
-                    selected_fields_json TEXT,
-                    scenario_description TEXT,
-                    extra_details TEXT,
-                    retrieved_evidence_json TEXT,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            # training_role_profiles：保存 AI 客户画像。
-            # visible/hidden/role/confirm_card 分开存，方便控制哪些内容给学员看。
-            self._ensure_column(conn, "training_role_profiles", "plan_id", "TEXT")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS training_goal_settings (
-                    setting_id TEXT PRIMARY KEY,
-                    profile_id TEXT NOT NULL,
-                    plan_id TEXT,
-                    trainee_id TEXT NOT NULL,
-                    training_mode TEXT NOT NULL,
-                    training_purpose TEXT NOT NULL,
-                    round_limit INTEGER NOT NULL,
-                    stages_json TEXT NOT NULL,
-                    scoring_rules_json TEXT,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            # training_goal_settings：保存开放式训练目标、动态轮数和阶段条件。
-            self._ensure_column(conn, "training_goal_settings", "plan_id", "TEXT")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS training_plans (
-                    plan_id TEXT PRIMARY KEY,
-                    plan_name TEXT NOT NULL,
-                    trainee_id TEXT NOT NULL,
-                    trainee_name TEXT NOT NULL,
-                    profile_type TEXT NOT NULL,
-                    trainee_json TEXT NOT NULL,
-                    selected_fields_json TEXT NOT NULL,
-                    scenario_description TEXT NOT NULL,
-                    extra_details TEXT,
-                    model_mode TEXT,
-                    active_profile_id TEXT,
-                    active_setting_id TEXT,
-                    role_status TEXT NOT NULL,
-                    goal_status TEXT NOT NULL,
-                    score_status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            # training_plans：训练方案主表，负责把“训练名称、角色、阶段、评分规则”串起来。
-            self._migrate_training_plans_allow_duplicate_names(conn)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sales_training_sessions (
-                    session_id TEXT PRIMARY KEY,
-                    profile_id TEXT NOT NULL,
-                    setting_id TEXT NOT NULL,
-                    trainee_id TEXT NOT NULL,
-                    training_mode TEXT NOT NULL,
-                    response_mode TEXT NOT NULL,
-                    current_stage_no INTEGER NOT NULL DEFAULT 1,
-                    status TEXT NOT NULL,
-                    round_limit INTEGER NOT NULL,
-                    total_score INTEGER,
-                    level TEXT,
-                    report_json TEXT,
-                    started_at TEXT NOT NULL,
-                    ended_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            # sales_training_sessions：一场训练会话的主表。
-            # 对话轮次和评分分开存，避免主表被大文本撑大。
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sales_training_turns (
-                    turn_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    round_no INTEGER NOT NULL,
-                    stage_no INTEGER NOT NULL DEFAULT 1,
-                    response_mode TEXT,
-                    started_at TEXT,
-                    submitted_at TEXT,
-                    response_seconds REAL,
-                    retrieved_chunk_ids_json TEXT,
-                    retrieved_evidence_json TEXT,
-                    stage_decision_json TEXT,
-                    coach_analysis_json TEXT,
-                    metadata_json TEXT,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(session_id) REFERENCES sales_training_sessions(session_id)
-                )
-                """
-            )
-            self._ensure_column(conn, "training_goal_settings", "scoring_rules_json", "TEXT")
-            self._ensure_column(conn, "sales_training_turns", "coach_analysis_json", "TEXT")
-            # sales_training_turns：保存每一轮学员/AI 客户对话。
-            # round_no=0 约定为 AI 客户开场白。
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sales_training_scores (
-                    score_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    general_score INTEGER NOT NULL,
-                    stage_score INTEGER NOT NULL,
-                    penalty_score INTEGER NOT NULL,
-                    final_score INTEGER NOT NULL,
-                    level TEXT NOT NULL,
-                    is_passed INTEGER NOT NULL,
-                    detail_json TEXT NOT NULL,
-                    review_status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(session_id) REFERENCES sales_training_sessions(session_id)
-                )
-                """
-            )
+    def __init__(self):
+        # 表结构由 docs/mysql初始化建表和基础数据.sql 管理。
+        # 仓储层只负责业务 CRUD，不在运行时偷偷补表，避免结构来源分裂。
+        pass
 
     @staticmethod
     def _json(data: Any) -> str:
-        # ensure_ascii=False 保证中文直接存中文，而不是 \u4e2d 这种转义。
+        """把 Python 对象序列化为数据库 JSON 字符串。"""
+
         return json.dumps(data, ensure_ascii=False)
 
     @staticmethod
-    def _ensure_column(conn: Any, table_name: str, column_name: str, column_definition: str) -> None:
-        """给测试兼容库的旧表补字段。
+    def _enrich_batch_with_document(
+            batch: TrainingKnowledgeBatchEntity,
+            document: DocumentEntity | None,
+    ) -> TrainingKnowledgeBatchEntity:
+        """把 documents 表的文件信息挂到训练批次实体上。
 
-        本地兼容库没有 ADD COLUMN IF NOT EXISTS，所以先用 PRAGMA table_info 读取已有字段。
-        table_name 和 column_name 都是代码里的固定值，不接收外部输入。
+        这些 document_* 字段不是 training_knowledge_batches 表字段，
+        只是列表和预览接口的只读展示字段，所以作为实体临时属性附加。
         """
 
-        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        existing_columns = {str(row["name"]) for row in rows}
-        if column_name not in existing_columns:
-            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+        batch.document_filename = document.filename if document else None
+        batch.document_file_path = document.file_path if document else None
+        batch.document_file_md5 = document.file_md5 if document else None
+        batch.document_file_type = document.file_type if document else None
+        batch.document_file_size = document.file_size if document else None
+        batch.document_status = document.status if document else None
+        return batch
 
     @staticmethod
-    def _ensure_sqlite_documents_table(conn: Any) -> None:
-        """给训练仓储的 SQLite 测试库补齐 documents 文件台账表。
+    def _batch_select_statement():
+        """构造训练批次和文档信息的 ORM join 查询。"""
 
-        运行时 MySQL 由初始化 SQL 管理表结构；SQLite 测试库可能只实例化 TrainingRepository。
-        因为训练批次需要 LEFT JOIN documents 展示文件基础信息，这里创建轻量兼容表。
-        """
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS documents (
-                document_id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                file_md5 TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                version INTEGER NOT NULL DEFAULT 1,
-                chunk_count INTEGER NOT NULL DEFAULT 0,
-                collection_name TEXT NOT NULL DEFAULT 'agent',
-                document_type TEXT NOT NULL DEFAULT 'text',
-                split_strategy TEXT NOT NULL DEFAULT 'recursive',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                error_message TEXT
-            )
-            """
+        return select(TrainingKnowledgeBatchEntity, DocumentEntity).outerjoin(
+            DocumentEntity,
+            DocumentEntity.document_id == TrainingKnowledgeBatchEntity.document_id,
         )
 
-    @staticmethod
-    def _ensure_mysql_training_batch_document_column(conn: Any) -> None:
-        """给 MySQL 运行库补齐训练批次到 documents 的关联字段。
+    @classmethod
+    def _scalars_to_batches(
+            cls,
+            rows: list[tuple[TrainingKnowledgeBatchEntity, DocumentEntity | None]],
+    ) -> list[TrainingKnowledgeBatchEntity]:
+        """把 ORM join 结果转换成带文件展示信息的训练批次实体列表。"""
 
-        生产库表结构主要由 SQL 脚本维护；这里做小范围兼容迁移，
-        避免老库升级代码后缺少 document_id 字段导致上传失败。
-        """
-
-        table_rows = conn.execute("SHOW TABLES LIKE 'training_knowledge_batches'").fetchall()
-        if not table_rows:
-            return
-        column_rows = conn.execute("SHOW COLUMNS FROM training_knowledge_batches LIKE 'document_id'").fetchall()
-        if not column_rows:
-            conn.execute(
-                """
-                ALTER TABLE training_knowledge_batches
-                ADD COLUMN document_id VARCHAR(64) NULL COMMENT '关联 documents.document_id，文件基础信息统一保存在 documents 表'
-                AFTER batch_id
-                """
-            )
-        index_rows = conn.execute(
-            "SHOW INDEX FROM training_knowledge_batches WHERE Key_name = 'idx_training_batches_document'"
-        ).fetchall()
-        if not index_rows:
-            conn.execute("CREATE INDEX idx_training_batches_document ON training_knowledge_batches(document_id)")
-
-    @staticmethod
-    def _migrate_training_plans_allow_duplicate_names(conn: Any) -> None:
-        """把旧训练方案表迁移为允许同名训练。
-
-        本地兼容库不能直接删除 UNIQUE 约束，所以检测到旧表仍然把 plan_name 作为唯一字段时，
-        需要建临时表、复制数据、替换旧表。每场训练仍然由 plan_id 保证唯一。
-        """
-
-        unique_indexes = conn.execute("PRAGMA index_list(training_plans)").fetchall()
-        has_plan_name_unique_index = False
-        for index_row in unique_indexes:
-            if int(index_row["unique"] or 0) != 1:
-                continue
-            index_columns = conn.execute(f"PRAGMA index_info({index_row['name']})").fetchall()
-            column_names = [str(column["name"]) for column in index_columns]
-            if column_names == ["plan_name"]:
-                has_plan_name_unique_index = True
-                break
-        if not has_plan_name_unique_index:
-            return
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS training_plans_new (
-                plan_id TEXT PRIMARY KEY,
-                plan_name TEXT NOT NULL,
-                trainee_id TEXT NOT NULL,
-                trainee_name TEXT NOT NULL,
-                profile_type TEXT NOT NULL,
-                trainee_json TEXT NOT NULL,
-                selected_fields_json TEXT NOT NULL,
-                scenario_description TEXT NOT NULL,
-                extra_details TEXT,
-                model_mode TEXT,
-                active_profile_id TEXT,
-                active_setting_id TEXT,
-                role_status TEXT NOT NULL,
-                goal_status TEXT NOT NULL,
-                score_status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO training_plans_new (
-                plan_id, plan_name, trainee_id, trainee_name, profile_type,
-                trainee_json, selected_fields_json, scenario_description, extra_details,
-                model_mode, active_profile_id, active_setting_id,
-                role_status, goal_status, score_status, created_at, updated_at
-            )
-            SELECT
-                plan_id, plan_name, trainee_id, trainee_name, profile_type,
-                trainee_json, selected_fields_json, scenario_description, extra_details,
-                model_mode, active_profile_id, active_setting_id,
-                role_status, goal_status, score_status, created_at, updated_at
-            FROM training_plans
-            """
-        )
-        conn.execute("DROP TABLE training_plans")
-        conn.execute("ALTER TABLE training_plans_new RENAME TO training_plans")
-
-    @staticmethod
-    def _migrate_training_batch_versions(conn: Any) -> None:
-        """给历史训练资料批次补齐版本字段。
-
-        老数据没有 version_group_id 和 is_current。
-        这里把每个已发布批次先视为一个独立版本组的当前版本，
-        后续同名文件再次发布时再进入真正的版本链。
-        """
-
-        conn.execute(
-            """
-            UPDATE training_knowledge_batches
-            SET version_group_id = batch_id
-            WHERE version_group_id IS NULL OR version_group_id = ''
-            """
-        )
-        conn.execute(
-            """
-            UPDATE training_knowledge_batches
-            SET version_no = 1
-            WHERE version_no IS NULL OR version_no <= 0
-            """
-        )
-        conn.execute(
-            """
-            UPDATE training_knowledge_batches
-            SET is_current = 1
-            WHERE status = 'published' AND COALESCE(is_current, 0) = 0
-            """
-        )
-
-    @staticmethod
-    def _drop_training_knowledge_chunks(conn: Any) -> None:
-        """删除旧的训练知识切片表。
-
-        新方案把待审核切片放在临时 Qdrant，发布后复制到正式 Qdrant。
-        关系型数据库不再保存切片正文，旧表可以直接清理。
-        """
-
-        conn.execute("DROP TABLE IF EXISTS training_knowledge_chunks")
-
-    @staticmethod
-    def _row(row: Any | None) -> TrainingRepositoryRow | None:
-        # 数据库行对象转成 dict 后，业务层更好处理。
-        return dict(row) if row is not None else None
+        return [cls._enrich_batch_with_document(batch, document) for batch, document in rows]
 
     def create_batch(self, **values: Any) -> TrainingKnowledgeBatchEntity:
-        """创建训练知识上传批次。
+        """创建训练知识上传批次。"""
 
-        **values 是 Python 的关键字参数收集写法，类似 Java 里传一个 Map。
-        这里用它是为了让调用方只传自己关心的字段，仓储内部统一补默认值。
-        """
-
-        now = utc_now_text()
+        now = utc_now()
         batch_id = values.get("batch_id") or f"batch_{uuid.uuid4().hex}"
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO training_knowledge_batches (
-                    batch_id, document_id, source_type, source_file, file_path, file_md5,
-                    version_group_id, version_no, previous_batch_id, is_current,
-                    profile_type, task_type, industry, difficulty, visibility_default, status,
-                    error_message, quality_report_json, created_by, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    # 统一使用 ? 作为仓储层参数占位符，MySQL 连接层会自动转换，避免手动拼 SQL。
-                    batch_id,
-                    values.get("document_id"),
-                    values.get("source_type"),
-                    values.get("source_file"),
-                    values.get("file_path"),
-                    values.get("file_md5"),
-                    values.get("version_group_id") or batch_id,
-                    int(values.get("version_no") or 1),
-                    values.get("previous_batch_id"),
-                    int(bool(values.get("is_current"))),
-                    values.get("profile_type"),
-                    values.get("task_type"),
-                    values.get("industry"),
-                    values.get("difficulty"),
-                    values.get("visibility_default"),
-                    values.get("status", "uploaded"),
-                    values.get("error_message"),
-                    self._json(values.get("quality_report")) if values.get("quality_report") is not None else None,
-                    values.get("created_by"),
-                    now,
-                    now,
-                ),
-            )
-        return self.get_batch(batch_id) or {}
+        batch = TrainingKnowledgeBatchEntity(
+            batch_id=batch_id,
+            document_id=values.get("document_id"),
+            source_type=values.get("source_type"),
+            source_file=values.get("source_file"),
+            file_path=values.get("file_path"),
+            file_md5=values.get("file_md5"),
+            version_group_id=values.get("version_group_id") or batch_id,
+            version_no=int(values.get("version_no") or 1),
+            previous_batch_id=values.get("previous_batch_id"),
+            is_current=int(bool(values.get("is_current"))),
+            profile_type=values.get("profile_type"),
+            task_type=values.get("task_type"),
+            industry=values.get("industry"),
+            difficulty=values.get("difficulty"),
+            visibility_default=values.get("visibility_default"),
+            status=values.get("status", "uploaded"),
+            chunk_count=int(values.get("chunk_count") or 0),
+            point_count=int(values.get("point_count") or 0),
+            error_message=values.get("error_message"),
+            quality_report_json=self._json(values.get("quality_report")) if values.get("quality_report") is not None else None,
+            created_by=values.get("created_by"),
+            created_at=now,
+            updated_at=now,
+        )
+        with orm_session_context() as session:
+            session.add(batch)
+        created = self.get_batch(batch_id)
+        if created is None:
+            raise RuntimeError(f"训练资料批次创建失败：{batch_id}")
+        return created
 
     def update_batch_status(
             self,
@@ -490,75 +153,63 @@ class TrainingRepository:
             quality_report: dict[str, Any] | None = None,
             is_current: bool | None = None,
     ) -> None:
-        """更新训练知识上传批次状态和统计信息。
+        """更新训练知识上传批次状态和统计信息。"""
 
-        COALESCE(?, chunk_count) 的意思是：
-        - 如果传入的新值不是 None，就用新值；
-        - 如果传入 None，就保留原字段值。
-        """
-
-        with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE training_knowledge_batches
-                SET status = ?,
-                    chunk_count = COALESCE(?, chunk_count),
-                    point_count = COALESCE(?, point_count),
-                    error_message = ?,
-                    quality_report_json = COALESCE(?, quality_report_json),
-                    is_current = COALESCE(?, is_current),
-                    updated_at = ?
-                WHERE batch_id = ?
-                """,
-                (
-                    status,
-                    chunk_count,
-                    point_count,
-                    error_message,
-                    self._json(quality_report) if quality_report is not None else None,
-                    int(is_current) if is_current is not None else None,
-                    utc_now_text(),
-                    batch_id,
-                ),
-            )
+        with orm_session_context() as session:
+            batch = session.get(TrainingKnowledgeBatchEntity, batch_id)
+            if batch is None:
+                return
+            batch.status = status
+            if chunk_count is not None:
+                batch.chunk_count = int(chunk_count)
+            if point_count is not None:
+                batch.point_count = int(point_count)
+            batch.error_message = error_message
+            if quality_report is not None:
+                batch.quality_report_json = self._json(quality_report)
+            if is_current is not None:
+                batch.is_current = int(is_current)
+            batch.updated_at = utc_now()
 
     def get_latest_batch_for_version(self, *, source_type: str, source_file: str) -> TrainingKnowledgeBatchEntity | None:
         """按资料类型和文件名查询最新版本批次。"""
 
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT
-                    b.*,
-                    d.filename AS document_filename,
-                    d.file_path AS document_file_path,
-                    d.file_md5 AS document_file_md5,
-                    d.file_type AS document_file_type,
-                    d.file_size AS document_file_size,
-                    d.status AS document_status
-                FROM training_knowledge_batches b
-                LEFT JOIN documents d ON d.document_id = b.document_id
-                WHERE b.source_type = ? AND b.source_file = ? AND b.status != 'deleted'
-                ORDER BY b.version_no DESC, b.updated_at DESC, b.created_at DESC
-                LIMIT 1
-                """,
-                (source_type, source_file),
-            ).fetchone()
-        return self._row(row)
+        statement = (
+            self._batch_select_statement()
+            .where(
+                TrainingKnowledgeBatchEntity.source_type == source_type,
+                TrainingKnowledgeBatchEntity.source_file == source_file,
+                TrainingKnowledgeBatchEntity.status != "deleted",
+            )
+            .order_by(
+                TrainingKnowledgeBatchEntity.version_no.desc(),
+                TrainingKnowledgeBatchEntity.updated_at.desc(),
+                TrainingKnowledgeBatchEntity.created_at.desc(),
+            )
+            .limit(1)
+        )
+        with orm_session_context() as session:
+            row = session.execute(statement).one_or_none()
+        if row is None:
+            return None
+        return self._enrich_batch_with_document(row[0], row[1])
 
     def list_current_published_batch_ids(self) -> list[str]:
         """查询当前参与训练检索的已发布批次编号。"""
 
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT batch_id
-                FROM training_knowledge_batches
-                WHERE status = 'published' AND COALESCE(is_current, 0) = 1
-                ORDER BY updated_at DESC, created_at DESC
-                """
-            ).fetchall()
-        return [str(row["batch_id"]) for row in rows]
+        statement = (
+            select(TrainingKnowledgeBatchEntity.batch_id)
+            .where(
+                TrainingKnowledgeBatchEntity.status == "published",
+                TrainingKnowledgeBatchEntity.is_current == 1,
+            )
+            .order_by(
+                TrainingKnowledgeBatchEntity.updated_at.desc(),
+                TrainingKnowledgeBatchEntity.created_at.desc(),
+            )
+        )
+        with orm_session_context() as session:
+            return [str(batch_id) for batch_id in session.scalars(statement).all()]
 
     def list_published_batches_in_version_group(
             self,
@@ -568,253 +219,186 @@ class TrainingRepository:
     ) -> list[TrainingKnowledgeBatchEntity]:
         """查询同一版本组内已发布或已归档的批次。"""
 
-        params: list[Any] = [version_group_id]
-        exclude_sql = ""
+        conditions = [
+            TrainingKnowledgeBatchEntity.version_group_id == version_group_id,
+            TrainingKnowledgeBatchEntity.status.in_(["published", "archived"]),
+        ]
         if exclude_batch_id:
-            exclude_sql = "AND b.batch_id != ?"
-            params.append(exclude_batch_id)
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT
-                    b.*,
-                    d.filename AS document_filename,
-                    d.file_path AS document_file_path,
-                    d.file_md5 AS document_file_md5,
-                    d.file_type AS document_file_type,
-                    d.file_size AS document_file_size,
-                    d.status AS document_status
-                FROM training_knowledge_batches b
-                LEFT JOIN documents d ON d.document_id = b.document_id
-                WHERE b.version_group_id = ?
-                  AND b.status IN ('published', 'archived')
-                  {exclude_sql}
-                ORDER BY b.version_no DESC, b.updated_at DESC
-                """,
-                params,
-            ).fetchall()
-        return [dict(row) for row in rows]
+            conditions.append(TrainingKnowledgeBatchEntity.batch_id != exclude_batch_id)
+        statement = (
+            self._batch_select_statement()
+            .where(*conditions)
+            .order_by(
+                TrainingKnowledgeBatchEntity.version_no.desc(),
+                TrainingKnowledgeBatchEntity.updated_at.desc(),
+            )
+        )
+        with orm_session_context() as session:
+            rows = session.execute(statement).all()
+        return self._scalars_to_batches(rows)
 
     def list_batches_in_version_group(self, version_group_id: str) -> list[TrainingKnowledgeBatchEntity]:
         """查询同一版本组内的全部未删除批次。"""
 
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT
-                    b.*,
-                    d.filename AS document_filename,
-                    d.file_path AS document_file_path,
-                    d.file_md5 AS document_file_md5,
-                    d.file_type AS document_file_type,
-                    d.file_size AS document_file_size,
-                    d.status AS document_status
-                FROM training_knowledge_batches b
-                LEFT JOIN documents d ON d.document_id = b.document_id
-                WHERE b.version_group_id = ?
-                  AND b.status != 'deleted'
-                ORDER BY b.version_no DESC, b.updated_at DESC, b.created_at DESC
-                """,
-                (version_group_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        statement = (
+            self._batch_select_statement()
+            .where(
+                TrainingKnowledgeBatchEntity.version_group_id == version_group_id,
+                TrainingKnowledgeBatchEntity.status != "deleted",
+            )
+            .order_by(
+                TrainingKnowledgeBatchEntity.version_no.desc(),
+                TrainingKnowledgeBatchEntity.updated_at.desc(),
+                TrainingKnowledgeBatchEntity.created_at.desc(),
+            )
+        )
+        with orm_session_context() as session:
+            rows = session.execute(statement).all()
+        return self._scalars_to_batches(rows)
 
     def archive_other_versions(self, *, version_group_id: str, current_batch_id: str) -> None:
         """把同版本组内非当前版本标记为归档。"""
 
-        with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE training_knowledge_batches
-                SET status = 'archived',
-                    is_current = 0,
-                    updated_at = ?
-                WHERE version_group_id = ?
-                  AND batch_id != ?
-                  AND status = 'published'
-                """,
-                (utc_now_text(), version_group_id, current_batch_id),
-            )
+        statement = select(TrainingKnowledgeBatchEntity).where(
+            TrainingKnowledgeBatchEntity.version_group_id == version_group_id,
+            TrainingKnowledgeBatchEntity.batch_id != current_batch_id,
+            TrainingKnowledgeBatchEntity.status == "published",
+        )
+        with orm_session_context() as session:
+            for batch in session.scalars(statement):
+                batch.status = "archived"
+                batch.is_current = 0
+                batch.updated_at = utc_now()
 
     def get_published_batch_by_md5(self, file_md5: str) -> TrainingKnowledgeBatchEntity | None:
-        """按文件 MD5 查询已经成功入库的训练资料。
+        """按文件 MD5 查询已经成功入库的训练资料。"""
 
-        只复用 published 批次，避免解析失败或半入库数据被误当成可用资料。
-        """
-
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT
-                    b.*,
-                    d.filename AS document_filename,
-                    d.file_path AS document_file_path,
-                    d.file_md5 AS document_file_md5,
-                    d.file_type AS document_file_type,
-                    d.file_size AS document_file_size,
-                    d.status AS document_status
-                FROM training_knowledge_batches b
-                LEFT JOIN documents d ON d.document_id = b.document_id
-                WHERE COALESCE(d.file_md5, b.file_md5) = ? AND b.status = 'published'
-                ORDER BY b.updated_at DESC, b.created_at DESC
-                LIMIT 1
-                """,
-                (file_md5,),
-            ).fetchone()
-        return self._row(row)
+        statement = (
+            self._batch_select_statement()
+            .where(
+                TrainingKnowledgeBatchEntity.status == "published",
+                or_(
+                    DocumentEntity.file_md5 == file_md5,
+                    TrainingKnowledgeBatchEntity.file_md5 == file_md5,
+                ),
+            )
+            .order_by(
+                TrainingKnowledgeBatchEntity.updated_at.desc(),
+                TrainingKnowledgeBatchEntity.created_at.desc(),
+            )
+            .limit(1)
+        )
+        with orm_session_context() as session:
+            row = session.execute(statement).one_or_none()
+        if row is None:
+            return None
+        return self._enrich_batch_with_document(row[0], row[1])
 
     def list_batches(self, *, page: int, page_size: int) -> tuple[list[TrainingKnowledgeBatchEntity], int]:
         """分页查询训练资料上传批次。"""
 
         offset = (page - 1) * page_size
-        with self.connect() as conn:
-            total_row = conn.execute(
-                "SELECT COUNT(*) AS total FROM training_knowledge_batches WHERE status != 'deleted'"
-            ).fetchone()
-            rows = conn.execute(
-                """
-                SELECT
-                    b.*,
-                    d.filename AS document_filename,
-                    d.file_path AS document_file_path,
-                    d.file_md5 AS document_file_md5,
-                    d.file_type AS document_file_type,
-                    d.file_size AS document_file_size,
-                    d.status AS document_status
-                FROM training_knowledge_batches b
-                LEFT JOIN documents d ON d.document_id = b.document_id
-                WHERE b.status != 'deleted'
-                ORDER BY b.updated_at DESC, b.created_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (page_size, offset),
-            ).fetchall()
-        return [dict(row) for row in rows], int(total_row["total"] or 0)
+        count_statement = select(func.count()).select_from(TrainingKnowledgeBatchEntity).where(
+            TrainingKnowledgeBatchEntity.status != "deleted"
+        )
+        list_statement = (
+            self._batch_select_statement()
+            .where(TrainingKnowledgeBatchEntity.status != "deleted")
+            .order_by(
+                TrainingKnowledgeBatchEntity.updated_at.desc(),
+                TrainingKnowledgeBatchEntity.created_at.desc(),
+            )
+            .limit(page_size)
+            .offset(offset)
+        )
+        with orm_session_context() as session:
+            total = int(session.scalar(count_statement) or 0)
+            rows = session.execute(list_statement).all()
+        return self._scalars_to_batches(rows), total
 
     def mark_batch_deleted(self, batch_id: str) -> bool:
-        """软删除训练资料批次。
+        """软删除训练资料批次。"""
 
-        这里不物理删除原文件，方便后续审计、预览问题排查或恢复。
-        返回 False 表示批次不存在或已经删除。
-        """
-
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT batch_id FROM training_knowledge_batches WHERE batch_id = ? AND status != 'deleted'",
-                (batch_id,),
-            ).fetchone()
-            if row is None:
+        with orm_session_context() as session:
+            batch = session.get(TrainingKnowledgeBatchEntity, batch_id)
+            if batch is None or batch.status == "deleted":
                 return False
-            conn.execute(
-                """
-                UPDATE training_knowledge_batches
-                SET status = 'deleted',
-                    updated_at = ?
-                WHERE batch_id = ?
-                """,
-                (utc_now_text(), batch_id),
-            )
-        return True
+            batch.status = "deleted"
+            batch.updated_at = utc_now()
+            return True
 
     def get_batch(self, batch_id: str) -> TrainingKnowledgeBatchEntity | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT
-                    b.*,
-                    d.filename AS document_filename,
-                    d.file_path AS document_file_path,
-                    d.file_md5 AS document_file_md5,
-                    d.file_type AS document_file_type,
-                    d.file_size AS document_file_size,
-                    d.status AS document_status
-                FROM training_knowledge_batches b
-                LEFT JOIN documents d ON d.document_id = b.document_id
-                WHERE b.batch_id = ?
-                """,
-                (batch_id,),
-            ).fetchone()
-        return self._row(row)
+        """按批次编号查询训练资料批次。"""
+
+        statement = self._batch_select_statement().where(TrainingKnowledgeBatchEntity.batch_id == batch_id)
+        with orm_session_context() as session:
+            row = session.execute(statement).one_or_none()
+        if row is None:
+            return None
+        return self._enrich_batch_with_document(row[0], row[1])
 
     def create_plan(self, **values: Any) -> TrainingPlanEntity:
-        """创建训练方案。
+        """创建训练方案。"""
 
-        训练方案是角色、训练阶段、评分规则的上层聚合。
-        plan_id 保证唯一，plan_name 允许重复，方便同一主题多次训练。
-        """
-
-        now = utc_now_text()
+        now = utc_now()
         plan_id = values.get("plan_id") or f"plan_{uuid.uuid4().hex}"
         trainee = values["trainee"]
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO training_plans (
-                    plan_id, plan_name, trainee_id, trainee_name, profile_type,
-                    trainee_json, selected_fields_json, scenario_description, extra_details,
-                    model_mode, active_profile_id, active_setting_id,
-                    role_status, goal_status, score_status, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
-                """,
-                (
-                    plan_id,
-                    values["plan_name"],
-                    trainee["trainee_id"],
-                    trainee.get("trainee_name") or "销售学员",
-                    values["profile_type"],
-                    self._json(trainee),
-                    self._json(values.get("selected_fields") or {}),
-                    values["scenario_description"],
-                    values.get("extra_details") or "",
-                    values.get("model_mode"),
-                    "pending",
-                    "pending",
-                    "pending",
-                    now,
-                    now,
-                ),
-            )
-        return self.get_plan(plan_id) or {}
+        plan = TrainingPlanEntity(
+            plan_id=plan_id,
+            plan_name=values["plan_name"],
+            trainee_id=trainee["trainee_id"],
+            trainee_name=trainee.get("trainee_name") or "销售学员",
+            profile_type=values["profile_type"],
+            trainee_json=self._json(trainee),
+            selected_fields_json=self._json(values.get("selected_fields") or {}),
+            scenario_description=values["scenario_description"],
+            extra_details=values.get("extra_details") or "",
+            model_mode=values.get("model_mode"),
+            active_profile_id=None,
+            active_setting_id=None,
+            role_status="pending",
+            goal_status="pending",
+            score_status="pending",
+            created_at=now,
+            updated_at=now,
+        )
+        with orm_session_context() as session:
+            session.add(plan)
+        created = self.get_plan(plan_id)
+        if created is None:
+            raise RuntimeError(f"训练方案创建失败：{plan_id}")
+        return created
 
     def list_plans(self, *, page: int, page_size: int, keyword: str | None = None) -> tuple[list[TrainingPlanEntity], int]:
         """分页查询训练方案列表。"""
 
         offset = (page - 1) * page_size
-        params: list[Any] = []
-        where_sql = ""
+        conditions = []
         if keyword and keyword.strip():
-            where_sql = "WHERE plan_name LIKE ?"
-            params.append(f"%{keyword.strip()}%")
-        with self.connect() as conn:
-            total_row = conn.execute(
-                f"SELECT COUNT(*) AS total FROM training_plans {where_sql}",
-                params,
-            ).fetchone()
-            rows = conn.execute(
-                f"""
-                SELECT *
-                FROM training_plans
-                {where_sql}
-                ORDER BY updated_at DESC, created_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                [*params, page_size, offset],
-            ).fetchall()
-        return [dict(row) for row in rows], int(total_row["total"] or 0)
+            conditions.append(TrainingPlanEntity.plan_name.like(f"%{keyword.strip()}%"))
+        count_statement = select(func.count()).select_from(TrainingPlanEntity)
+        list_statement = (
+            select(TrainingPlanEntity)
+            .order_by(TrainingPlanEntity.updated_at.desc(), TrainingPlanEntity.created_at.desc())
+            .limit(page_size)
+            .offset(offset)
+        )
+        if conditions:
+            count_statement = count_statement.where(*conditions)
+            list_statement = list_statement.where(*conditions)
+        with orm_session_context() as session:
+            total = int(session.scalar(count_statement) or 0)
+            rows = session.scalars(list_statement).all()
+        return rows, total
 
     def get_plan(self, plan_id: str) -> TrainingPlanEntity | None:
         """按 ID 查询训练方案。"""
 
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM training_plans WHERE plan_id = ?", (plan_id,)).fetchone()
-        return self._row(row)
+        with orm_session_context() as session:
+            return session.get(TrainingPlanEntity, plan_id)
 
-    def update_plan(self, plan_id: str, **values: Any) -> TrainingPlanEntity:
-        """更新训练方案基础信息和状态。
-
-        这里使用动态 SQL，但字段白名单来自代码固定集合，不接收外部字段名。
-        """
+    def update_plan(self, plan_id: str, **values: Any) -> TrainingPlanEntity | None:
+        """更新训练方案基础信息和状态。"""
 
         allowed_columns = {
             "plan_name",
@@ -832,24 +416,17 @@ class TrainingRepository:
             "goal_status",
             "score_status",
         }
-        assignments: list[str] = []
-        params: list[Any] = []
-        for key, value in values.items():
-            if key not in allowed_columns:
-                continue
-            assignments.append(f"{key} = ?")
-            params.append(value)
-        assignments.append("updated_at = ?")
-        params.append(utc_now_text())
-        params.append(plan_id)
-        with self.connect() as conn:
-            conn.execute(
-                f"UPDATE training_plans SET {', '.join(assignments)} WHERE plan_id = ?",
-                params,
-            )
-        return self.get_plan(plan_id) or {}
+        with orm_session_context() as session:
+            plan = session.get(TrainingPlanEntity, plan_id)
+            if plan is None:
+                return None
+            for key, value in values.items():
+                if key in allowed_columns:
+                    setattr(plan, key, value)
+            plan.updated_at = utc_now()
+        return self.get_plan(plan_id)
 
-    def attach_role_to_plan(self, plan_id: str, profile_id: str) -> TrainingPlanEntity:
+    def attach_role_to_plan(self, plan_id: str, profile_id: str) -> TrainingPlanEntity | None:
         """把生成好的 AI 角色关联到训练方案，并标记阶段/评分需要重新生成。"""
 
         return self.update_plan(
@@ -861,7 +438,7 @@ class TrainingRepository:
             score_status="stale",
         )
 
-    def attach_goal_to_plan(self, plan_id: str, setting_id: str) -> TrainingPlanEntity:
+    def attach_goal_to_plan(self, plan_id: str, setting_id: str) -> TrainingPlanEntity | None:
         """把生成好的训练阶段关联到训练方案，并标记评分规则已随阶段生成。"""
 
         return self.update_plan(
@@ -874,43 +451,37 @@ class TrainingRepository:
     def save_role_profile(self, **values: Any) -> TrainingRoleProfileEntity:
         """保存一次 AI 陪练角色。"""
 
-        now = utc_now_text()
+        now = utc_now()
         profile_id = values.get("profile_id") or f"profile_{uuid.uuid4().hex}"
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO training_role_profiles (
-                    profile_id, trainee_id, plan_id, profile_type, visible_profile_json,
-                    hidden_profile_json, role_profile_json, role_confirm_card_json,
-                    selected_fields_json, scenario_description, extra_details,
-                    retrieved_evidence_json, status, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    profile_id,
-                    values["trainee_id"],
-                    values.get("plan_id"),
-                    values["profile_type"],
-                    self._json(values["visible_profile"]),
-                    self._json(values["hidden_profile"]),
-                    self._json(values["role_profile"]),
-                    self._json(values["role_confirm_card"]),
-                    self._json(values.get("selected_fields") or {}),
-                    values.get("scenario_description"),
-                    values.get("extra_details"),
-                    self._json(values.get("retrieved_evidence") or []),
-                    values.get("status", "confirmed"),
-                    now,
-                    now,
-                ),
-            )
-        return self.get_role_profile(profile_id) or {}
+        role_profile = TrainingRoleProfileEntity(
+            profile_id=profile_id,
+            trainee_id=values["trainee_id"],
+            plan_id=values.get("plan_id"),
+            profile_type=values["profile_type"],
+            visible_profile_json=self._json(values["visible_profile"]),
+            hidden_profile_json=self._json(values["hidden_profile"]),
+            role_profile_json=self._json(values["role_profile"]),
+            role_confirm_card_json=self._json(values["role_confirm_card"]),
+            selected_fields_json=self._json(values.get("selected_fields") or {}),
+            scenario_description=values.get("scenario_description"),
+            extra_details=values.get("extra_details"),
+            retrieved_evidence_json=self._json(values.get("retrieved_evidence") or []),
+            status=values.get("status", "confirmed"),
+            created_at=now,
+            updated_at=now,
+        )
+        with orm_session_context() as session:
+            session.add(role_profile)
+        created = self.get_role_profile(profile_id)
+        if created is None:
+            raise RuntimeError(f"AI 客户角色保存失败：{profile_id}")
+        return created
 
     def get_role_profile(self, profile_id: str) -> TrainingRoleProfileEntity | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM training_role_profiles WHERE profile_id = ?", (profile_id,)).fetchone()
-        return self._row(row)
+        """按 ID 查询 AI 客户角色。"""
+
+        with orm_session_context() as session:
+            return session.get(TrainingRoleProfileEntity, profile_id)
 
     def update_role_profile(
             self,
@@ -920,64 +491,55 @@ class TrainingRepository:
             hidden_profile: dict | None = None,
             role_profile: dict | None = None,
             role_confirm_card: dict | None = None,
-    ) -> TrainingRoleProfileEntity:
+    ) -> TrainingRoleProfileEntity | None:
         """人工修改 AI 客户角色的某些 JSON 字段。"""
 
-        updates: dict[str, str] = {}
-        if visible_profile is not None:
-            updates["visible_profile_json"] = self._json(visible_profile)
-        if hidden_profile is not None:
-            updates["hidden_profile_json"] = self._json(hidden_profile)
-        if role_profile is not None:
-            updates["role_profile_json"] = self._json(role_profile)
-        if role_confirm_card is not None:
-            updates["role_confirm_card_json"] = self._json(role_confirm_card)
-        if not updates:
-            return self.get_role_profile(profile_id) or {}
-        assignments = [f"{column} = ?" for column in updates]
-        params = [*updates.values(), utc_now_text(), profile_id]
-        with self.connect() as conn:
-            conn.execute(
-                f"UPDATE training_role_profiles SET {', '.join(assignments)}, updated_at = ? WHERE profile_id = ?",
-                params,
-            )
-        return self.get_role_profile(profile_id) or {}
+        with orm_session_context() as session:
+            profile = session.get(TrainingRoleProfileEntity, profile_id)
+            if profile is None:
+                return None
+            if visible_profile is not None:
+                profile.visible_profile_json = self._json(visible_profile)
+            if hidden_profile is not None:
+                profile.hidden_profile_json = self._json(hidden_profile)
+            if role_profile is not None:
+                profile.role_profile_json = self._json(role_profile)
+            if role_confirm_card is not None:
+                profile.role_confirm_card_json = self._json(role_confirm_card)
+            profile.updated_at = utc_now()
+        return self.get_role_profile(profile_id)
 
     def save_goal_setting(self, **values: Any) -> TrainingGoalSettingEntity:
         """保存开放式训练设置。"""
 
-        now = utc_now_text()
+        now = utc_now()
         setting_id = values.get("setting_id") or f"setting_{uuid.uuid4().hex}"
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO training_goal_settings (
-                    setting_id, profile_id, plan_id, trainee_id, training_mode, training_purpose,
-                    round_limit, stages_json, scoring_rules_json, status, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    setting_id,
-                    values["profile_id"],
-                    values.get("plan_id"),
-                    values["trainee_id"],
-                    values.get("training_mode", "open"),
-                    values["training_purpose"],
-                    int(values["round_limit"]),
-                    self._json(values["stages"]),
-                    self._json(values.get("scoring_rules") or {}),
-                    values.get("status", "confirmed"),
-                    now,
-                    now,
-                ),
-            )
-        return self.get_goal_setting(setting_id) or {}
+        setting = TrainingGoalSettingEntity(
+            setting_id=setting_id,
+            profile_id=values["profile_id"],
+            plan_id=values.get("plan_id"),
+            trainee_id=values["trainee_id"],
+            training_mode=values.get("training_mode", "open"),
+            training_purpose=values["training_purpose"],
+            round_limit=int(values["round_limit"]),
+            stages_json=self._json(values["stages"]),
+            scoring_rules_json=self._json(values.get("scoring_rules") or {}),
+            status=values.get("status", "confirmed"),
+            created_at=now,
+            updated_at=now,
+        )
+        with orm_session_context() as session:
+            session.add(setting)
+        created = self.get_goal_setting(setting_id)
+        if created is None:
+            raise RuntimeError(f"训练设置保存失败：{setting_id}")
+        return created
 
     def get_goal_setting(self, setting_id: str) -> TrainingGoalSettingEntity | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM training_goal_settings WHERE setting_id = ?", (setting_id,)).fetchone()
-        return self._row(row)
+        """按 ID 查询训练设置。"""
+
+        with orm_session_context() as session:
+            return session.get(TrainingGoalSettingEntity, setting_id)
 
     def update_goal_setting(
             self,
@@ -987,64 +549,59 @@ class TrainingRepository:
             round_limit: int | None = None,
             stages: list[dict[str, Any]] | None = None,
             scoring_rules: dict | None = None,
-    ) -> TrainingGoalSettingEntity:
+    ) -> TrainingGoalSettingEntity | None:
         """人工修改训练宗旨、轮数、阶段或评分规则。"""
 
-        updates: dict[str, Any] = {}
-        if training_purpose is not None:
-            updates["training_purpose"] = training_purpose
-        if round_limit is not None:
-            updates["round_limit"] = int(round_limit)
-        if stages is not None:
-            updates["stages_json"] = self._json(stages)
-        if scoring_rules is not None:
-            updates["scoring_rules_json"] = self._json(scoring_rules)
-        if not updates:
-            return self.get_goal_setting(setting_id) or {}
-        assignments = [f"{column} = ?" for column in updates]
-        params = [*updates.values(), utc_now_text(), setting_id]
-        with self.connect() as conn:
-            conn.execute(
-                f"UPDATE training_goal_settings SET {', '.join(assignments)}, updated_at = ? WHERE setting_id = ?",
-                params,
-            )
-        return self.get_goal_setting(setting_id) or {}
+        with orm_session_context() as session:
+            setting = session.get(TrainingGoalSettingEntity, setting_id)
+            if setting is None:
+                return None
+            if training_purpose is not None:
+                setting.training_purpose = training_purpose
+            if round_limit is not None:
+                setting.round_limit = int(round_limit)
+            if stages is not None:
+                setting.stages_json = self._json(stages)
+            if scoring_rules is not None:
+                setting.scoring_rules_json = self._json(scoring_rules)
+            setting.updated_at = utc_now()
+        return self.get_goal_setting(setting_id)
 
     def create_session(self, **values: Any) -> SalesTrainingSessionEntity:
         """创建一次开放式训练会话。"""
 
-        now = utc_now_text()
+        now = utc_now()
         session_id = values.get("session_id") or f"session_{uuid.uuid4().hex}"
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO sales_training_sessions (
-                    session_id, profile_id, setting_id, trainee_id, training_mode,
-                    response_mode, current_stage_no, status, round_limit,
-                    started_at, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    values["profile_id"],
-                    values["setting_id"],
-                    values["trainee_id"],
-                    values.get("training_mode", "open"),
-                    values.get("response_mode", "stream"),
-                    values.get("status", "active"),
-                    int(values["round_limit"]),
-                    now,
-                    now,
-                    now,
-                ),
-            )
-        return self.get_session(session_id) or {}
+        training_session = SalesTrainingSessionEntity(
+            session_id=session_id,
+            profile_id=values["profile_id"],
+            setting_id=values["setting_id"],
+            trainee_id=values["trainee_id"],
+            training_mode=values.get("training_mode", "open"),
+            response_mode=values.get("response_mode", "stream"),
+            current_stage_no=1,
+            status=values.get("status", "active"),
+            round_limit=int(values["round_limit"]),
+            total_score=None,
+            level=None,
+            report_json=None,
+            started_at=now,
+            ended_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        with orm_session_context() as session:
+            session.add(training_session)
+        created = self.get_session(session_id)
+        if created is None:
+            raise RuntimeError(f"训练会话创建失败：{session_id}")
+        return created
 
     def get_session(self, session_id: str) -> SalesTrainingSessionEntity | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM sales_training_sessions WHERE session_id = ?", (session_id,)).fetchone()
-        return self._row(row)
+        """按 ID 查询训练会话。"""
+
+        with orm_session_context() as session:
+            return session.get(SalesTrainingSessionEntity, session_id)
 
     def list_sessions(
             self,
@@ -1053,49 +610,47 @@ class TrainingRepository:
             page_size: int,
             trainee_id: str | None = None,
     ) -> tuple[list[SalesTrainingSessionEntity], int]:
-        """分页查询训练会话历史，并统计学员已回答轮数。
-
-        返回值是 tuple[list[SalesTrainingSessionEntity], int]：
-        - 第一个元素是当前页训练会话实体列表；
-        - 第二个元素是符合条件的总数。
-
-        Python 的 tuple 类似 Java 里简单返回 Pair，不过这里用类型注解明确结构。
-        """
+        """分页查询训练会话历史，并统计学员已回答轮数。"""
 
         offset = (page - 1) * page_size
-        filters: list[str] = []
-        params: list[Any] = []
+        conditions = []
         if trainee_id:
-            filters.append("s.trainee_id = ?")
-            params.append(trainee_id)
-        # where_sql 只由固定片段拼接，不拼接用户输入；用户输入仍然走 ? 参数。
-        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+            conditions.append(SalesTrainingSessionEntity.trainee_id == trainee_id)
+        answered_count_subquery = (
+            select(
+                SalesTrainingTurnEntity.session_id.label("session_id"),
+                func.count(SalesTrainingTurnEntity.turn_id).label("answered_count"),
+            )
+            .where(SalesTrainingTurnEntity.role == "trainee")
+            .group_by(SalesTrainingTurnEntity.session_id)
+            .subquery()
+        )
+        count_statement = select(func.count()).select_from(SalesTrainingSessionEntity)
+        list_statement = (
+            select(SalesTrainingSessionEntity, answered_count_subquery.c.answered_count)
+            .outerjoin(
+                answered_count_subquery,
+                answered_count_subquery.c.session_id == SalesTrainingSessionEntity.session_id,
+            )
+            .order_by(
+                SalesTrainingSessionEntity.updated_at.desc(),
+                SalesTrainingSessionEntity.created_at.desc(),
+            )
+            .limit(page_size)
+            .offset(offset)
+        )
+        if conditions:
+            count_statement = count_statement.where(*conditions)
+            list_statement = list_statement.where(*conditions)
+        with orm_session_context() as session:
+            total = int(session.scalar(count_statement) or 0)
+            rows = session.execute(list_statement).all()
 
-        with self.connect() as conn:
-            total_row = conn.execute(
-                f"SELECT COUNT(*) AS total FROM sales_training_sessions s {where_sql}",
-                params,
-            ).fetchone()
-            rows = conn.execute(
-                f"""
-                SELECT s.*,
-                       COALESCE(t.answered_count, 0) AS answered_count
-                FROM sales_training_sessions s
-                LEFT JOIN (
-                    SELECT session_id, COUNT(*) AS answered_count
-                    FROM sales_training_turns
-                    WHERE role = 'trainee'
-                    GROUP BY session_id
-                ) t ON t.session_id = s.session_id
-                {where_sql}
-                ORDER BY s.updated_at DESC, s.created_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                # [*params, page_size, offset] 是 Python 列表解包写法。
-                # 等价于 Java 中把已有参数列表复制后再追加两个分页参数。
-                [*params, page_size, offset],
-            ).fetchall()
-        return [dict(row) for row in rows], int(total_row["total"] or 0)
+        sessions: list[SalesTrainingSessionEntity] = []
+        for training_session, answered_count in rows:
+            training_session.answered_count = int(answered_count or 0)
+            sessions.append(training_session)
+        return sessions, total
 
     def update_session_status(
             self,
@@ -1108,164 +663,123 @@ class TrainingRepository:
     ) -> None:
         """更新训练会话状态，评分完成时同步写报告摘要。"""
 
-        with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE sales_training_sessions
-                SET status = ?, total_score = COALESCE(?, total_score),
-                    level = COALESCE(?, level), report_json = COALESCE(?, report_json),
-                    ended_at = CASE WHEN ? IN ('completed', 'failed') THEN COALESCE(ended_at, ?) ELSE ended_at END,
-                    updated_at = ?
-                WHERE session_id = ?
-                """,
-                (
-                    status,
-                    total_score,
-                    level,
-                    self._json(report) if report is not None else None,
-                    status,
-                    utc_now_text(),
-                    utc_now_text(),
-                    session_id,
-                ),
-            )
+        now = utc_now()
+        with orm_session_context() as session:
+            training_session = session.get(SalesTrainingSessionEntity, session_id)
+            if training_session is None:
+                return
+            training_session.status = status
+            if total_score is not None:
+                training_session.total_score = int(total_score)
+            if level is not None:
+                training_session.level = level
+            if report is not None:
+                training_session.report_json = self._json(report)
+            if status in {"completed", "failed"} and training_session.ended_at is None:
+                training_session.ended_at = now
+            training_session.updated_at = now
 
     def add_turn(self, **values: Any) -> SalesTrainingTurnEntity:
-        """保存训练对话轮次。
+        """保存训练对话轮次。"""
 
-        role 字段当前会出现：
-        - customer：AI 客户；
-        - trainee：学员；
-        - system：系统消息。
-
-        训练复盘时按 round_no + created_at 排序，还原真实对话顺序。
-        """
-
+        now = utc_now()
         turn_id = values.get("turn_id") or f"turn_{uuid.uuid4().hex}"
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO sales_training_turns (
-                    turn_id, session_id, role, content, round_no, stage_no,
-                    response_mode, started_at, submitted_at, response_seconds,
-                    retrieved_chunk_ids_json, retrieved_evidence_json,
-                    stage_decision_json, coach_analysis_json, metadata_json, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    turn_id,
-                    values["session_id"],
-                    values["role"],
-                    values["content"],
-                    int(values["round_no"]),
-                    int(values.get("stage_no", 1)),
-                    values.get("response_mode"),
-                    values.get("started_at"),
-                    values.get("submitted_at"),
-                    values.get("response_seconds"),
-                    self._json(values.get("retrieved_chunk_ids") or []),
-                    self._json(values.get("retrieved_evidence") or []),
-                    self._json(values.get("stage_decision") or {}),
-                    self._json(values.get("coach_analysis") or {}),
-                    self._json(values.get("metadata") or {}),
-                    utc_now_text(),
-                ),
-            )
-        return self.get_turn(turn_id) or {}
+        turn = SalesTrainingTurnEntity(
+            turn_id=turn_id,
+            session_id=values["session_id"],
+            role=values["role"],
+            content=values["content"],
+            round_no=int(values["round_no"]),
+            stage_no=int(values.get("stage_no", 1)),
+            response_mode=values.get("response_mode"),
+            started_at=to_datetime(values.get("started_at")),
+            submitted_at=to_datetime(values.get("submitted_at")),
+            response_seconds=values.get("response_seconds"),
+            retrieved_chunk_ids_json=self._json(values.get("retrieved_chunk_ids") or []),
+            retrieved_evidence_json=self._json(values.get("retrieved_evidence") or []),
+            stage_decision_json=self._json(values.get("stage_decision") or {}),
+            coach_analysis_json=self._json(values.get("coach_analysis") or {}),
+            metadata_json=self._json(values.get("metadata") or {}),
+            created_at=now,
+        )
+        with orm_session_context() as session:
+            session.add(turn)
+        created = self.get_turn(turn_id)
+        if created is None:
+            raise RuntimeError(f"训练轮次保存失败：{turn_id}")
+        return created
 
     def get_turn(self, turn_id: str) -> SalesTrainingTurnEntity | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM sales_training_turns WHERE turn_id = ?", (turn_id,)).fetchone()
-        return self._row(row)
+        """按 ID 查询训练轮次。"""
+
+        with orm_session_context() as session:
+            return session.get(SalesTrainingTurnEntity, turn_id)
 
     def list_turns(self, session_id: str) -> list[SalesTrainingTurnEntity]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM sales_training_turns
-                WHERE session_id = ?
-                ORDER BY round_no, created_at
-                """,
-                (session_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        """查询训练会话内的全部轮次。"""
+
+        statement = (
+            select(SalesTrainingTurnEntity)
+            .where(SalesTrainingTurnEntity.session_id == session_id)
+            .order_by(SalesTrainingTurnEntity.round_no.asc(), SalesTrainingTurnEntity.created_at.asc())
+        )
+        with orm_session_context() as session:
+            return session.scalars(statement).all()
 
     def next_round_no(self, session_id: str) -> int:
-        """计算下一轮学员回复轮次。
+        """计算下一轮学员回复轮次。"""
 
-        只统计 role='trainee'，因为 AI 客户开场白 round_no=0，
-        AI 客户回复和学员回复共享同一个 round_no。
-        """
-
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT COALESCE(MAX(round_no), 0) AS max_round
-                FROM sales_training_turns
-                WHERE session_id = ? AND role = 'trainee'
-                """,
-                (session_id,),
-            ).fetchone()
-        return int(row["max_round"] or 0) + 1
+        statement = select(func.coalesce(func.max(SalesTrainingTurnEntity.round_no), 0)).where(
+            SalesTrainingTurnEntity.session_id == session_id,
+            SalesTrainingTurnEntity.role == "trainee",
+        )
+        with orm_session_context() as session:
+            max_round = int(session.scalar(statement) or 0)
+        return max_round + 1
 
     def save_score(self, **values: Any) -> SalesTrainingScoreEntity:
-        """保存训练评分结果。
+        """保存训练评分结果。"""
 
-        一期先保留多评分记录能力，方便后续“AI 自动评分 + 人工复核”。
-        服务层会做幂等控制，避免已完成会话重复生成多份评分。
-        """
-
-        now = utc_now_text()
+        now = utc_now()
         score_id = values.get("score_id") or f"score_{uuid.uuid4().hex}"
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO sales_training_scores (
-                    score_id, session_id, general_score, stage_score, penalty_score,
-                    final_score, level, is_passed, detail_json, review_status,
-                    created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    score_id,
-                    values["session_id"],
-                    int(values["general_score"]),
-                    int(values["stage_score"]),
-                    int(values.get("penalty_score", 0)),
-                    int(values["final_score"]),
-                    values["level"],
-                    1 if values.get("is_passed") else 0,
-                    self._json(values.get("detail") or {}),
-                    values.get("review_status", "confirmed"),
-                    now,
-                    now,
-                ),
-            )
-        return self.get_score(score_id) or {}
+        score = SalesTrainingScoreEntity(
+            score_id=score_id,
+            session_id=values["session_id"],
+            general_score=int(values["general_score"]),
+            stage_score=int(values["stage_score"]),
+            penalty_score=int(values.get("penalty_score", 0)),
+            final_score=int(values["final_score"]),
+            level=values["level"],
+            is_passed=1 if values.get("is_passed") else 0,
+            detail_json=self._json(values.get("detail") or {}),
+            review_status=values.get("review_status", "confirmed"),
+            created_at=now,
+            updated_at=now,
+        )
+        with orm_session_context() as session:
+            session.add(score)
+        created = self.get_score(score_id)
+        if created is None:
+            raise RuntimeError(f"训练评分保存失败：{score_id}")
+        return created
 
     def get_score(self, score_id: str) -> SalesTrainingScoreEntity | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM sales_training_scores WHERE score_id = ?", (score_id,)).fetchone()
-        return self._row(row)
+        """按 ID 查询训练评分。"""
+
+        with orm_session_context() as session:
+            return session.get(SalesTrainingScoreEntity, score_id)
 
     def get_latest_score_by_session(self, session_id: str) -> SalesTrainingScoreEntity | None:
-        """查询某个训练会话最新的一份评分报告。
+        """查询某个训练会话最新的一份评分报告。"""
 
-        如果未来允许人工复核产生新版本评分，这里始终取 updated_at 最新的一份。
-        """
-
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM sales_training_scores
-                WHERE session_id = ?
-                ORDER BY updated_at DESC, created_at DESC
-                LIMIT 1
-                """,
-                (session_id,),
-            ).fetchone()
-        return self._row(row)
+        statement = (
+            select(SalesTrainingScoreEntity)
+            .where(SalesTrainingScoreEntity.session_id == session_id)
+            .order_by(
+                SalesTrainingScoreEntity.updated_at.desc(),
+                SalesTrainingScoreEntity.created_at.desc(),
+            )
+            .limit(1)
+        )
+        with orm_session_context() as session:
+            return session.scalars(statement).first()

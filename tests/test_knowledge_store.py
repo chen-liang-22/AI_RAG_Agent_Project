@@ -40,7 +40,7 @@ class FakeDictionaryRedisClient:
 
 
 def test_conversation_exchange_is_persisted_in_sequence(tmp_path):
-    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    store = KnowledgeStore()
     conversation = store.ensure_conversation(
         conversation_id="conv_test",
         user_id="user_1",
@@ -66,7 +66,7 @@ def test_conversation_exchange_is_persisted_in_sequence(tmp_path):
 
 
 def test_conversations_can_be_listed_and_loaded_with_messages(tmp_path):
-    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    store = KnowledgeStore()
     store.ensure_conversation(conversation_id="conv_a", user_id="user_1", title="第一段会话")
     store.ensure_conversation(conversation_id="conv_b", user_id="user_2", title="第二段会话")
     store.save_chat_exchange(
@@ -84,7 +84,7 @@ def test_conversations_can_be_listed_and_loaded_with_messages(tmp_path):
 
 
 def test_conversations_can_be_filtered_by_keyword(tmp_path):
-    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    store = KnowledgeStore()
     store.ensure_conversation(conversation_id="conv_robot", user_id="1001", title="扫拖预约设置")
     store.ensure_conversation(conversation_id="conv_report", user_id="1002", title="使用报告查询")
 
@@ -105,7 +105,7 @@ def test_dictionary_items_use_redis_cache(monkeypatch, tmp_path):
 
     fake_redis = FakeDictionaryRedisClient()
     monkeypatch.setattr(knowledge_store, "get_redis_client", lambda: fake_redis)
-    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    store = KnowledgeStore()
     fake_redis.values.clear()
     fake_redis.set_calls.clear()
 
@@ -131,7 +131,7 @@ def test_upsert_dictionary_item_refreshes_redis_cache(monkeypatch, tmp_path):
 
     fake_redis = FakeDictionaryRedisClient()
     monkeypatch.setattr(knowledge_store, "get_redis_client", lambda: fake_redis)
-    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    store = KnowledgeStore()
     fake_redis.values.clear()
     fake_redis.set_calls.clear()
 
@@ -154,7 +154,7 @@ def test_upsert_dictionary_item_refreshes_redis_cache(monkeypatch, tmp_path):
 
 
 def test_exam_session_questions_and_answers_are_persisted(tmp_path):
-    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    store = KnowledgeStore()
     session = store.create_exam_session(
         session_id="exam_unit",
         user_id="user_exam",

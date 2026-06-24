@@ -98,7 +98,7 @@ class ReactAgent:
         graph.add_edge("tools", "update_report_state")  # 工具执行完后先更新业务状态
         graph.add_edge("update_report_state", "agent")  # 更新完状态后回到模型，让模型生成最终回答
 
-        return graph.compile()  # 编译图；会话历史由 SQLite 在每次请求前注入
+        return graph.compile()  # 编译图；会话历史由 MySQL 在每次请求前注入
 
     @staticmethod
     def _message_content_to_text(content) -> str:
@@ -122,7 +122,7 @@ class ReactAgent:
     def _input_state(cls, query: str, history: list[dict] | None = None) -> AgentState:
         """把用户输入转换成 LangGraph 的初始 state。
 
-        这里会把 SQLite 中最近的历史消息和当前用户新消息一起传入。
+        这里会把 MySQL 中最近的历史消息和当前用户新消息一起传入。
         这样服务重启后也能恢复会话上下文。
         """
 
@@ -133,7 +133,7 @@ class ReactAgent:
 
     @staticmethod
     def _history_to_messages(history: list[dict]) -> list[AnyMessage]:
-        """把 SQLite 消息记录转换成 LangChain 消息。"""
+        """把 MySQL 消息记录转换成 LangChain 消息。"""
 
         messages: list[AnyMessage] = []
         for item in history:
@@ -154,7 +154,7 @@ class ReactAgent:
         """生成 LangGraph 运行配置。
 
         thread_id 主要用于 LangGraph 内部 tracing。
-        持久化历史以 SQLite conversation_id 为准。
+        持久化历史以 MySQL conversation_id 为准。
         """
 
         return {"configurable": {"thread_id": conversation_id or user_id or "anonymous"}}

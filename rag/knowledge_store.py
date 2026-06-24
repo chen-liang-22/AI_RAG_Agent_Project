@@ -1,12 +1,11 @@
 import json
-import os
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
-from rag.profile_dictionaries import PROFILE_DICTIONARY_ITEMS
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session
+
 from domain.entities import (
     ConversationEntity,
     ConversationMessageEntity,
@@ -14,9 +13,9 @@ from domain.entities import (
     DocumentEntity,
     ExamQuestionEntity,
     ExamSessionEntity,
-    KnowledgeStoreRow,
 )
-from utils.database_connection import database_context, is_mysql_runtime
+from infrastructure.orm_session import orm_session_context
+from rag.profile_dictionaries import PROFILE_DICTIONARY_ITEMS
 from utils.logger_handler import logger
 from utils.redis_client import get_redis_client
 
@@ -196,259 +195,49 @@ def utc_now_text() -> str:
     return datetime.utcnow().isoformat(timespec="seconds", sep=" ")
 
 
+def utc_now() -> datetime:
+    """返回去掉微秒的 UTC 时间，便于写入 MySQL DATETIME 字段。"""
+
+    return datetime.utcnow().replace(microsecond=0)
+
+
 class KnowledgeStore:
-    """业务元数据存储。
+    """业务元数据仓储。
 
-    最终设计里，关系型数据库只保存业务状态：
-    - documents：文件管理、索引状态、版本、chunk_count。
-    - conversations / conversation_messages：会话历史。
-
-    知识正文、FAQ、向量和可检索 payload 都以 Qdrant 为准。
+    关系型数据库只保存文件、字典、会话和考试这些业务状态。
+    知识正文、分片正文、向量和可检索 payload 仍以 Qdrant 为准。
     """
 
-    def __init__(self, db_path: str | None = None):
-        self.db_path = db_path
-        if self.db_path:
-            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+    def __init__(self):
         self.init_db()
 
-    @contextmanager
-    def connect(self) -> Iterator[Any]:
-        """打开业务数据库连接，并在 SQL 执行结束后自动提交和关闭。"""
-
-        with database_context(self.db_path) as conn:
-            yield conn
-
     def init_db(self) -> None:
+        """同步默认字典数据。
+
+        表结构由 MySQL 初始化脚本维护；这里只做业务默认字典 upsert。
+        """
+
         global _MYSQL_DEFAULT_DICTIONARY_SYNCED
 
-        should_refresh_dictionary_cache = False
-        with self.connect() as conn:
-            if is_mysql_runtime(self.db_path):
-                # MySQL 表结构由 docs/mysql初始化建表和基础数据.sql 管理。
-                # 默认字典同步是批量写操作，进程内只执行一次，避免每次创建仓储对象都拖慢接口。
-                if not _MYSQL_DEFAULT_DICTIONARY_SYNCED:
-                    self.seed_default_dictionaries(conn)
-                    _MYSQL_DEFAULT_DICTIONARY_SYNCED = True
-                    should_refresh_dictionary_cache = True
-                if should_refresh_dictionary_cache:
-                    # 默认字典同步属于写操作，先提交再用新连接刷新 Redis 缓存。
-                    conn.commit()
-                    self.refresh_all_dictionary_cache()
-                return
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS documents (
-                    document_id TEXT PRIMARY KEY,
-                    filename TEXT NOT NULL,
-                    file_path TEXT NOT NULL,
-                    file_type TEXT NOT NULL,
-                    file_md5 TEXT NOT NULL,
-                    file_size INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    version INTEGER NOT NULL DEFAULT 1,
-                    chunk_count INTEGER NOT NULL DEFAULT 0,
-                    collection_name TEXT NOT NULL DEFAULT 'agent',
-                    document_type TEXT NOT NULL DEFAULT 'text',
-                    split_strategy TEXT NOT NULL DEFAULT 'recursive',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    error_message TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS conversations (
-                    conversation_id TEXT PRIMARY KEY,
-                    user_id TEXT,
-                    title TEXT,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    message_count INTEGER NOT NULL DEFAULT 0,
-                    summary TEXT,
-                    metadata_json TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    last_message_at TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS conversation_messages (
-                    message_id TEXT PRIMARY KEY,
-                    conversation_id TEXT NOT NULL,
-                    sequence_no INTEGER NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    content_type TEXT NOT NULL DEFAULT 'text',
-                    model_name TEXT,
-                    token_count INTEGER,
-                    metadata_json TEXT,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id),
-                    UNIQUE(conversation_id, sequence_no)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_documents_file_md5
-                ON documents(file_md5)
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dictionary_items (
-                    dictionary_item_id TEXT PRIMARY KEY,
-                    dictionary_code TEXT NOT NULL,
-                    dictionary_name TEXT NOT NULL,
-                    item_code TEXT NOT NULL,
-                    item_name TEXT NOT NULL,
-                    parent_item_id TEXT,
-                    item_level INTEGER NOT NULL DEFAULT 1,
-                    sort_order INTEGER NOT NULL DEFAULT 0,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    description TEXT,
-                    metadata_json TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(dictionary_code, item_code)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS exam_sessions (
-                    session_id TEXT PRIMARY KEY,
-                    user_id TEXT,
-                    title TEXT,
-                    collection_name TEXT NOT NULL,
-                    document_id TEXT,
-                    filename TEXT,
-                    section_path TEXT,
-                    round_count INTEGER NOT NULL,
-                    question_types_json TEXT,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    current_round INTEGER NOT NULL DEFAULT 1,
-                    answered_count INTEGER NOT NULL DEFAULT 0,
-                    total_score REAL NOT NULL DEFAULT 0,
-                    max_score REAL NOT NULL DEFAULT 100,
-                    model_mode TEXT,
-                    metadata_json TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    completed_at TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS exam_questions (
-                    exam_question_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    round_no INTEGER NOT NULL,
-                    source_question_id TEXT,
-                    source_document_id TEXT,
-                    source_filename TEXT,
-                    source_page INTEGER,
-                    section_path TEXT,
-                    question_type TEXT NOT NULL,
-                    prompt TEXT NOT NULL,
-                    options_json TEXT,
-                    correct_answer_json TEXT,
-                    reference_answer TEXT,
-                    user_answer TEXT,
-                    is_correct INTEGER,
-                    score REAL,
-                    max_score REAL NOT NULL,
-                    analysis_json TEXT,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at TEXT NOT NULL,
-                    answered_at TEXT,
-                    FOREIGN KEY(session_id) REFERENCES exam_sessions(session_id) ON DELETE CASCADE,
-                    UNIQUE(session_id, round_no)
-                )
-                """
-            )
-            self._ensure_document_columns(conn)
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_documents_collection
-                ON documents(collection_name)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_conversations_user_updated
-                ON conversations(user_id, updated_at)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_conversations_status
-                ON conversations(status)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_messages_conversation_sequence
-                ON conversation_messages(conversation_id, sequence_no)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
-                ON conversation_messages(conversation_id, created_at)
-                """
-            )
+        if _MYSQL_DEFAULT_DICTIONARY_SYNCED:
+            return
+        with orm_session_context() as session:
+            self.seed_default_dictionaries(session)
+        _MYSQL_DEFAULT_DICTIONARY_SYNCED = True
+        self.refresh_all_dictionary_cache()
 
-            # 旧知识表不再作为知识答案来源，启动时清理，避免继续双写或误查。
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_dictionary_items_code_parent
-                ON dictionary_items(dictionary_code, parent_item_id, sort_order)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_exam_sessions_updated
-                ON exam_sessions(updated_at)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_exam_sessions_user_status
-                ON exam_sessions(user_id, status)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_exam_questions_session_round
-                ON exam_questions(session_id, round_no)
-                """
-            )
-            self.seed_default_dictionaries(conn)
-            should_refresh_dictionary_cache = True
-            conn.execute("DROP TABLE IF EXISTS qa_items")
-            conn.execute("DROP TABLE IF EXISTS document_segments")
-            conn.execute("DROP TABLE IF EXISTS knowledge_units")
-        if should_refresh_dictionary_cache:
-            self.refresh_all_dictionary_cache()
-
-    def seed_default_dictionaries(self, conn: Any) -> None:
+    def seed_default_dictionaries(self, session: Session) -> None:
         """初始化系统默认字典项，已有字典项只更新展示信息。"""
 
-        # 清理已经废弃的旧字典，避免旧库升级后前端继续展示过期口径。
-        conn.execute(
-            """
-            DELETE FROM dictionary_items
-            WHERE dictionary_code IN (?, ?)
-            """,
-            ("collection_domain_keyword", "sales_customer_profile_template"),
-        )
+        deprecated_items = session.scalars(
+            select(DictionaryItemEntity).where(
+                DictionaryItemEntity.dictionary_code.in_(DEPRECATED_DICTIONARY_CODES)
+            )
+        ).all()
+        for item in deprecated_items:
+            session.delete(item)
 
-        now = utc_now_text()
+        now = utc_now()
         for dictionary in DEFAULT_DICTIONARY_ITEMS:
             dictionary_code = dictionary["dictionary_code"]
             dictionary_name = dictionary["dictionary_name"]
@@ -457,67 +246,47 @@ class KnowledgeStore:
                 item_code, item_name, parent_code, sort_order, description = item[:5]
                 metadata = item[5] if len(item) > 5 else None
                 metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
-                existing = conn.execute(
-                    """
-                    SELECT dictionary_item_id
-                    FROM dictionary_items
-                    WHERE dictionary_code = ? AND item_code = ?
-                    """,
-                    (dictionary_code, item_code),
-                ).fetchone()
+                existing = session.scalars(
+                    select(DictionaryItemEntity).where(
+                        DictionaryItemEntity.dictionary_code == dictionary_code,
+                        DictionaryItemEntity.item_code == item_code,
+                    )
+                ).first()
                 parent_item_id = item_id_by_code.get(parent_code or "")
                 item_level = 1 if parent_item_id is None else 2
                 if existing:
-                    dictionary_item_id = existing["dictionary_item_id"]
-                    conn.execute(
-                        """
-                        UPDATE dictionary_items
-                        SET dictionary_name = ?, item_name = ?, parent_item_id = ?,
-                            item_level = ?, sort_order = ?, description = ?, metadata_json = ?, updated_at = ?
-                        WHERE dictionary_item_id = ?
-                        """,
-                        (
-                            dictionary_name,
-                            item_name,
-                            parent_item_id,
-                            item_level,
-                            sort_order,
-                            description,
-                            metadata_json,
-                            now,
-                            dictionary_item_id,
-                        ),
-                    )
+                    existing.dictionary_name = dictionary_name
+                    existing.item_name = item_name
+                    existing.parent_item_id = parent_item_id
+                    existing.item_level = item_level
+                    existing.sort_order = int(sort_order)
+                    existing.enabled = 1
+                    existing.description = description
+                    existing.metadata_json = metadata_json
+                    existing.updated_at = now
+                    dictionary_item_id = existing.dictionary_item_id
                 else:
                     dictionary_item_id = f"dict_{uuid.uuid4().hex}"
-                    conn.execute(
-                        """
-                        INSERT INTO dictionary_items (
-                            dictionary_item_id, dictionary_code, dictionary_name,
-                            item_code, item_name, parent_item_id, item_level,
-                            sort_order, enabled, description, metadata_json,
-                            created_at, updated_at
+                    session.add(
+                        DictionaryItemEntity(
+                            dictionary_item_id=dictionary_item_id,
+                            dictionary_code=dictionary_code,
+                            dictionary_name=dictionary_name,
+                            item_code=item_code,
+                            item_name=item_name,
+                            parent_item_id=parent_item_id,
+                            item_level=item_level,
+                            sort_order=int(sort_order),
+                            enabled=1,
+                            description=description,
+                            metadata_json=metadata_json,
+                            created_at=now,
+                            updated_at=now,
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-                        """,
-                        (
-                            dictionary_item_id,
-                            dictionary_code,
-                            dictionary_name,
-                            item_code,
-                            item_name,
-                            parent_item_id,
-                            item_level,
-                            sort_order,
-                            description,
-                            metadata_json,
-                            now,
-                            now,
-                        ),
                     )
                 item_id_by_code[item_code] = dictionary_item_id
 
-    def list_dictionary_items(self, dictionary_code: str | None = None) -> list[DictionaryItemEntity]:
+    def list_dictionary_items(self, dictionary_code: str | None = None) -> list[dict[str, Any]]:
         """查询字典项列表，支持按字典编码过滤。"""
 
         clean_dictionary_code = dictionary_code.strip() if dictionary_code else None
@@ -529,29 +298,21 @@ class KnowledgeStore:
         self._write_dictionary_items_cache(clean_dictionary_code, rows)
         return rows
 
-    def _list_dictionary_items_from_db(self, dictionary_code: str | None = None) -> list[DictionaryItemEntity]:
+    def _list_dictionary_items_from_db(self, dictionary_code: str | None = None) -> list[dict[str, Any]]:
         """直接从数据库查询字典项，供缓存未命中或刷新缓存时使用。"""
 
-        with self.connect() as conn:
-            if dictionary_code:
-                rows = conn.execute(
-                    """
-                    SELECT *
-                    FROM dictionary_items
-                    WHERE dictionary_code = ?
-                    ORDER BY dictionary_code, item_level, sort_order, item_code
-                    """,
-                    (dictionary_code,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT *
-                    FROM dictionary_items
-                    ORDER BY dictionary_code, item_level, sort_order, item_code
-                    """
-                ).fetchall()
-        return [self._serialize_dictionary_row(dict(row)) for row in rows]
+        statement = select(DictionaryItemEntity)
+        if dictionary_code:
+            statement = statement.where(DictionaryItemEntity.dictionary_code == dictionary_code)
+        statement = statement.order_by(
+            DictionaryItemEntity.dictionary_code.asc(),
+            DictionaryItemEntity.item_level.asc(),
+            DictionaryItemEntity.sort_order.asc(),
+            DictionaryItemEntity.item_code.asc(),
+        )
+        with orm_session_context() as session:
+            rows = session.scalars(statement).all()
+        return [self._serialize_dictionary_row(row.to_dict()) for row in rows]
 
     def _dictionary_items_cache_key(self, dictionary_code: str | None = None) -> str:
         """生成字典项列表缓存 key，空编码表示全部字典。"""
@@ -559,7 +320,7 @@ class KnowledgeStore:
         cache_code = dictionary_code or "all"
         return get_redis_client().build_key("dictionary", "items", cache_code)
 
-    def _load_dictionary_items_cache(self, dictionary_code: str | None = None) -> list[DictionaryItemEntity] | None:
+    def _load_dictionary_items_cache(self, dictionary_code: str | None = None) -> list[dict[str, Any]] | None:
         """从 Redis 读取字典项缓存，Redis 不可用或内容异常时返回 None。"""
 
         cache_key = self._dictionary_items_cache_key(dictionary_code)
@@ -594,10 +355,7 @@ class KnowledgeStore:
 
         all_rows = self._list_dictionary_items_from_db(None)
         redis_client = get_redis_client()
-        stale_keys = [
-            self._dictionary_items_cache_key(code)
-            for code in DEPRECATED_DICTIONARY_CODES
-        ]
+        stale_keys = [self._dictionary_items_cache_key(code) for code in DEPRECATED_DICTIONARY_CODES]
         redis_client.delete(*stale_keys)
         self._write_dictionary_items_cache(None, all_rows)
         rows_by_dictionary: dict[str, list[dict[str, Any]]] = {}
@@ -618,7 +376,7 @@ class KnowledgeStore:
                 serialized_row[key] = value
         return serialized_row
 
-    def get_dictionary_item_by_code(self, dictionary_code: str, item_code: str) -> DictionaryItemEntity | None:
+    def get_dictionary_item_by_code(self, dictionary_code: str, item_code: str) -> dict[str, Any] | None:
         """按字典编码和字典项编码查询单个字典项。"""
 
         clean_item_code = item_code.strip()
@@ -640,7 +398,7 @@ class KnowledgeStore:
             enabled: bool = True,
             description: str | None = None,
             metadata: dict[str, Any] | None = None,
-    ) -> DictionaryItemEntity:
+    ) -> dict[str, Any]:
         """新增或更新字典项。"""
 
         clean_dictionary_code = dictionary_code.strip()
@@ -650,82 +408,62 @@ class KnowledgeStore:
         if not clean_dictionary_code or not clean_item_code or not clean_dictionary_name or not clean_item_name:
             raise ValueError("字典编码、字典名称、字典项编码和字典项名称不能为空")
 
-        with self.connect() as conn:
+        with orm_session_context() as session:
             final_parent_item_id = self._resolve_dictionary_parent_id(
-                conn,
+                session,
                 clean_dictionary_code,
                 parent_item_id,
                 parent_item_code,
             )
-            item_level = self._resolve_dictionary_item_level(conn, final_parent_item_id)
+            item_level = self._resolve_dictionary_item_level(session, final_parent_item_id)
             metadata_json = json.dumps(metadata or {}, ensure_ascii=False) if metadata else None
-            now = utc_now_text()
-            existing = conn.execute(
-                """
-                SELECT dictionary_item_id
-                FROM dictionary_items
-                WHERE dictionary_code = ? AND item_code = ?
-                """,
-                (clean_dictionary_code, clean_item_code),
-            ).fetchone()
-            if existing:
-                dictionary_item_id = existing["dictionary_item_id"]
-                conn.execute(
-                    """
-                    UPDATE dictionary_items
-                    SET dictionary_name = ?, item_name = ?, parent_item_id = ?,
-                        item_level = ?, sort_order = ?, enabled = ?, description = ?,
-                        metadata_json = ?, updated_at = ?
-                    WHERE dictionary_item_id = ?
-                    """,
-                    (
-                        clean_dictionary_name,
-                        clean_item_name,
-                        final_parent_item_id,
-                        item_level,
-                        sort_order,
-                        1 if enabled else 0,
-                        description,
-                        metadata_json,
-                        now,
-                        dictionary_item_id,
-                    ),
+            now = utc_now()
+            existing = session.scalars(
+                select(DictionaryItemEntity).where(
+                    DictionaryItemEntity.dictionary_code == clean_dictionary_code,
+                    DictionaryItemEntity.item_code == clean_item_code,
                 )
+            ).first()
+            if existing:
+                dictionary_item_id = existing.dictionary_item_id
+                existing.dictionary_name = clean_dictionary_name
+                existing.item_name = clean_item_name
+                existing.parent_item_id = final_parent_item_id
+                existing.item_level = item_level
+                existing.sort_order = int(sort_order)
+                existing.enabled = 1 if enabled else 0
+                existing.description = description
+                existing.metadata_json = metadata_json
+                existing.updated_at = now
             else:
                 dictionary_item_id = f"dict_{uuid.uuid4().hex}"
-                conn.execute(
-                    """
-                    INSERT INTO dictionary_items (
-                        dictionary_item_id, dictionary_code, dictionary_name,
-                        item_code, item_name, parent_item_id, item_level,
-                        sort_order, enabled, description, metadata_json,
-                        created_at, updated_at
+                session.add(
+                    DictionaryItemEntity(
+                        dictionary_item_id=dictionary_item_id,
+                        dictionary_code=clean_dictionary_code,
+                        dictionary_name=clean_dictionary_name,
+                        item_code=clean_item_code,
+                        item_name=clean_item_name,
+                        parent_item_id=final_parent_item_id,
+                        item_level=item_level,
+                        sort_order=int(sort_order),
+                        enabled=1 if enabled else 0,
+                        description=description,
+                        metadata_json=metadata_json,
+                        created_at=now,
+                        updated_at=now,
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        dictionary_item_id,
-                        clean_dictionary_code,
-                        clean_dictionary_name,
-                        clean_item_code,
-                        clean_item_name,
-                        final_parent_item_id,
-                        item_level,
-                        sort_order,
-                        1 if enabled else 0,
-                        description,
-                        metadata_json,
-                        now,
-                        now,
-                    ),
                 )
 
         self.refresh_dictionary_cache(clean_dictionary_code)
-        return self.get_dictionary_item_by_code(clean_dictionary_code, clean_item_code) or {}
+        item = self.get_dictionary_item_by_code(clean_dictionary_code, clean_item_code)
+        if item is None:
+            raise RuntimeError(f"字典项保存失败：{dictionary_item_id}")
+        return item
 
     @staticmethod
     def _resolve_dictionary_parent_id(
-            conn: Any,
+            session: Session,
             dictionary_code: str,
             parent_item_id: str | None,
             parent_item_code: str | None,
@@ -733,50 +471,33 @@ class KnowledgeStore:
         """解析字典父级 ID，支持直接传 ID 或传父级编码。"""
 
         if parent_item_id:
-            row = conn.execute(
-                """
-                SELECT dictionary_item_id
-                FROM dictionary_items
-                WHERE dictionary_item_id = ? AND dictionary_code = ?
-                """,
-                (parent_item_id, dictionary_code),
-            ).fetchone()
-            if row is None:
+            row = session.get(DictionaryItemEntity, parent_item_id)
+            if row is None or row.dictionary_code != dictionary_code:
                 raise ValueError(f"父级字典项不存在或不属于当前字典：{parent_item_id}")
-            return str(row["dictionary_item_id"])
+            return row.dictionary_item_id
         if not parent_item_code:
             return None
 
-        row = conn.execute(
-            """
-            SELECT dictionary_item_id
-            FROM dictionary_items
-            WHERE dictionary_code = ? AND item_code = ?
-            """,
-            (dictionary_code, parent_item_code),
-        ).fetchone()
+        row = session.scalars(
+            select(DictionaryItemEntity).where(
+                DictionaryItemEntity.dictionary_code == dictionary_code,
+                DictionaryItemEntity.item_code == parent_item_code,
+            )
+        ).first()
         if row is None:
             raise ValueError(f"父级字典项不存在：{parent_item_code}")
-        return str(row["dictionary_item_id"])
+        return row.dictionary_item_id
 
     @staticmethod
-    def _resolve_dictionary_item_level(conn: Any, parent_item_id: str | None) -> int:
+    def _resolve_dictionary_item_level(session: Session, parent_item_id: str | None) -> int:
         """根据父级字典项计算当前字典项层级。"""
 
         if not parent_item_id:
             return 1
-
-        row = conn.execute(
-            """
-            SELECT item_level
-            FROM dictionary_items
-            WHERE dictionary_item_id = ?
-            """,
-            (parent_item_id,),
-        ).fetchone()
+        row = session.get(DictionaryItemEntity, parent_item_id)
         if row is None:
             raise ValueError(f"父级字典项不存在：{parent_item_id}")
-        return int(row["item_level"]) + 1
+        return int(row.item_level) + 1
 
     def list_enabled_dictionary_codes(self, dictionary_code: str) -> list[str]:
         """查询某个字典下已启用的字典项编码。"""
@@ -829,26 +550,6 @@ class KnowledgeStore:
             return normalized_value
         return default_code
 
-    @staticmethod
-    def _ensure_document_columns(conn: Any) -> None:
-        if is_mysql_runtime():
-            return
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
-        migrations = {
-            "collection_name": "ALTER TABLE documents ADD COLUMN collection_name TEXT NOT NULL DEFAULT 'agent'",
-            "document_type": "ALTER TABLE documents ADD COLUMN document_type TEXT NOT NULL DEFAULT 'text'",
-            "split_strategy": "ALTER TABLE documents ADD COLUMN split_strategy TEXT NOT NULL DEFAULT 'recursive'",
-        }
-        for column_name, statement in migrations.items():
-            if column_name not in columns:
-                conn.execute(statement)
-
-    @staticmethod
-    def row_to_dict(row: Any | None) -> KnowledgeStoreRow | None:
-        """把数据库行对象转换成轻量实体字典。"""
-
-        return dict(row) if row else None
-
     def create_document(
             self,
             *,
@@ -863,37 +564,32 @@ class KnowledgeStore:
             document_type: str = "text",
             split_strategy: str = "recursive",
     ) -> DocumentEntity:
-        now = utc_now_text()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO documents (
-                    document_id, filename, file_path, file_type, file_md5,
-                    file_size, status, version, chunk_count, collection_name,
-                    document_type, split_strategy, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?)
-                """,
-                (
-                    document_id,
-                    filename,
-                    file_path,
-                    file_type,
-                    file_md5,
-                    file_size,
-                    status,
-                    collection_name,
-                    document_type,
-                    split_strategy,
-                    now,
-                    now,
-                ),
-            )
+        """创建知识库文档元数据。"""
 
-        document = self.get_document(document_id)
-        if document is None:
+        now = utc_now()
+        document = DocumentEntity(
+            document_id=document_id,
+            filename=filename,
+            file_path=file_path,
+            file_type=file_type,
+            file_md5=file_md5,
+            file_size=int(file_size),
+            status=status,
+            version=1,
+            chunk_count=0,
+            collection_name=collection_name,
+            document_type=document_type,
+            split_strategy=split_strategy,
+            created_at=now,
+            updated_at=now,
+            error_message=None,
+        )
+        with orm_session_context() as session:
+            session.add(document)
+        created = self.get_document(document_id)
+        if created is None:
             raise RuntimeError(f"Document {document_id} was not created")
-        return document
+        return created
 
     def find_active_document_by_md5(
             self,
@@ -902,49 +598,37 @@ class KnowledgeStore:
     ) -> DocumentEntity | None:
         """按文件 MD5 查找未删除文档；传入 collection 时只在该 collection 内去重。"""
 
+        conditions = [
+            DocumentEntity.file_md5 == file_md5,
+            DocumentEntity.status != "deleted",
+        ]
         if collection_name:
-            with self.connect() as conn:
-                row = conn.execute(
-                    """
-                    SELECT * FROM documents
-                    WHERE file_md5 = ? AND collection_name = ? AND status != 'deleted'
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (file_md5, collection_name),
-                ).fetchone()
-            return self.row_to_dict(row)
-
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM documents
-                WHERE file_md5 = ? AND status != 'deleted'
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (file_md5,),
-            ).fetchone()
-        return self.row_to_dict(row)
+            conditions.append(DocumentEntity.collection_name == collection_name)
+        statement = (
+            select(DocumentEntity)
+            .where(*conditions)
+            .order_by(DocumentEntity.created_at.desc())
+            .limit(1)
+        )
+        with orm_session_context() as session:
+            return session.scalars(statement).first()
 
     def get_document(self, document_id: str) -> DocumentEntity | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM documents WHERE document_id = ?",
-                (document_id,),
-            ).fetchone()
-        return self.row_to_dict(row)
+        """按 ID 查询文档。"""
+
+        with orm_session_context() as session:
+            return session.get(DocumentEntity, document_id)
 
     def list_documents(self) -> list[DocumentEntity]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM documents
-                WHERE status != 'deleted'
-                ORDER BY created_at DESC
-                """
-            ).fetchall()
-        return [dict(row) for row in rows]
+        """查询全部未删除文档。"""
+
+        statement = (
+            select(DocumentEntity)
+            .where(DocumentEntity.status != "deleted")
+            .order_by(DocumentEntity.created_at.desc())
+        )
+        with orm_session_context() as session:
+            return session.scalars(statement).all()
 
     def update_document_status(
             self,
@@ -958,38 +642,25 @@ class KnowledgeStore:
             document_type: str | None = None,
             split_strategy: str | None = None,
     ) -> None:
-        document = self.get_document(document_id)
-        if document is None:
-            raise ValueError(f"Document {document_id} does not exist")
+        """更新文档索引状态。"""
 
-        version = int(document["version"]) + 1 if increment_version else int(document["version"])
-        final_chunk_count = int(document["chunk_count"]) if chunk_count is None else chunk_count
-        final_collection_name = collection_name or document.get("collection_name") or "agent"
-        final_document_type = document_type or document.get("document_type") or "text"
-        final_split_strategy = split_strategy or document.get("split_strategy") or "recursive"
-
-        with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE documents
-                SET status = ?, chunk_count = ?, error_message = ?, version = ?,
-                    collection_name = ?, document_type = ?, split_strategy = ?, updated_at = ?
-                WHERE document_id = ?
-                """,
-                (
-                    status,
-                    final_chunk_count,
-                    error_message,
-                    version,
-                    final_collection_name,
-                    final_document_type,
-                    final_split_strategy,
-                    utc_now_text(),
-                    document_id,
-                ),
-            )
+        with orm_session_context() as session:
+            document = session.get(DocumentEntity, document_id)
+            if document is None:
+                raise ValueError(f"Document {document_id} does not exist")
+            document.status = status
+            document.chunk_count = int(document.chunk_count if chunk_count is None else chunk_count)
+            document.error_message = error_message
+            if increment_version:
+                document.version = int(document.version) + 1
+            document.collection_name = collection_name or document.collection_name or "agent"
+            document.document_type = document_type or document.document_type or "text"
+            document.split_strategy = split_strategy or document.split_strategy or "recursive"
+            document.updated_at = utc_now()
 
     def mark_document_deleted(self, document_id: str) -> None:
+        """把文档标记为删除。"""
+
         self.update_document_status(document_id, "deleted")
 
     def ensure_conversation(
@@ -1000,6 +671,8 @@ class KnowledgeStore:
             title: str | None = None,
             metadata: dict[str, Any] | None = None,
     ) -> ConversationEntity:
+        """确保会话存在，已删除会话不会复用原 ID。"""
+
         clean_conversation_id = (conversation_id or "").strip()
         if clean_conversation_id:
             existing = self.get_conversation(clean_conversation_id)
@@ -1010,67 +683,57 @@ class KnowledgeStore:
         else:
             clean_conversation_id = f"conv_{uuid.uuid4().hex}"
 
-        now = utc_now_text()
+        now = utc_now()
         clean_title = (title or "").strip()[:80] or None
         metadata_json = json.dumps(metadata or {}, ensure_ascii=False) if metadata else None
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO conversations (
-                    conversation_id, user_id, title, status, message_count, summary,
-                    metadata_json, created_at, updated_at, last_message_at
-                )
-                VALUES (?, ?, ?, 'active', 0, NULL, ?, ?, ?, NULL)
-                """,
-                (clean_conversation_id, user_id, clean_title, metadata_json, now, now),
-            )
-
-        conversation = self.get_conversation(clean_conversation_id)
-        if conversation is None:
+        conversation = ConversationEntity(
+            conversation_id=clean_conversation_id,
+            user_id=user_id,
+            title=clean_title,
+            status="active",
+            message_count=0,
+            summary=None,
+            metadata_json=metadata_json,
+            created_at=now,
+            updated_at=now,
+            last_message_at=None,
+        )
+        with orm_session_context() as session:
+            session.add(conversation)
+        created = self.get_conversation(clean_conversation_id)
+        if created is None:
             raise RuntimeError(f"Conversation {clean_conversation_id} was not created")
-        return conversation
+        return created
 
     def get_conversation(self, conversation_id: str) -> ConversationEntity | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM conversations WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-        return self.row_to_dict(row)
+        """按 ID 查询会话。"""
+
+        with orm_session_context() as session:
+            return session.get(ConversationEntity, conversation_id)
 
     def delete_conversation(self, conversation_id: str) -> bool:
         """删除聊天记录。
 
-        会话主表保留一条 deleted 状态记录，避免历史 ID 误复用；
-        消息明细直接删除，避免已删除会话的问答正文继续留在数据库里。
+        会话主表保留 deleted 状态；消息明细直接删除，避免正文继续留存。
         """
 
-        now = utc_now_text()
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT status FROM conversations WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if row is None or row["status"] == "deleted":
+        now = utc_now()
+        with orm_session_context() as session:
+            conversation = session.get(ConversationEntity, conversation_id)
+            if conversation is None or conversation.status == "deleted":
                 return False
-
-            conn.execute(
-                "DELETE FROM conversation_messages WHERE conversation_id = ?",
-                (conversation_id,),
-            )
-            conn.execute(
-                """
-                UPDATE conversations
-                SET status = 'deleted',
-                    message_count = 0,
-                    updated_at = ?,
-                    last_message_at = ?
-                WHERE conversation_id = ?
-                """,
-                (now, now, conversation_id),
-            )
-
-        return True
+            messages = session.scalars(
+                select(ConversationMessageEntity).where(
+                    ConversationMessageEntity.conversation_id == conversation_id
+                )
+            ).all()
+            for message in messages:
+                session.delete(message)
+            conversation.status = "deleted"
+            conversation.message_count = 0
+            conversation.updated_at = now
+            conversation.last_message_at = now
+            return True
 
     def list_conversations(
             self,
@@ -1085,39 +748,38 @@ class KnowledgeStore:
         final_page = max(1, int(page))
         final_page_size = max(1, min(int(page_size), 50))
         offset = (final_page - 1) * final_page_size
-        conditions = ["status != 'deleted'"]
-        params: list[Any] = []
-
+        conditions = [ConversationEntity.status != "deleted"]
         if user_id:
-            conditions.append("user_id = ?")
-            params.append(user_id)
-
+            conditions.append(ConversationEntity.user_id == user_id)
         clean_keyword = (keyword or "").strip()
         if clean_keyword:
             like_keyword = f"%{self._escape_like_keyword(clean_keyword)}%"
             conditions.append(
-                "(title LIKE ? ESCAPE '\\' OR user_id LIKE ? ESCAPE '\\' OR conversation_id LIKE ? ESCAPE '\\')"
+                or_(
+                    ConversationEntity.title.like(like_keyword, escape="\\"),
+                    ConversationEntity.user_id.like(like_keyword, escape="\\"),
+                    ConversationEntity.conversation_id.like(like_keyword, escape="\\"),
+                )
             )
-            params.extend([like_keyword, like_keyword, like_keyword])
 
-        where_sql = " AND ".join(conditions)
-        with self.connect() as conn:
-            total_row = conn.execute(
-                f"SELECT COUNT(*) AS total FROM conversations WHERE {where_sql}",
-                params,
-            ).fetchone()
-            rows = conn.execute(
-                f"""
-                SELECT *
-                FROM conversations
-                WHERE {where_sql}
-                ORDER BY COALESCE(last_message_at, updated_at, created_at) DESC
-                LIMIT ? OFFSET ?
-                """,
-                [*params, final_page_size, offset],
-            ).fetchall()
-
-        return [dict(row) for row in rows], int(total_row["total"] if total_row else 0)
+        count_statement = select(func.count()).select_from(ConversationEntity).where(*conditions)
+        list_statement = (
+            select(ConversationEntity)
+            .where(*conditions)
+            .order_by(
+                func.coalesce(
+                    ConversationEntity.last_message_at,
+                    ConversationEntity.updated_at,
+                    ConversationEntity.created_at,
+                ).desc()
+            )
+            .limit(final_page_size)
+            .offset(offset)
+        )
+        with orm_session_context() as session:
+            total = int(session.scalar(count_statement) or 0)
+            rows = session.scalars(list_statement).all()
+        return rows, total
 
     @staticmethod
     def _escape_like_keyword(keyword: str) -> str:
@@ -1126,34 +788,29 @@ class KnowledgeStore:
         return keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     def list_recent_messages(self, conversation_id: str, limit: int = 20) -> list[ConversationMessageEntity]:
+        """查询最近若干条会话消息，并按正序返回。"""
+
         final_limit = max(1, min(int(limit), 100))
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM conversation_messages
-                WHERE conversation_id = ?
-                ORDER BY sequence_no DESC
-                LIMIT ?
-                """,
-                (conversation_id, final_limit),
-            ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        statement = (
+            select(ConversationMessageEntity)
+            .where(ConversationMessageEntity.conversation_id == conversation_id)
+            .order_by(ConversationMessageEntity.sequence_no.desc())
+            .limit(final_limit)
+        )
+        with orm_session_context() as session:
+            rows = session.scalars(statement).all()
+        return list(reversed(rows))
 
     def list_conversation_messages(self, conversation_id: str) -> list[ConversationMessageEntity]:
         """查询某个会话的全部消息。"""
 
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM conversation_messages
-                WHERE conversation_id = ?
-                ORDER BY sequence_no ASC
-                """,
-                (conversation_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        statement = (
+            select(ConversationMessageEntity)
+            .where(ConversationMessageEntity.conversation_id == conversation_id)
+            .order_by(ConversationMessageEntity.sequence_no.asc())
+        )
+        with orm_session_context() as session:
+            return session.scalars(statement).all()
 
     def add_message(
             self,
@@ -1166,75 +823,52 @@ class KnowledgeStore:
             token_count: int | None = None,
             metadata: dict[str, Any] | None = None,
     ) -> ConversationMessageEntity:
+        """新增一条会话消息并刷新会话统计。"""
+
         if self.get_conversation(conversation_id) is None:
             self.ensure_conversation(conversation_id=conversation_id)
 
-        now = utc_now_text()
+        now = utc_now()
         metadata_json = json.dumps(metadata or {}, ensure_ascii=False) if metadata else None
         message_id = f"msg_{uuid.uuid4().hex}"
-
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT COALESCE(MAX(sequence_no), 0) + 1 AS next_sequence_no
-                FROM conversation_messages
-                WHERE conversation_id = ?
-                """,
-                (conversation_id,),
-            ).fetchone()
-            sequence_no = int(row["next_sequence_no"])
-            conn.execute(
-                """
-                INSERT INTO conversation_messages (
-                    message_id, conversation_id, sequence_no, role, content, content_type,
-                    model_name, token_count, metadata_json, created_at
+        with orm_session_context() as session:
+            next_sequence_no = int(
+                session.scalar(
+                    select(func.coalesce(func.max(ConversationMessageEntity.sequence_no), 0) + 1).where(
+                        ConversationMessageEntity.conversation_id == conversation_id
+                    )
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    message_id,
-                    conversation_id,
-                    sequence_no,
-                    role,
-                    content,
-                    content_type,
-                    model_name,
-                    token_count,
-                    metadata_json,
-                    now,
-                ),
+                or 1
             )
-            conn.execute(
-                """
-                UPDATE conversations
-                SET message_count = message_count + 1,
-                    updated_at = ?,
-                    last_message_at = ?
-                WHERE conversation_id = ?
-                """,
-                (now, now, conversation_id),
+            message = ConversationMessageEntity(
+                message_id=message_id,
+                conversation_id=conversation_id,
+                sequence_no=next_sequence_no,
+                role=role,
+                content=content,
+                content_type=content_type,
+                model_name=model_name,
+                token_count=token_count,
+                metadata_json=metadata_json,
+                created_at=now,
             )
+            session.add(message)
+            conversation = session.get(ConversationEntity, conversation_id)
+            if conversation is not None:
+                conversation.message_count = int(conversation.message_count or 0) + 1
+                conversation.updated_at = now
+                conversation.last_message_at = now
 
-        return self.get_message(message_id) or {
-            "message_id": message_id,
-            "conversation_id": conversation_id,
-            "sequence_no": sequence_no,
-            "role": role,
-            "content": content,
-            "content_type": content_type,
-            "model_name": model_name,
-            "token_count": token_count,
-            "metadata_json": metadata_json,
-            "created_at": now,
-        }
+        created = self.get_message(message_id)
+        if created is None:
+            raise RuntimeError(f"消息保存失败：{message_id}")
+        return created
 
     def get_message(self, message_id: str) -> ConversationMessageEntity | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM conversation_messages WHERE message_id = ?",
-                (message_id,),
-            ).fetchone()
-        return self.row_to_dict(row)
+        """按 ID 查询消息。"""
+
+        with orm_session_context() as session:
+            return session.get(ConversationMessageEntity, message_id)
 
     def save_chat_exchange(
             self,
@@ -1245,11 +879,9 @@ class KnowledgeStore:
             model_name: str | None = None,
             metadata: dict[str, Any] | None = None,
     ) -> None:
-        self.add_message(
-            conversation_id=conversation_id,
-            role="user",
-            content=user_message,
-        )
+        """保存一问一答两条聊天消息。"""
+
+        self.add_message(conversation_id=conversation_id, role="user", content=user_message)
         self.add_message(
             conversation_id=conversation_id,
             role="assistant",
@@ -1275,44 +907,35 @@ class KnowledgeStore:
     ) -> ExamSessionEntity:
         """创建一场对话式考试会话。"""
 
-        now = utc_now_text()
+        now = utc_now()
         clean_session_id = (session_id or "").strip() or f"exam_{uuid.uuid4().hex}"
-        question_types_json = json.dumps(question_types, ensure_ascii=False)
-        metadata_json = json.dumps(metadata or {}, ensure_ascii=False) if metadata else None
-        clean_title = (title or "").strip()[:120] or "知识掌握度测评"
-
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO exam_sessions (
-                    session_id, user_id, title, collection_name, document_id, filename,
-                    section_path, round_count, question_types_json, status, current_round,
-                    answered_count, total_score, max_score, model_mode, metadata_json,
-                    created_at, updated_at, completed_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, 0, 0, 100, ?, ?, ?, ?, NULL)
-                """,
-                (
-                    clean_session_id,
-                    user_id,
-                    clean_title,
-                    collection_name,
-                    document_id,
-                    filename,
-                    section_path,
-                    round_count,
-                    question_types_json,
-                    model_mode,
-                    metadata_json,
-                    now,
-                    now,
-                ),
-            )
-
-        session = self.get_exam_session(clean_session_id)
-        if session is None:
+        exam_session = ExamSessionEntity(
+            session_id=clean_session_id,
+            user_id=user_id,
+            title=(title or "").strip()[:120] or "知识掌握度测评",
+            collection_name=collection_name,
+            document_id=document_id,
+            filename=filename,
+            section_path=section_path,
+            round_count=int(round_count),
+            question_types_json=json.dumps(question_types, ensure_ascii=False),
+            status="active",
+            current_round=1,
+            answered_count=0,
+            total_score=0,
+            max_score=100,
+            model_mode=model_mode,
+            metadata_json=json.dumps(metadata or {}, ensure_ascii=False) if metadata else None,
+            created_at=now,
+            updated_at=now,
+            completed_at=None,
+        )
+        with orm_session_context() as session:
+            session.add(exam_session)
+        created = self.get_exam_session(clean_session_id)
+        if created is None:
             raise RuntimeError(f"考试会话创建失败：{clean_session_id}")
-        return session
+        return created
 
     def add_exam_question(
             self,
@@ -1333,55 +956,43 @@ class KnowledgeStore:
     ) -> ExamQuestionEntity:
         """保存考试会话中的单轮题目。"""
 
-        now = utc_now_text()
+        now = utc_now()
         exam_question_id = f"exam_q_{uuid.uuid4().hex}"
-        options_json = json.dumps(options or [], ensure_ascii=False)
-        correct_answer_json = json.dumps(correct_answer, ensure_ascii=False)
-
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO exam_questions (
-                    exam_question_id, session_id, round_no, source_question_id,
-                    source_document_id, source_filename, source_page, section_path,
-                    question_type, prompt, options_json, correct_answer_json,
-                    reference_answer, max_score, status, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-                """,
-                (
-                    exam_question_id,
-                    session_id,
-                    round_no,
-                    source_question_id,
-                    source_document_id,
-                    source_filename,
-                    source_page,
-                    section_path,
-                    question_type,
-                    prompt,
-                    options_json,
-                    correct_answer_json,
-                    reference_answer,
-                    max_score,
-                    now,
-                ),
-            )
-
-        question = self.get_exam_question(exam_question_id=exam_question_id)
-        if question is None:
+        question = ExamQuestionEntity(
+            exam_question_id=exam_question_id,
+            session_id=session_id,
+            round_no=int(round_no),
+            source_question_id=source_question_id,
+            source_document_id=source_document_id,
+            source_filename=source_filename,
+            source_page=source_page,
+            section_path=section_path,
+            question_type=question_type,
+            prompt=prompt,
+            options_json=json.dumps(options or [], ensure_ascii=False),
+            correct_answer_json=json.dumps(correct_answer, ensure_ascii=False),
+            reference_answer=reference_answer,
+            user_answer=None,
+            is_correct=None,
+            score=None,
+            max_score=float(max_score),
+            analysis_json=None,
+            status="pending",
+            created_at=now,
+            answered_at=None,
+        )
+        with orm_session_context() as session:
+            session.add(question)
+        created = self.get_exam_question(exam_question_id=exam_question_id)
+        if created is None:
             raise RuntimeError(f"考试题目保存失败：{exam_question_id}")
-        return question
+        return created
 
     def get_exam_session(self, session_id: str) -> ExamSessionEntity | None:
         """按考试会话编号查询考试会话。"""
 
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM exam_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        return self.row_to_dict(row)
+        with orm_session_context() as session:
+            return session.get(ExamSessionEntity, session_id)
 
     def get_exam_question(
             self,
@@ -1392,39 +1003,27 @@ class KnowledgeStore:
     ) -> ExamQuestionEntity | None:
         """查询单道考试题目，支持按题目编号或会话轮次定位。"""
 
-        with self.connect() as conn:
+        with orm_session_context() as session:
             if exam_question_id:
-                row = conn.execute(
-                    "SELECT * FROM exam_questions WHERE exam_question_id = ?",
-                    (exam_question_id,),
-                ).fetchone()
-            elif session_id and round_no is not None:
-                row = conn.execute(
-                    """
-                    SELECT *
-                    FROM exam_questions
-                    WHERE session_id = ? AND round_no = ?
-                    """,
-                    (session_id, round_no),
-                ).fetchone()
-            else:
-                row = None
-        return self.row_to_dict(row)
+                return session.get(ExamQuestionEntity, exam_question_id)
+            if session_id and round_no is not None:
+                statement = select(ExamQuestionEntity).where(
+                    ExamQuestionEntity.session_id == session_id,
+                    ExamQuestionEntity.round_no == int(round_no),
+                )
+                return session.scalars(statement).first()
+            return None
 
     def list_exam_questions(self, session_id: str) -> list[ExamQuestionEntity]:
         """查询某场考试的全部题目。"""
 
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM exam_questions
-                WHERE session_id = ?
-                ORDER BY round_no ASC
-                """,
-                (session_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        statement = (
+            select(ExamQuestionEntity)
+            .where(ExamQuestionEntity.session_id == session_id)
+            .order_by(ExamQuestionEntity.round_no.asc())
+        )
+        with orm_session_context() as session:
+            return session.scalars(statement).all()
 
     def answer_exam_question(
             self,
@@ -1438,73 +1037,51 @@ class KnowledgeStore:
     ) -> ExamQuestionEntity:
         """保存用户单轮作答和分析结果，并刷新考试会话分数。"""
 
-        now = utc_now_text()
-        analysis_json = json.dumps(analysis, ensure_ascii=False)
+        now = utc_now()
+        with orm_session_context() as session:
+            question = session.get(ExamQuestionEntity, exam_question_id)
+            if question is None or question.session_id != session_id:
+                raise RuntimeError(f"考试题目不存在：{exam_question_id}")
+            question.user_answer = user_answer
+            question.is_correct = 1 if is_correct else 0
+            question.score = float(score)
+            question.analysis_json = json.dumps(analysis, ensure_ascii=False)
+            question.status = "answered"
+            question.answered_at = now
 
-        with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE exam_questions
-                SET user_answer = ?, is_correct = ?, score = ?, analysis_json = ?,
-                    status = 'answered', answered_at = ?
-                WHERE exam_question_id = ? AND session_id = ?
-                """,
-                (
-                    user_answer,
-                    1 if is_correct else 0,
-                    score,
-                    analysis_json,
-                    now,
-                    exam_question_id,
-                    session_id,
-                ),
+            answered_count = int(
+                session.scalar(
+                    select(func.count()).select_from(ExamQuestionEntity).where(
+                        ExamQuestionEntity.session_id == session_id,
+                        ExamQuestionEntity.status == "answered",
+                    )
+                )
+                or 0
             )
-            aggregate = conn.execute(
-                """
-                SELECT
-                    COUNT(CASE WHEN status = 'answered' THEN 1 END) AS answered_count,
-                    COALESCE(SUM(CASE WHEN status = 'answered' THEN score ELSE 0 END), 0) AS total_score,
-                    COUNT(*) AS question_count
-                FROM exam_questions
-                WHERE session_id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-            session = conn.execute(
-                """
-                SELECT round_count
-                FROM exam_sessions
-                WHERE session_id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-            answered_count = int(aggregate["answered_count"] if aggregate else 0)
-            total_score = float(aggregate["total_score"] if aggregate else 0)
-            round_count = int(session["round_count"] if session else 0)
-            completed = answered_count >= round_count > 0
-            next_round = min(answered_count + 1, round_count)
-            conn.execute(
-                """
-                UPDATE exam_sessions
-                SET answered_count = ?, total_score = ?, current_round = ?,
-                    status = ?, updated_at = ?, completed_at = ?
-                WHERE session_id = ?
-                """,
-                (
-                    answered_count,
-                    total_score,
-                    next_round,
-                    "completed" if completed else "active",
-                    now,
-                    now if completed else None,
-                    session_id,
-                ),
+            total_score = float(
+                session.scalar(
+                    select(func.coalesce(func.sum(ExamQuestionEntity.score), 0)).where(
+                        ExamQuestionEntity.session_id == session_id,
+                        ExamQuestionEntity.status == "answered",
+                    )
+                )
+                or 0
             )
+            exam_session = session.get(ExamSessionEntity, session_id)
+            if exam_session is not None:
+                round_count = int(exam_session.round_count or 0)
+                completed = answered_count >= round_count > 0
+                exam_session.answered_count = answered_count
+                exam_session.total_score = total_score
+                exam_session.current_round = min(answered_count + 1, round_count)
+                exam_session.status = "completed" if completed else "active"
+                exam_session.updated_at = now
+                exam_session.completed_at = now if completed else None
 
-        question = self.get_exam_question(exam_question_id=exam_question_id)
-        if question is None:
+        answered = self.get_exam_question(exam_question_id=exam_question_id)
+        if answered is None:
             raise RuntimeError(f"考试题目不存在：{exam_question_id}")
-        return question
+        return answered
 
     def list_exam_sessions(
             self,
@@ -1519,36 +1096,31 @@ class KnowledgeStore:
         final_page = max(1, int(page))
         final_page_size = max(1, min(int(page_size), 50))
         offset = (final_page - 1) * final_page_size
-        conditions = ["1 = 1"]
-        params: list[Any] = []
-
+        conditions = []
         if user_id:
-            conditions.append("user_id = ?")
-            params.append(user_id)
-
+            conditions.append(ExamSessionEntity.user_id == user_id)
         clean_keyword = (keyword or "").strip()
         if clean_keyword:
             like_keyword = f"%{self._escape_like_keyword(clean_keyword)}%"
             conditions.append(
-                "(title LIKE ? ESCAPE '\\' OR filename LIKE ? ESCAPE '\\' OR section_path LIKE ? ESCAPE '\\')"
+                or_(
+                    ExamSessionEntity.title.like(like_keyword, escape="\\"),
+                    ExamSessionEntity.filename.like(like_keyword, escape="\\"),
+                    ExamSessionEntity.section_path.like(like_keyword, escape="\\"),
+                )
             )
-            params.extend([like_keyword, like_keyword, like_keyword])
 
-        where_sql = " AND ".join(conditions)
-        with self.connect() as conn:
-            total_row = conn.execute(
-                f"SELECT COUNT(*) AS total FROM exam_sessions WHERE {where_sql}",
-                params,
-            ).fetchone()
-            rows = conn.execute(
-                f"""
-                SELECT *
-                FROM exam_sessions
-                WHERE {where_sql}
-                ORDER BY updated_at DESC, created_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                [*params, final_page_size, offset],
-            ).fetchall()
-
-        return [dict(row) for row in rows], int(total_row["total"] if total_row else 0)
+        count_statement = select(func.count()).select_from(ExamSessionEntity)
+        list_statement = (
+            select(ExamSessionEntity)
+            .order_by(ExamSessionEntity.updated_at.desc(), ExamSessionEntity.created_at.desc())
+            .limit(final_page_size)
+            .offset(offset)
+        )
+        if conditions:
+            count_statement = count_statement.where(*conditions)
+            list_statement = list_statement.where(*conditions)
+        with orm_session_context() as session:
+            total = int(session.scalar(count_statement) or 0)
+            rows = session.scalars(list_statement).all()
+        return rows, total

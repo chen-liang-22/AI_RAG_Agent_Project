@@ -1,277 +1,381 @@
-"""关系型数据库表实体类型。
+"""关系型数据库 ORM 实体。
 
-项目当前使用手写 SQL 和 dict 行数据，不引入 ORM。
-这些 TypedDict 只描述数据库行结构，方便 PyCharm 类型提示和后续维护字段名。
+这些类是真正的 SQLAlchemy ORM Model，作用类似 Java MyBatis-Plus 的实体类：
+- 类名对应业务实体；
+- `__tablename__` 对应数据库表；
+- `mapped_column` 对应表字段；
+- `to_dict()` 用于把 ORM 对象转换成接口和 service 层仍在使用的字典视图。
+
+注意：这里定义的是数据库实体，不再把普通类型提示当作实体类使用。
 """
 
 from __future__ import annotations
 
-from typing import Any, NotRequired, TypedDict
+from datetime import date, datetime
+from typing import Any
+
+from sqlalchemy import DateTime, Float, Integer, String, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-class DocumentEntity(TypedDict):
+class BaseOrmModel(DeclarativeBase):
+    """ORM 实体基类。"""
+
+
+def format_orm_value(value: Any) -> Any:
+    """把 ORM 字段值转换成接口层更容易处理的基础类型。"""
+
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds", sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+class DictMixin:
+    """提供统一的 ORM 对象转 dict 能力。"""
+
+    def _field_names(self) -> list[str]:
+        """返回表字段名和仓储层临时挂载的只读展示字段。"""
+
+        column_names = [column.name for column in self.__table__.columns]
+        extra_names = [
+            key
+            for key in vars(self)
+            if not key.startswith("_") and key not in column_names
+        ]
+        return [*column_names, *extra_names]
+
+    def __getitem__(self, key: str) -> Any:
+        """兼容旧 service 中的 row["field"] 读取方式。"""
+
+        return format_orm_value(getattr(self, key))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """兼容旧 service 中的 row.get("field") 读取方式。"""
+
+        if not hasattr(self, key):
+            return default
+        value = getattr(self, key)
+        return format_orm_value(value)
+
+    def items(self):
+        """兼容少量需要遍历字段的旧代码。"""
+
+        return self.to_dict().items()
+
+    def keys(self):
+        """兼容 `{**entity}` 这类 Mapping 解包读取方式。"""
+
+        return self.to_dict().keys()
+
+    def values(self):
+        """兼容少量需要按字典值遍历的调用。"""
+
+        return self.to_dict().values()
+
+    def __iter__(self):
+        """让实体可以按字典 key 迭代。"""
+
+        return iter(self.keys())
+
+    def to_dict(self) -> dict[str, Any]:
+        """按表字段导出字典，保持现有 service 层读取方式稳定。"""
+
+        return {
+            field_name: format_orm_value(getattr(self, field_name))
+            for field_name in self._field_names()
+        }
+
+
+class DocumentEntity(BaseOrmModel, DictMixin):
     """documents 表实体，记录知识库文件元数据和索引状态。"""
 
-    document_id: str  # 文件唯一编号
-    filename: str  # 原始文件名
-    file_path: str  # 本地存储路径
-    file_type: str  # 文件扩展类型
-    file_md5: str  # 文件内容 MD5，用于去重
-    file_size: int  # 文件大小，单位字节
-    status: str  # 文件状态，例如 uploaded/indexing/indexed/failed/deleted
-    version: int  # 文件索引版本号
-    chunk_count: int  # 已写入向量库的切片数量
-    collection_name: str  # Qdrant collection 名称
-    document_type: str  # 文档结构类型，例如 text/qa/numbered
-    split_strategy: str  # 切分策略，例如 recursive/outline_qa
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
-    error_message: str | None  # 失败原因
+    __tablename__ = "documents"
+
+    document_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="文件唯一编号")
+    filename: Mapped[str] = mapped_column(String(255), nullable=False, comment="原始文件名")
+    file_path: Mapped[str] = mapped_column(String(1024), nullable=False, comment="本地存储路径")
+    file_type: Mapped[str] = mapped_column(String(32), nullable=False, comment="文件扩展类型")
+    file_md5: Mapped[str] = mapped_column(String(64), nullable=False, comment="文件内容 MD5")
+    file_size: Mapped[int] = mapped_column(Integer, nullable=False, comment="文件大小，单位字节")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, comment="文件状态")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="文件索引版本号")
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="已写入向量库的切片数量")
+    collection_name: Mapped[str] = mapped_column(String(128), nullable=False, default="agent", comment="Qdrant collection 名称")
+    document_type: Mapped[str] = mapped_column(String(32), nullable=False, default="text", comment="文档结构类型")
+    split_strategy: Mapped[str] = mapped_column(String(64), nullable=False, default="recursive", comment="切分策略")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True, comment="失败原因")
 
 
-class ConversationEntity(TypedDict):
+class ConversationEntity(BaseOrmModel, DictMixin):
     """conversations 表实体，记录一次聊天会话摘要。"""
 
-    conversation_id: str  # 会话唯一编号
-    user_id: str | None  # 用户编号
-    title: str | None  # 会话标题
-    status: str  # 会话状态，例如 active/deleted
-    message_count: int  # 消息数量
-    summary: str | None  # 会话摘要
-    metadata_json: str | None  # 扩展元数据 JSON
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
-    last_message_at: str | None  # 最后一条消息时间
+    __tablename__ = "conversations"
+
+    conversation_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="会话唯一编号")
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="用户编号")
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="会话标题")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", comment="会话状态")
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="消息数量")
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True, comment="会话摘要")
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="扩展元数据 JSON")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
+    last_message_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="最后一条消息时间")
 
 
-class ConversationMessageEntity(TypedDict):
+class ConversationMessageEntity(BaseOrmModel, DictMixin):
     """conversation_messages 表实体，记录会话中的单条消息。"""
 
-    message_id: str  # 消息唯一编号
-    conversation_id: str  # 所属会话编号
-    sequence_no: int  # 会话内顺序号
-    role: str  # 消息角色，例如 user/assistant/system
-    content: str  # 消息正文
-    content_type: str  # 内容类型，默认 text
-    model_name: str | None  # 生成该消息的模型名
-    token_count: int | None  # token 数量
-    metadata_json: str | None  # 扩展元数据 JSON
-    created_at: str  # 创建时间
+    __tablename__ = "conversation_messages"
+
+    message_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="消息唯一编号")
+    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="所属会话编号")
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False, comment="会话内顺序号")
+    role: Mapped[str] = mapped_column(String(32), nullable=False, comment="消息角色")
+    content: Mapped[str] = mapped_column(Text, nullable=False, comment="消息正文")
+    content_type: Mapped[str] = mapped_column(String(32), nullable=False, default="text", comment="内容类型")
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="模型名")
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="token 数量")
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="扩展元数据 JSON")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
 
 
-class DictionaryItemEntity(TypedDict):
+class DictionaryItemEntity(BaseOrmModel, DictMixin):
     """dictionary_items 表实体，记录系统字典项。"""
 
-    dictionary_item_id: str  # 字典项唯一编号
-    dictionary_code: str  # 字典编码
-    dictionary_name: str  # 字典名称
-    item_code: str  # 字典项编码
-    item_name: str  # 字典项展示名
-    parent_item_id: str | None  # 父级字典项编号
-    item_level: int  # 字典层级
-    sort_order: int  # 排序值
-    enabled: int  # 是否启用，1 启用，0 禁用
-    description: str | None  # 字典项说明
-    metadata_json: str | None  # 扩展配置 JSON
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
+    __tablename__ = "dictionary_items"
+
+    dictionary_item_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="字典项唯一编号")
+    dictionary_code: Mapped[str] = mapped_column(String(128), nullable=False, comment="字典编码")
+    dictionary_name: Mapped[str] = mapped_column(String(128), nullable=False, comment="字典名称")
+    item_code: Mapped[str] = mapped_column(String(128), nullable=False, comment="字典项编码")
+    item_name: Mapped[str] = mapped_column(String(128), nullable=False, comment="字典项展示名")
+    parent_item_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="父级字典项编号")
+    item_level: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="字典层级")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="排序值")
+    enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="是否启用")
+    description: Mapped[str | None] = mapped_column(Text, nullable=True, comment="字典项说明")
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="扩展配置 JSON")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
 
 
-class ExamSessionEntity(TypedDict):
+class ExamSessionEntity(BaseOrmModel, DictMixin):
     """exam_sessions 表实体，记录一次对话式考试会话。"""
 
-    session_id: str  # 考试会话编号
-    user_id: str | None  # 用户编号
-    title: str  # 考试标题
-    collection_name: str  # 题源向量库 collection
-    document_id: str | None  # 限定题源文件编号
-    filename: str | None  # 限定题源文件名
-    section_path: str | None  # 限定一级目录
-    round_count: int  # 题目轮数
-    question_types_json: str  # 题型列表 JSON
-    status: str  # 考试状态，例如 active/completed
-    current_round: int  # 当前轮次
-    answered_count: int  # 已回答数量
-    total_score: float  # 当前总分
-    max_score: float  # 满分
-    model_mode: str | None  # 模型档位
-    metadata_json: str | None  # 扩展元数据 JSON
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
-    completed_at: str | None  # 完成时间
+    __tablename__ = "exam_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="考试会话编号")
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="用户编号")
+    title: Mapped[str] = mapped_column(String(255), nullable=False, comment="考试标题")
+    collection_name: Mapped[str] = mapped_column(String(128), nullable=False, comment="题源向量库 collection")
+    document_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="限定题源文件编号")
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="限定题源文件名")
+    section_path: Mapped[str | None] = mapped_column(String(512), nullable=True, comment="限定一级目录")
+    round_count: Mapped[int] = mapped_column(Integer, nullable=False, comment="题目轮数")
+    question_types_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="题型列表 JSON")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", comment="考试状态")
+    current_round: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="当前轮次")
+    answered_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="已回答数量")
+    total_score: Mapped[float] = mapped_column(Float, nullable=False, default=0, comment="当前总分")
+    max_score: Mapped[float] = mapped_column(Float, nullable=False, default=100, comment="满分")
+    model_mode: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="模型档位")
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="扩展元数据 JSON")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
+    completed_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="完成时间")
 
 
-class ExamQuestionEntity(TypedDict):
+class ExamQuestionEntity(BaseOrmModel, DictMixin):
     """exam_questions 表实体，记录考试中的单道题和作答结果。"""
 
-    exam_question_id: str  # 考试题目编号
-    session_id: str  # 所属考试会话编号
-    round_no: int  # 轮次
-    source_question_id: str | None  # 来源题目编号
-    source_document_id: str | None  # 来源文档编号
-    source_filename: str | None  # 来源文件名
-    source_page: int | None  # 来源页码
-    section_path: str | None  # 来源目录
-    question_type: str  # 题型，例如 single_choice/multiple_choice/true_false
-    prompt: str  # 题干
-    options_json: str | None  # 选项 JSON
-    correct_answer_json: str | None  # 标准答案 JSON
-    reference_answer: str  # 参考答案
-    user_answer: str | None  # 用户答案
-    is_correct: int | None  # 是否正确，1 正确，0 错误
-    score: float | None  # 得分
-    max_score: float  # 本题满分
-    analysis_json: str | None  # 评分分析 JSON
-    status: str  # 题目状态，例如 pending/answered
-    created_at: str  # 创建时间
-    answered_at: str | None  # 回答时间
+    __tablename__ = "exam_questions"
+
+    exam_question_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="考试题目编号")
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="所属考试会话编号")
+    round_no: Mapped[int] = mapped_column(Integer, nullable=False, comment="轮次")
+    source_question_id: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="来源题目编号")
+    source_document_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="来源文档编号")
+    source_filename: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="来源文件名")
+    source_page: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="来源页码")
+    section_path: Mapped[str | None] = mapped_column(String(512), nullable=True, comment="来源目录")
+    question_type: Mapped[str] = mapped_column(String(64), nullable=False, comment="题型")
+    prompt: Mapped[str] = mapped_column(Text, nullable=False, comment="题干")
+    options_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="选项 JSON")
+    correct_answer_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="标准答案 JSON")
+    reference_answer: Mapped[str | None] = mapped_column(Text, nullable=True, comment="参考答案")
+    user_answer: Mapped[str | None] = mapped_column(Text, nullable=True, comment="用户答案")
+    is_correct: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="是否正确")
+    score: Mapped[float | None] = mapped_column(Float, nullable=True, comment="得分")
+    max_score: Mapped[float] = mapped_column(Float, nullable=False, comment="本题满分")
+    analysis_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="评分分析 JSON")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", comment="题目状态")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    answered_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="回答时间")
 
 
-class TrainingKnowledgeBatchEntity(TypedDict):
+class TrainingKnowledgeBatchEntity(BaseOrmModel, DictMixin):
     """training_knowledge_batches 表实体，记录销售训练资料上传批次。"""
 
-    batch_id: str  # 上传批次编号
-    document_id: str | None  # 关联 documents.document_id，统一保存文件基础信息
-    source_type: str  # 资料来源类型
-    source_file: str  # 原始文件名
-    file_path: str | None  # 历史兼容字段，新上传优先读取 documents.file_path
-    file_md5: str | None  # 历史兼容字段，新上传优先读取 documents.file_md5
-    version_group_id: str | None  # 版本组编号
-    version_no: int  # 版本号
-    previous_batch_id: str | None  # 上一个批次编号
-    is_current: int  # 是否当前版本
-    profile_type: str | None  # 画像类型，兼容旧字段
-    task_type: str | None  # 任务类型，兼容旧字段
-    industry: str | None  # 行业，兼容旧字段
-    difficulty: str | None  # 难度，兼容旧字段
-    visibility_default: str | None  # 默认可见性
-    status: str  # 批次状态
-    chunk_count: int  # 切片数量
-    point_count: int  # 向量点数量
-    error_message: str | None  # 失败原因
-    quality_report_json: str | None  # 质量评估报告 JSON
-    created_by: str | None  # 创建人
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
+    __tablename__ = "training_knowledge_batches"
+
+    batch_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="上传批次编号")
+    document_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="关联 documents.document_id")
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False, comment="资料来源类型")
+    source_file: Mapped[str] = mapped_column(String(255), nullable=False, comment="原始文件名")
+    file_path: Mapped[str | None] = mapped_column(String(1024), nullable=True, comment="历史兼容文件路径")
+    file_md5: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="历史兼容文件 MD5")
+    version_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="版本组编号")
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="版本号")
+    previous_batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="上一个批次编号")
+    is_current: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="是否当前版本")
+    profile_type: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="画像类型")
+    task_type: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="任务类型")
+    industry: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="行业")
+    difficulty: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="难度")
+    visibility_default: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="默认可见性")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, comment="批次状态")
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="切片数量")
+    point_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="向量点数量")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True, comment="失败原因")
+    quality_report_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="质量评估报告 JSON")
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="创建人")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
 
 
-class TrainingPlanEntity(TypedDict):
+class TrainingPlanEntity(BaseOrmModel, DictMixin):
     """training_plans 表实体，记录销售训练方案。"""
 
-    plan_id: str  # 训练方案编号
-    plan_name: str  # 训练方案名称
-    trainee_id: str  # 学员编号
-    trainee_name: str  # 学员名称
-    profile_type: str  # 画像类型
-    trainee_json: str  # 学员画像 JSON
-    selected_fields_json: str  # 画像字段选择 JSON
-    scenario_description: str  # 场景描述
-    extra_details: str | None  # 补充说明
-    model_mode: str | None  # 模型档位
-    active_profile_id: str | None  # 当前客户画像编号
-    active_setting_id: str | None  # 当前训练目标编号
-    role_status: str  # 角色生成状态
-    goal_status: str  # 目标生成状态
-    score_status: str  # 评分规则状态
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
+    __tablename__ = "training_plans"
+
+    plan_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="训练方案编号")
+    plan_name: Mapped[str] = mapped_column(String(255), nullable=False, comment="训练方案名称")
+    trainee_id: Mapped[str] = mapped_column(String(128), nullable=False, comment="学员编号")
+    trainee_name: Mapped[str] = mapped_column(String(128), nullable=False, comment="学员名称")
+    profile_type: Mapped[str] = mapped_column(String(64), nullable=False, comment="画像类型")
+    trainee_json: Mapped[str] = mapped_column(Text, nullable=False, comment="学员画像 JSON")
+    selected_fields_json: Mapped[str] = mapped_column(Text, nullable=False, comment="画像字段选择 JSON")
+    scenario_description: Mapped[str] = mapped_column(Text, nullable=False, comment="场景描述")
+    extra_details: Mapped[str | None] = mapped_column(Text, nullable=True, comment="补充说明")
+    model_mode: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="模型档位")
+    active_profile_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="当前客户画像编号")
+    active_setting_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="当前训练目标编号")
+    role_status: Mapped[str] = mapped_column(String(32), nullable=False, comment="角色生成状态")
+    goal_status: Mapped[str] = mapped_column(String(32), nullable=False, comment="目标生成状态")
+    score_status: Mapped[str] = mapped_column(String(32), nullable=False, comment="评分规则状态")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
 
 
-class TrainingRoleProfileEntity(TypedDict):
+class TrainingRoleProfileEntity(BaseOrmModel, DictMixin):
     """training_role_profiles 表实体，记录 AI 客户画像。"""
 
-    profile_id: str  # 画像编号
-    trainee_id: str  # 学员编号
-    plan_id: str | None  # 所属训练方案编号
-    profile_type: str  # 画像类型
-    visible_profile_json: str  # 学员可见画像 JSON
-    hidden_profile_json: str  # 隐藏画像 JSON
-    role_profile_json: str  # AI 扮演画像 JSON
-    role_confirm_card_json: str  # 画像确认卡片 JSON
-    selected_fields_json: str | None  # 画像字段选择 JSON
-    scenario_description: str | None  # 场景描述
-    extra_details: str | None  # 补充说明
-    retrieved_evidence_json: str | None  # 生成画像时召回证据 JSON
-    status: str  # 画像状态
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
+    __tablename__ = "training_role_profiles"
+
+    profile_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="画像编号")
+    trainee_id: Mapped[str] = mapped_column(String(128), nullable=False, comment="学员编号")
+    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="所属训练方案编号")
+    profile_type: Mapped[str] = mapped_column(String(64), nullable=False, comment="画像类型")
+    visible_profile_json: Mapped[str] = mapped_column(Text, nullable=False, comment="学员可见画像 JSON")
+    hidden_profile_json: Mapped[str] = mapped_column(Text, nullable=False, comment="隐藏画像 JSON")
+    role_profile_json: Mapped[str] = mapped_column(Text, nullable=False, comment="AI 扮演画像 JSON")
+    role_confirm_card_json: Mapped[str] = mapped_column(Text, nullable=False, comment="画像确认卡片 JSON")
+    selected_fields_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="画像字段选择 JSON")
+    scenario_description: Mapped[str | None] = mapped_column(Text, nullable=True, comment="场景描述")
+    extra_details: Mapped[str | None] = mapped_column(Text, nullable=True, comment="补充说明")
+    retrieved_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="生成画像时召回证据 JSON")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, comment="画像状态")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
 
 
-class TrainingGoalSettingEntity(TypedDict):
+class TrainingGoalSettingEntity(BaseOrmModel, DictMixin):
     """training_goal_settings 表实体，记录训练目标和阶段设置。"""
 
-    setting_id: str  # 目标设置编号
-    profile_id: str  # 关联画像编号
-    plan_id: str | None  # 所属训练方案编号
-    trainee_id: str  # 学员编号
-    training_mode: str  # 训练模式
-    training_purpose: str  # 训练目的
-    round_limit: int  # 轮数上限
-    stages_json: str  # 阶段设置 JSON
-    scoring_rules_json: str | None  # 评分规则 JSON
-    status: str  # 设置状态
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
+    __tablename__ = "training_goal_settings"
+
+    setting_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="目标设置编号")
+    profile_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="关联画像编号")
+    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="所属训练方案编号")
+    trainee_id: Mapped[str] = mapped_column(String(128), nullable=False, comment="学员编号")
+    training_mode: Mapped[str] = mapped_column(String(64), nullable=False, comment="训练模式")
+    training_purpose: Mapped[str] = mapped_column(Text, nullable=False, comment="训练目的")
+    round_limit: Mapped[int] = mapped_column(Integer, nullable=False, comment="轮数上限")
+    stages_json: Mapped[str] = mapped_column(Text, nullable=False, comment="阶段设置 JSON")
+    scoring_rules_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="评分规则 JSON")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, comment="设置状态")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
 
 
-class SalesTrainingSessionEntity(TypedDict):
+class SalesTrainingSessionEntity(BaseOrmModel, DictMixin):
     """sales_training_sessions 表实体，记录一场销售训练会话。"""
 
-    session_id: str  # 训练会话编号
-    profile_id: str  # 客户画像编号
-    setting_id: str  # 训练目标编号
-    trainee_id: str  # 学员编号
-    training_mode: str  # 训练模式
-    response_mode: str  # 响应模式
-    current_stage_no: int  # 当前阶段编号
-    status: str  # 会话状态
-    round_limit: int  # 轮数上限
-    total_score: int | None  # 总分
-    level: str | None  # 评级
-    report_json: str | None  # 训练报告 JSON
-    started_at: str  # 开始时间
-    ended_at: str | None  # 结束时间
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
-    answered_count: NotRequired[int]  # 列表查询时额外返回的已回答轮数
+    __tablename__ = "sales_training_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="训练会话编号")
+    profile_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="客户画像编号")
+    setting_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="训练目标编号")
+    trainee_id: Mapped[str] = mapped_column(String(128), nullable=False, comment="学员编号")
+    training_mode: Mapped[str] = mapped_column(String(64), nullable=False, comment="训练模式")
+    response_mode: Mapped[str] = mapped_column(String(32), nullable=False, comment="响应模式")
+    current_stage_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="当前阶段编号")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, comment="会话状态")
+    round_limit: Mapped[int] = mapped_column(Integer, nullable=False, comment="轮数上限")
+    total_score: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="总分")
+    level: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="评级")
+    report_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="训练报告 JSON")
+    started_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="开始时间")
+    ended_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="结束时间")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
 
 
-class SalesTrainingTurnEntity(TypedDict):
+class SalesTrainingTurnEntity(BaseOrmModel, DictMixin):
     """sales_training_turns 表实体，记录销售训练单轮对话。"""
 
-    turn_id: str  # 对话轮次编号
-    session_id: str  # 所属训练会话编号
-    role: str  # 角色，例如 customer/trainee/system
-    content: str  # 对话内容
-    round_no: int  # 轮次
-    stage_no: int  # 阶段编号
-    response_mode: str | None  # 响应模式
-    started_at: str | None  # 开始时间
-    submitted_at: str | None  # 提交时间
-    response_seconds: float | None  # 响应耗时
-    retrieved_chunk_ids_json: str | None  # 召回切片编号 JSON
-    retrieved_evidence_json: str | None  # 召回证据 JSON
-    stage_decision_json: str | None  # 阶段判断 JSON
-    coach_analysis_json: str | None  # 教练分析 JSON
-    metadata_json: str | None  # 扩展元数据 JSON
-    created_at: str  # 创建时间
+    __tablename__ = "sales_training_turns"
+
+    turn_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="对话轮次编号")
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="所属训练会话编号")
+    role: Mapped[str] = mapped_column(String(32), nullable=False, comment="角色")
+    content: Mapped[str] = mapped_column(Text, nullable=False, comment="对话内容")
+    round_no: Mapped[int] = mapped_column(Integer, nullable=False, comment="轮次")
+    stage_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="阶段编号")
+    response_mode: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="响应模式")
+    started_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="开始时间")
+    submitted_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="提交时间")
+    response_seconds: Mapped[float | None] = mapped_column(Float, nullable=True, comment="响应耗时")
+    retrieved_chunk_ids_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="召回切片编号 JSON")
+    retrieved_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="召回证据 JSON")
+    stage_decision_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="阶段判断 JSON")
+    coach_analysis_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="教练分析 JSON")
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="扩展元数据 JSON")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
 
 
-class SalesTrainingScoreEntity(TypedDict):
+class SalesTrainingScoreEntity(BaseOrmModel, DictMixin):
     """sales_training_scores 表实体，记录销售训练评分结果。"""
 
-    score_id: str  # 评分编号
-    session_id: str  # 所属训练会话编号
-    general_score: int  # 通用能力分
-    stage_score: int  # 阶段表现分
-    penalty_score: int  # 扣分
-    final_score: int  # 最终分
-    level: str  # 评级
-    is_passed: int  # 是否通过，1 通过，0 未通过
-    detail_json: str  # 评分明细 JSON
-    review_status: str  # 复核状态
-    created_at: str  # 创建时间
-    updated_at: str  # 更新时间
+    __tablename__ = "sales_training_scores"
+
+    score_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="评分编号")
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="所属训练会话编号")
+    general_score: Mapped[int] = mapped_column(Integer, nullable=False, comment="通用能力分")
+    stage_score: Mapped[int] = mapped_column(Integer, nullable=False, comment="阶段表现分")
+    penalty_score: Mapped[int] = mapped_column(Integer, nullable=False, comment="扣分")
+    final_score: Mapped[int] = mapped_column(Integer, nullable=False, comment="最终分")
+    level: Mapped[str] = mapped_column(String(64), nullable=False, comment="评级")
+    is_passed: Mapped[int] = mapped_column(Integer, nullable=False, comment="是否通过")
+    detail_json: Mapped[str] = mapped_column(Text, nullable=False, comment="评分明细 JSON")
+    review_status: Mapped[str] = mapped_column(String(32), nullable=False, comment="复核状态")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
 
 
 KnowledgeStoreRow = (
@@ -282,7 +386,7 @@ KnowledgeStoreRow = (
     | ExamSessionEntity
     | ExamQuestionEntity
 )
-"""知识库仓储可能返回的表实体联合类型。"""
+"""知识库仓储可能返回的 ORM 实体联合类型。"""
 
 TrainingRepositoryRow = (
     TrainingKnowledgeBatchEntity
@@ -293,7 +397,7 @@ TrainingRepositoryRow = (
     | SalesTrainingTurnEntity
     | SalesTrainingScoreEntity
 )
-"""销售训练仓储可能返回的表实体联合类型。"""
+"""销售训练仓储可能返回的 ORM 实体联合类型。"""
 
 EntityRow = KnowledgeStoreRow | TrainingRepositoryRow
-"""项目关系型表实体联合类型。"""
+"""项目关系型 ORM 实体联合类型。"""

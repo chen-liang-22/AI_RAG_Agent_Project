@@ -116,7 +116,7 @@ def test_training_ingest_quality_detects_weak_split():
 def test_training_upload_waits_for_manual_publish(tmp_path):
     """上传阶段只写临时向量库，确认发布后才进入正式向量库。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     content = "\n".join([
@@ -155,12 +155,6 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
     assert document["status"] == "indexed"
     assert document["chunk_count"] == upload_result.chunk_count
     assert all(item.metadata["document_id"] == upload_result.document_id for item in fake_staging_service.documents)
-    with repository.connect() as conn:
-        chunk_table = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'training_knowledge_chunks'"
-        ).fetchone()
-    assert chunk_table is None
-
     publish_result = service.publish_batch(upload_result.batch_id)
 
     assert publish_result.status == "published"
@@ -175,7 +169,7 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
 def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeypatch):
     """规则切分质量低时，应采用质量更高的 LLM 兜底切片。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     captured_model_modes = []
@@ -240,7 +234,7 @@ def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeyp
 def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
     """人工重新切分时，应主动采用 LLM 兜底结果并回到待确认状态。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     captured_model_modes = []
@@ -323,7 +317,7 @@ def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
 def test_training_preview_uses_saved_chunks(tmp_path):
     """预览接口应展示已保存切片，避免重新解析导致预览和发布不一致。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     attach_fake_vector_services(service)
     content = "\n".join([
@@ -347,7 +341,7 @@ def test_training_preview_uses_saved_chunks(tmp_path):
 def test_training_duplicate_upload_uses_document_md5(tmp_path):
     """重复上传应通过 documents 文件台账中的 MD5 复用已发布批次。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     attach_fake_vector_services(service)
     content = "\n".join([
@@ -381,7 +375,7 @@ def test_training_duplicate_upload_uses_document_md5(tmp_path):
 def test_training_publish_writes_validation_report(tmp_path):
     """发布完成后，应把抽样检索验证结果写回质量报告。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     attach_fake_vector_services(service)
     content = "\n".join([
@@ -407,7 +401,7 @@ def test_training_publish_writes_validation_report(tmp_path):
 def test_training_delete_batch_marks_document_deleted(tmp_path):
     """删除训练批次时，应同步软删除 documents 文件台账记录。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     content = "\n".join([
@@ -440,7 +434,7 @@ def test_training_delete_batch_marks_document_deleted(tmp_path):
 def test_training_publish_archives_previous_version_and_rollback(tmp_path):
     """同名资料发布新版本后旧版本应归档，并支持回滚为当前版本。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
 
@@ -499,7 +493,7 @@ def test_training_publish_archives_previous_version_and_rollback(tmp_path):
 def test_training_list_batch_versions_returns_version_chain(tmp_path):
     """版本链接口应返回同一版本组内的全部未删除版本。"""
 
-    repository = TrainingRepository(str(tmp_path / "training.db"))
+    repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     attach_fake_vector_services(service)
 

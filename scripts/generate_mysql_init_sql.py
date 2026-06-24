@@ -1,6 +1,6 @@
 """生成 MySQL 初始化 SQL。
 
-这个脚本只生成建表和系统默认字典数据，便于把当前 SQLite 元数据层迁移到 MySQL。
+这个脚本只生成建表和系统默认字典数据，便于统一维护 MySQL 初始化脚本。
 字典种子直接复用 rag.knowledge_store.DEFAULT_DICTIONARY_ITEMS，避免手写 SQL 和代码口径不一致。
 """
 

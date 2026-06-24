@@ -185,6 +185,10 @@ def _scroll_candidate_questions(
     offset = None
     scroll_rounds = 0
 
+    if not client.collection_exists(final_collection_name):
+        logger.warning("[考试] 题源向量库不存在，返回空题源 Collection=%s 文档编号=%s", final_collection_name, document_id)
+        return []
+
     while True:
         scroll_rounds += 1
         points, offset = client.scroll(

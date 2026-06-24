@@ -125,10 +125,10 @@ class SalesTrainingService:
             repository: TrainingRepository | None = None,
             knowledge_store: KnowledgeStore | None = None,
     ):
-        # repository 支持注入，主要是为了单元测试可以传临时数据库。
+        # repository 支持注入，主要是为了单元测试或局部替换仓储实现。
         self.repository = repository or TrainingRepository()
-        # 文件台账复用知识库 documents 表；测试注入 SQLite 仓储时，文件台账也指向同一个临时库。
-        self.knowledge_store = knowledge_store or KnowledgeStore(self.repository.db_path)
+        # 文件台账复用知识库 documents 表，统一写入 MySQL。
+        self.knowledge_store = knowledge_store or KnowledgeStore()
         collection_config = _load_training_collection_config()
         self.training_collection_name = collection_config["published"]
         self.staging_collection_name = collection_config["staging"]
