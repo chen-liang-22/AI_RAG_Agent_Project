@@ -56,6 +56,7 @@ def test_openapi_exposes_core_routes():
     assert "/training/sessions/{session_id}" in paths
     assert "/training/sessions/{session_id}/turns" in paths
     assert "/training/sessions/{session_id}/final-score" in paths
+    assert "/internal/jobs/minio/cleanup-preview-uploads" in paths
     assert "/exam/generate" not in paths
     assert "/exam/grade" not in paths
 

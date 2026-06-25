@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from api.routers import auth, chat, dictionaries, exam, health, knowledge
+from api.routers import auth, chat, dictionaries, exam, health, internal_jobs, knowledge
 from api.warmup import run_startup_warmup
 from training.api.router import router as training_router
 
@@ -39,3 +39,4 @@ app.include_router(knowledge.router)
 app.include_router(dictionaries.router)
 app.include_router(exam.router)
 app.include_router(training_router)
+app.include_router(internal_jobs.router)
