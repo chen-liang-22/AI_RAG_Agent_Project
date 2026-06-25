@@ -67,6 +67,13 @@ data_path: data
 # - pdf：PDF 知识文件，会按页读取。
 allow_knowledge_file_type: ["txt", "pdf", "docx"]
 
+# 知识库上传预览生产化配置。
+upload_preview:
+  ttl_seconds: 86400
+  max_file_size_bytes: 52428800
+  sample_text_chars: 5000
+  recommendation_sample_chars: 10000
+
 # 文本切分块大小。
 # 值越小召回更精细，值越大上下文更完整。
 chunk_size: 200

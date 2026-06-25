@@ -10,6 +10,11 @@ from api.services.common_services import (
     _normalize_document_structure_type,
     _normalize_split_strategy,
 )
+from api.services.upload_preview_state import (
+    PREVIEW_OBJECT_PREFIX,
+    get_preview_upload_store,
+    load_upload_preview_config,
+)
 from infrastructure.file_storage_service import StoredFileInfo, get_file_storage_service
 from model.factory import get_chat_model, get_chat_model_name_for_mode
 from utils.config_handler import qdrant_conf
@@ -42,25 +47,36 @@ def _validate_file_type(filename: str) -> str:
     return file_type
 
 
-_PREVIEW_UPLOADS: dict[str, StoredFileInfo] = {}
-
-
-def _remove_created_upload_dir(upload_dir: str) -> None:
-    """兼容旧调用的清理函数；MinIO 模式下不再清理本地上传目录。"""
-
-    logger.debug("[知识库] MinIO 模式无需清理本地上传目录 目录=%s", upload_dir)
-
-
 def _save_preview_file(file: UploadFile, filename: str, upload_id: str) -> StoredFileInfo:
     """把上传文件保存到 MinIO 预览对象。"""
 
-    stored_file = get_file_storage_service().save_upload_file(
+    storage_service = get_file_storage_service()
+    stored_file = storage_service.save_upload_file(
         file=file,
         filename=filename,
         prefix="previews",
         owner_id=upload_id,
     )
-    _PREVIEW_UPLOADS[upload_id] = stored_file
+    preview_config = load_upload_preview_config()
+    if stored_file.file_size > preview_config.max_file_size_bytes:
+        storage_service.delete_object(
+            bucket_name=stored_file.bucket_name,
+            object_name=stored_file.object_name,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件过大，最大支持 {preview_config.max_file_size_bytes} 字节",
+        )
+
+    try:
+        get_preview_upload_store().save(upload_id, stored_file)
+    except Exception as exc:
+        storage_service.delete_object(
+            bucket_name=stored_file.bucket_name,
+            object_name=stored_file.object_name,
+        )
+        logger.error("[知识库] Redis 预览上传元数据写入失败 上传编号=%s 错误=%s", upload_id, exc, exc_info=True)
+        raise HTTPException(status_code=503, detail="预览上传状态保存失败，请稍后重试") from exc
     logger.info(
         "[知识库] 上传预览文件已保存到 MinIO 上传编号=%s 对象名=%s",
         upload_id,
@@ -69,27 +85,34 @@ def _save_preview_file(file: UploadFile, filename: str, upload_id: str) -> Store
     return stored_file
 
 
-def _move_upload_file(source_path: str, document_id: str, filename: str) -> str:
-    """兼容旧接口的移动函数；MinIO 模式下不再移动本地文件。"""
-
-    raise RuntimeError("MinIO 模式不支持移动本地上传文件，请使用 _promote_preview_file")
-
-
 def _get_preview_file(upload_id: str) -> StoredFileInfo:
     """根据上传编号找到 MinIO 临时预览对象。"""
 
     clean_upload_id = upload_id.strip()
-    stored_file = _PREVIEW_UPLOADS.get(clean_upload_id)
-    if stored_file is None:
-        raise HTTPException(status_code=404, detail=f"临时上传不存在：{clean_upload_id}")
+    metadata = get_preview_upload_store().get(clean_upload_id)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail=f"临时上传已过期或不存在：{clean_upload_id}")
+
+    stored_file = metadata.to_stored_file_info()
+    if not stored_file.object_name.startswith(PREVIEW_OBJECT_PREFIX):
+        raise HTTPException(status_code=400, detail="临时上传对象路径非法")
     return stored_file
+
 
 
 def _delete_preview_file(upload_id: str) -> None:
     """删除 MinIO 临时预览对象。"""
 
-    stored_file = _PREVIEW_UPLOADS.pop(upload_id.strip(), None)
-    if stored_file is None:
+    clean_upload_id = upload_id.strip()
+    store = get_preview_upload_store()
+    metadata = store.get(clean_upload_id)
+    store.delete(clean_upload_id)
+    if metadata is None:
+        return
+
+    stored_file = metadata.to_stored_file_info()
+    if not stored_file.object_name.startswith(PREVIEW_OBJECT_PREFIX):
+        logger.warning("[知识库] 跳过非法 MinIO 临时对象删除 上传编号=%s 对象名=%s", upload_id, stored_file.object_name)
         return
     try:
         get_file_storage_service().delete_object(
@@ -98,6 +121,8 @@ def _delete_preview_file(upload_id: str) -> None:
         )
     except Exception as exc:
         logger.warning("[知识库] 删除 MinIO 临时预览对象失败 上传编号=%s 错误=%s", upload_id, exc)
+    return
+
 
 
 def _promote_preview_file(upload_id: str, document_id: str) -> StoredFileInfo:
@@ -254,7 +279,8 @@ def _recommend_upload_split_strategy(upload_id: str) -> dict:
     ) as file_path:
         documents = VectorStoreService().get_file_documents(file_path)
     full_text = "\n\n".join(document.page_content for document in documents)
-    sample_text = _build_structure_sample(full_text, max_chars=10000)
+    preview_config = load_upload_preview_config()
+    sample_text = _build_structure_sample(full_text, max_chars=preview_config.recommendation_sample_chars)
     if not sample_text:
         raise HTTPException(status_code=400, detail="文件没有可用于模型推荐的文本内容")
 

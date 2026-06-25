@@ -16,6 +16,7 @@ from api.schemas import (
     KnowledgeUploadResponse,
 )
 from api.services.common_services import _document_to_response, _get_knowledge_store, build_document_dictionary_snapshot
+from api.services.document_asset_service import DocumentAssetService
 from api.services.indexing_services import _index_document, _sync_data_files_to_documents
 from api.services.upload_services import (
     _delete_preview_file,
@@ -25,8 +26,10 @@ from api.services.upload_services import (
     _sanitize_upload_filename,
     _save_preview_file,
     _validate_file_type,
+    load_upload_preview_config,
 )
 from infrastructure.file_storage_service import get_file_storage_service
+from rag.file_processors import FileProcessorFactory
 from utils.file_handler import pdf_loader
 from utils.logger_handler import logger
 from utils.qdrant_options import get_qdrant_collection_name
@@ -111,6 +114,15 @@ def _read_pdf_file_preview(file_path: str, max_chars: int) -> tuple[str, bool, i
     return "".join(parts), truncated, len(documents)
 
 
+def _read_document_file_preview(file_path: str, max_chars: int) -> tuple[str, bool]:
+    """读取 DOCX 等文档类文件的文本预览。"""
+
+    documents = FileProcessorFactory.load_documents(file_path)
+    content = "\n\n".join(document.page_content.strip() for document in documents if document.page_content.strip())
+    truncated = len(content) > max_chars
+    return content[:max_chars], truncated
+
+
 def _read_knowledge_file_preview(document: dict, max_chars: int) -> dict:
     """从 MinIO 下载原文件并按文件类型读取预览文本。"""
 
@@ -140,6 +152,15 @@ def _read_knowledge_file_preview(document: dict, max_chars: int) -> dict:
                 "content": content,
                 "truncated": truncated,
                 "page_count": page_count,
+            }
+
+        if file_type == "docx":
+            content, truncated = _read_document_file_preview(file_path, max_chars)
+            return {
+                "preview_type": "document_text",
+                "content": content,
+                "truncated": truncated,
+                "page_count": None,
             }
 
     raise HTTPException(status_code=400, detail=f"当前文件类型不支持预览：{file_type}")
@@ -174,7 +195,12 @@ def preview_knowledge_file(file: UploadFile = File(...)) -> KnowledgeUploadPrevi
                 object_name=stored_file.object_name,
                 filename=stored_file.filename,
         ) as file_path:
-            preview = VectorStoreService().preview_file(filename=filename, file_path=file_path)
+            preview_config = load_upload_preview_config()
+            preview = VectorStoreService().preview_file(
+                filename=filename,
+                file_path=file_path,
+                sample_limit=preview_config.sample_text_chars,
+            )
     except Exception as exc:
         _delete_preview_file(upload_id)
         logger.error(f"[知识库] 上传预览解析失败 文件名={filename} 错误={exc}", exc_info=True)
@@ -272,19 +298,21 @@ def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeU
 
 
 @router.get("/knowledge/files", response_model=list[KnowledgeFileResponse])
-def list_knowledge_files() -> list[KnowledgeFileResponse]:
+def list_knowledge_files(
+        include_training: bool = Query(False, description="是否包含销售训练集合，仅排查数据时使用"),
+) -> list[KnowledgeFileResponse]:
     """查询知识库文件列表。
 
     只返回 status != deleted 的文件。
     这个接口后续可以直接给前端知识库管理页面使用。
     """
 
-    logger.info("[知识库] 查询文件列表")
+    logger.info("[知识库] 查询文件列表 包含训练资料=%s", include_training)
     store = _get_knowledge_store()
     dictionary_snapshot = build_document_dictionary_snapshot(store)
     return [
         _document_to_response(document, dictionary_snapshot)
-        for document in store.list_documents()
+        for document in store.list_documents(include_training=include_training)
     ]
 
 
@@ -345,35 +373,11 @@ def preview_indexed_knowledge_file(
 
 @router.delete("/knowledge/files/{document_id}", response_model=KnowledgeDeleteResponse)
 def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
-    """按 document_id 删除知识库文件。
+    """? document_id ?????????????"""
 
-    这里的“删除”是知识库层面的删除：
-    - Qdrant 中该 document_id 的 points 会被删除。
-    - MySQL documents 中该文件会标记为 deleted。
-    - MinIO 中该文件对象会被物理删除。
-    """
-
-    logger.info(f"[知识库] 删除文件 文档编号={document_id}")
-    store = _get_knowledge_store()
-    document = store.get_document(document_id)
-
-    if document is None or document["status"] == _dictionary_status("document_status", "deleted"):
-        raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
-
-    try:
-        from infrastructure.vector_store_service import VectorStoreService  # 延迟导入，只在删除 Qdrant points 时加载
-
-        VectorStoreService.delete_document_vectors(document_id, collection_name=document.get("collection_name"))
-        store.mark_document_deleted(document_id)
-        get_file_storage_service().delete_object(
-            bucket_name=document.get("bucket_name"),
-            object_name=document.get("object_name"),
-        )
-    except Exception as exc:
-        logger.error(f"[知识库] 删除文件失败 文档编号={document_id} 错误={exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"知识库文件删除失败：{exc}") from exc
-
-    return KnowledgeDeleteResponse(status=_dictionary_status("document_status", "deleted"), document_id=document_id)
+    logger.info("[???] ???? ????=%s", document_id)
+    result = DocumentAssetService().delete_document_asset(document_id)
+    return KnowledgeDeleteResponse(status="deleted", document_id=result.document_id)
 
 
 @router.post("/knowledge/files/reindex-all", response_model=KnowledgeBulkReindexResponse)
@@ -383,7 +387,7 @@ def reindex_all_knowledge_files() -> KnowledgeBulkReindexResponse:
     这个接口用于把旧的粗糙 chunk 数据迁移到新的结构化知识单元。
     注意：
     - 会先删除并重建当前 Qdrant collection，清理无 document_id 的旧 points。
-    - 会重新读取 uploads/ 中的原始文件。
+    - 会从 MinIO 临时下载原始文件并重新解析。
     - 会重新调用 embedding。
     - 文件多时会比较慢，也会消耗模型调用额度。
     """
