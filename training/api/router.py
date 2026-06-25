@@ -150,8 +150,8 @@ def preview_training_batch(
 def delete_training_batch(batch_id: str) -> TrainingKnowledgeDeleteResponse:
     """删除训练资料批次。
 
-    删除采用软删除：业务数据库批次标记为 deleted，同时删除 Qdrant 中该 batch_id 的向量点。
-    原始上传文件暂时保留，方便以后做审计或恢复。
+    删除采用统一文件资产删除链路：硬删除 MySQL 批次与 documents 记录，
+    同步清理 Qdrant 正式库/临时库向量点，并删除 MinIO 原始文件对象。
     """
 
     return _service().delete_batch(batch_id)

@@ -348,17 +348,6 @@ class TrainingRepository:
             rows = session.execute(list_statement).all()
         return self._scalars_to_batches(rows), total
 
-    def mark_batch_deleted(self, batch_id: str) -> bool:
-        """软删除训练资料批次。"""
-
-        with orm_session_context() as session:
-            batch = session.get(TrainingKnowledgeBatchEntity, batch_id)
-            if batch is None or batch.status == "deleted":
-                return False
-            batch.status = "deleted"
-            batch.updated_at = utc_now()
-            return True
-
     def list_batches_by_document_id(self, document_id: str) -> list[TrainingKnowledgeBatchEntity]:
         """按 document_id 查询训练资料批次。"""
 
