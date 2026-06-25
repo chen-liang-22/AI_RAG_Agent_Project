@@ -62,6 +62,16 @@ class MinioObjectInfo:
     content_type: str | None = None  # MIME 类型
 
 
+@dataclass(frozen=True)
+class MinioObjectSummary:
+    """MinIO 对象列表摘要，用于清理任务判断对象年龄。"""
+
+    bucket_name: str
+    object_name: str
+    last_modified: Any
+    size: int | None = None
+
+
 def load_minio_config(config_path: str = get_abs_path("config/minio.yml")) -> dict[str, Any]:
     """读取 MinIO 配置，并允许环境变量覆盖关键连接参数。"""
 
@@ -361,6 +371,25 @@ class MinioStorageClient:
 
         logger.info("[MinIO] 对象下载完成 桶名=%s 对象名=%s 本地路径=%s", final_bucket, clean_object_name, target)
         return str(target)
+
+    def list_objects(self, prefix: str, bucket_name: str | None = None) -> list[MinioObjectSummary]:
+        """按前缀列出 MinIO 对象摘要。"""
+
+        final_bucket = self.ensure_bucket(bucket_name)
+        clean_prefix = prefix.strip().lstrip("/")
+        try:
+            objects = self.client().list_objects(final_bucket, prefix=clean_prefix, recursive=True)
+            return [
+                MinioObjectSummary(
+                    bucket_name=final_bucket,
+                    object_name=str(item.object_name),
+                    last_modified=getattr(item, "last_modified", None),
+                    size=getattr(item, "size", None),
+                )
+                for item in objects
+            ]
+        except S3Error as exc:
+            raise RuntimeError(f"列出 MinIO 对象失败：{exc}") from exc
 
     def object_exists(self, object_name: str, bucket_name: str | None = None) -> bool:
         """判断对象是否存在。"""

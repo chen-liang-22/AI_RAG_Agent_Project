@@ -110,6 +110,41 @@ class FileStorageService:
             uploaded=uploaded,
         )
 
+    def save_local_file(
+            self,
+            *,
+            file_path: str,
+            filename: str | None = None,
+            prefix: str,
+            owner_id: str,
+    ) -> StoredFileInfo:
+        """把服务端已有的本地文件保存到 MinIO。
+
+        这个方法只用于两类场景：
+        1. data/ 目录内置知识文件首次同步；
+        2. 历史本地文件迁移到 MinIO。
+
+        新上传的业务文件仍应走 save_upload_file，避免长期依赖本地 uploads 目录。
+        """
+
+        source_path = Path(file_path)
+        if not source_path.is_file():
+            raise FileNotFoundError(f"本地文件不存在，无法上传到 MinIO：{file_path}")
+
+        final_filename = Path(filename or source_path.name).name
+        object_name = self._object_name(prefix, owner_id, final_filename)
+        file_md5 = get_file_md5_hex(str(source_path))
+        if not file_md5:
+            raise RuntimeError(f"本地文件 MD5 计算失败：{file_path}")
+
+        uploaded = self.client.upload_file(str(source_path), object_name=object_name)
+        return self._to_stored_file_info(
+            filename=final_filename,
+            file_md5=file_md5,
+            file_size=source_path.stat().st_size,
+            uploaded=uploaded,
+        )
+
     def copy_object(self, *, source: StoredFileInfo, prefix: str, owner_id: str) -> StoredFileInfo:
         """把一个 MinIO 对象复制到新的业务位置。"""
 
@@ -134,6 +169,16 @@ class FileStorageService:
             logger.warning("[文件存储] 跳过空对象名删除")
             return False
         return self.client.delete_object(clean_object_name, bucket_name=bucket_name)
+
+    def ensure_bucket_ready(self) -> str:
+        """确认 MinIO 存储桶可用，并返回桶名。"""
+
+        return self.client.ensure_bucket()
+
+    def list_objects(self, *, prefix: str, bucket_name: str | None = None):
+        """按前缀列出 MinIO 对象摘要。"""
+
+        return self.client.list_objects(prefix=prefix, bucket_name=bucket_name)
 
     @contextmanager
     def downloaded_temp_file(self, *, bucket_name: str | None, object_name: str, filename: str) -> Iterator[str]:

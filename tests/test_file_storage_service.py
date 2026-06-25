@@ -49,6 +49,11 @@ class FakeStorageClient:
         Path(target_path).write_text("hello minio", encoding="utf-8")
         return target_path
 
+    def ensure_bucket(self):
+        """模拟 MinIO 桶可用检查。"""
+
+        return "pub"
+
 
 def test_file_storage_upload_copy_download_and_delete(monkeypatch):
     """统一文件存储服务应把上传、复制、下载、删除都收敛到 MinIO。"""
@@ -79,3 +84,45 @@ def test_file_storage_upload_copy_download_and_delete(monkeypatch):
     assert copied.object_name == "documents/doc_001/demo.txt"
     assert deleted is True
     assert fake_client.deleted == [("pub", "documents/doc_001/demo.txt")]
+
+
+def test_file_storage_save_local_file_uses_minio_facade(monkeypatch, tmp_path):
+    """本地初始化文件或历史迁移文件也应通过统一文件存储服务进入 MinIO。"""
+
+    fake_client = FakeStorageClient()
+    monkeypatch.setattr(storage_module, "get_minio_client", lambda: fake_client)
+    service = FileStorageService()
+
+    source_file = tmp_path / "内置知识.txt"
+    source_file.write_text("hello local file", encoding="utf-8")
+
+    stored = service.save_local_file(
+        file_path=str(source_file),
+        filename=source_file.name,
+        prefix="documents",
+        owner_id="doc_local",
+    )
+
+    assert service.ensure_bucket_ready() == "pub"
+    assert stored.file_md5 == "ef91f5bb45bfdad80cc73904db85a63b"
+    assert stored.object_name == "documents/doc_local/内置知识.txt"
+    assert stored.file_path == "minio://pub/documents/doc_local/内置知识.txt"
+
+
+def test_file_storage_lists_objects_through_minio_facade(monkeypatch):
+    """文件存储外观应提供 MinIO 前缀扫描能力，供清理任务复用。"""
+
+    fake_client = FakeStorageClient()
+    fake_client.list_objects = lambda prefix, bucket_name=None: [
+        SimpleNamespace(
+            bucket_name=bucket_name or "pub",
+            object_name=f"{prefix}tmp_001/demo.txt",
+            last_modified=None,
+            size=12,
+        )
+    ]
+    monkeypatch.setattr(storage_module, "get_minio_client", lambda: fake_client)
+
+    objects = FileStorageService().list_objects(prefix="previews/")
+
+    assert objects[0].object_name == "previews/tmp_001/demo.txt"

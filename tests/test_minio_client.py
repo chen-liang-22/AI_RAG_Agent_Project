@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from datetime import datetime, timezone
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -17,6 +19,15 @@ class FakeUploadResult:
 
     def __init__(self, etag: str = "etag-001"):
         self.etag = etag
+
+
+class FakeListedObject:
+    """测试用 MinIO 对象列表项。"""
+
+    def __init__(self, object_name, last_modified, size):
+        self.object_name = object_name
+        self.last_modified = last_modified
+        self.size = size
 
 
 class FakeMinioClient:
@@ -146,6 +157,49 @@ def test_minio_upload_file_delete_and_public_url(monkeypatch, tmp_path):
     assert downloaded_path.read_text(encoding="utf-8") == "downloaded"
 
 
+def test_minio_list_objects_returns_clean_summaries(monkeypatch):
+    """按前缀列出对象时应返回业务可读的轻量摘要。"""
+
+    listed_at = datetime(2026, 6, 25, tzinfo=timezone.utc)
+    fake_client = FakeMinioClient(bucket_exists=True)
+
+    def fake_list_objects(bucket_name, prefix="", recursive=True):
+        assert bucket_name == "pub"
+        assert prefix == "previews/"
+        assert recursive is True
+        return [
+            FakeListedObject("previews/tmp_001/demo.txt", listed_at, 12),
+            FakeListedObject("previews/tmp_002/demo.pdf", listed_at, 34),
+        ]
+
+    fake_client.list_objects = fake_list_objects
+    fake_sdk = SimpleNamespace(Minio=lambda **kwargs: fake_client)
+    monkeypatch.setattr(minio_client, "minio", fake_sdk)
+    monkeypatch.setattr(minio_client, "S3Error", RuntimeError)
+
+    client = MinioStorageClient(
+        {
+            "enabled": True,
+            "endpoint": "127.0.0.1:9000",
+            "access_key": "admin",
+            "secret_key": "1234qwer",
+            "secure": False,
+            "bucket_name": "pub",
+            "auto_create_bucket": False,
+        }
+    )
+
+    objects = client.list_objects(prefix="previews/")
+
+    assert [item.object_name for item in objects] == [
+        "previews/tmp_001/demo.txt",
+        "previews/tmp_002/demo.pdf",
+    ]
+    assert objects[0].bucket_name == "pub"
+    assert objects[0].last_modified == listed_at
+    assert objects[0].size == 12
+
+
 def test_minio_auto_create_bucket(monkeypatch, tmp_path):
     """验证自动创建桶的行为。"""
 
@@ -205,6 +259,7 @@ def test_minio_missing_bucket_raises(monkeypatch):
 
 
 
+@pytest.mark.skipif(os.getenv("RUN_REAL_MINIO_TESTS") != "1", reason="真实 MinIO 手动验证用例默认跳过")
 def test_real_minio_upload_file():
     """真实上传文件到 MinIO，用于本地手动验证。"""
 
