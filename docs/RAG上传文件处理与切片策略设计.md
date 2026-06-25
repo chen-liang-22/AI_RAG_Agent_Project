@@ -396,7 +396,7 @@ Qdrant payload 建议补充：
 
 ```mermaid
 flowchart TD
-    A["POST /knowledge/upload/preview"] --> B["保存到 uploads/_preview"]
+    A["POST /knowledge/upload/preview"] --> B["保存到 MinIO previews 临时对象"]
     B --> C["计算 MD5"]
     C --> D["FileProcessorFactory 选择文件处理器"]
     D --> E["读取样本文本和文件 metadata"]
@@ -411,7 +411,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     A["POST /knowledge/upload/confirm"] --> B["校验 upload_id"]
-    B --> C["移动到 uploads/{document_id}"]
+    B --> C["复制为 MinIO documents 正式对象"]
     C --> D["创建 documents 记录"]
     D --> E["FileProcessorFactory 读取完整文档"]
     E --> F["SplitStrategyFactory 选择切片策略"]

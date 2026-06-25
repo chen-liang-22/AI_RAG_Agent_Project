@@ -168,6 +168,22 @@ class DictionaryItemEntity(BaseOrmModel, DictMixin):
     updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
 
 
+class SystemUserEntity(BaseOrmModel, DictMixin):
+    """system_users 表实体，记录系统登录用户。"""
+
+    __tablename__ = "system_users"
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="用户唯一编号")
+    username: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, comment="登录账号")
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False, comment="展示名称")
+    password_hash: Mapped[str] = mapped_column(String(512), nullable=False, comment="密码哈希")
+    role: Mapped[str] = mapped_column(String(64), nullable=False, default="admin", comment="用户角色")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", comment="用户状态")
+    last_login_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="最后登录时间")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
+
+
 class ExamSessionEntity(BaseOrmModel, DictMixin):
     """exam_sessions 表实体，记录一次对话式考试会话。"""
 
@@ -387,6 +403,7 @@ KnowledgeStoreRow = (
     | ConversationEntity
     | ConversationMessageEntity
     | DictionaryItemEntity
+    | SystemUserEntity
     | ExamSessionEntity
     | ExamQuestionEntity
 )
@@ -403,5 +420,5 @@ TrainingRepositoryRow = (
 )
 """销售训练仓储可能返回的 ORM 实体联合类型。"""
 
-EntityRow = KnowledgeStoreRow | TrainingRepositoryRow
+EntityRow = KnowledgeStoreRow | TrainingRepositoryRow | SystemUserEntity
 """项目关系型 ORM 实体联合类型。"""

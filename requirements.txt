@@ -22,3 +22,4 @@ pymysql==1.1.2
 cryptography==48.0.1
 redis==7.1.0
 minio==7.2.20
+PyJWT==2.10.1

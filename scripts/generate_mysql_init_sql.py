@@ -165,7 +165,11 @@ SET FOREIGN_KEY_CHECKS = 0;
 CREATE TABLE IF NOT EXISTS documents (
   document_id VARCHAR(64) NOT NULL COMMENT '文档唯一编号',
   filename VARCHAR(255) NOT NULL COMMENT '原始文件名',
-  file_path VARCHAR(1024) NOT NULL COMMENT '服务端保存路径',
+  file_path VARCHAR(1024) NOT NULL COMMENT 'MinIO 存储 URI，格式为 minio://桶名/对象路径',
+  storage_type VARCHAR(32) NOT NULL DEFAULT 'minio' COMMENT '文件存储类型：minio 表示对象存储',
+  bucket_name VARCHAR(128) NULL COMMENT 'MinIO 桶名',
+  object_name VARCHAR(1024) NULL COMMENT 'MinIO 对象路径',
+  public_url VARCHAR(2048) NULL COMMENT 'MinIO 公共访问地址',
   file_type VARCHAR(32) NOT NULL COMMENT '文件类型，例如 txt、pdf、docx',
   file_md5 CHAR(32) NOT NULL COMMENT '文件 MD5，用于去重',
   file_size BIGINT NOT NULL COMMENT '文件大小，单位字节',
@@ -180,6 +184,7 @@ CREATE TABLE IF NOT EXISTS documents (
   error_message TEXT NULL COMMENT '失败原因',
   PRIMARY KEY (document_id),
   KEY idx_documents_file_md5 (file_md5),
+  KEY idx_documents_storage_object (storage_type, bucket_name, object_name(255)),
   KEY idx_documents_collection (collection_name),
   KEY idx_documents_status_updated (status, updated_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='普通知识库文件元数据表';
@@ -240,6 +245,21 @@ CREATE TABLE IF NOT EXISTS dictionary_items (
     FOREIGN KEY (parent_item_id) REFERENCES dictionary_items (dictionary_item_id)
     ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='系统字典表';
+
+CREATE TABLE IF NOT EXISTS system_users (
+  user_id VARCHAR(64) NOT NULL COMMENT '用户唯一编号',
+  username VARCHAR(128) NOT NULL COMMENT '登录账号',
+  display_name VARCHAR(128) NOT NULL COMMENT '展示名称',
+  password_hash VARCHAR(512) NOT NULL COMMENT '密码哈希，禁止保存明文密码',
+  role VARCHAR(64) NOT NULL DEFAULT 'admin' COMMENT '用户角色，例如 admin、user',
+  status VARCHAR(32) NOT NULL DEFAULT 'active' COMMENT '用户状态，例如 active、disabled',
+  last_login_at DATETIME NULL COMMENT '最后登录时间',
+  created_at DATETIME NOT NULL COMMENT '创建时间',
+  updated_at DATETIME NOT NULL COMMENT '更新时间',
+  PRIMARY KEY (user_id),
+  UNIQUE KEY uk_system_users_username (username),
+  KEY idx_system_users_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='系统登录用户表';
 
 CREATE TABLE IF NOT EXISTS exam_sessions (
   session_id VARCHAR(64) NOT NULL COMMENT '测评会话编号',

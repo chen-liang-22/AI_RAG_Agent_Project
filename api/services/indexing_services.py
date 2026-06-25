@@ -162,17 +162,17 @@ def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
             continue
 
         document_id = f"doc_{uuid.uuid4().hex}"
-        file_storage = get_file_storage_service()
-        stored_file = file_storage.client.upload_file(
-            file_path,
-            object_name=f"documents/{document_id}/{filename}",
+        stored_file = get_file_storage_service().save_local_file(
+            file_path=file_path,
+            filename=filename,
+            prefix="documents",
+            owner_id=document_id,
         )
-        storage_uri = file_storage.build_storage_uri(stored_file.bucket_name, stored_file.object_name)
         documents.append(
             store.create_document(
                 document_id=document_id,
                 filename=filename,
-                file_path=storage_uri,
+                file_path=stored_file.file_path,
                 file_type=file_type,
                 file_md5=file_md5,
                 file_size=os.path.getsize(file_path),

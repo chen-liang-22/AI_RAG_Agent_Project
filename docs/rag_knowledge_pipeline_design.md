@@ -63,7 +63,7 @@
 ```mermaid
 flowchart TD
     A["前端上传文件"] --> B["FastAPI Upload API"]
-    B --> C["保存原始文件 uploads/"]
+    B --> C["保存原始文件到 MinIO"]
     C --> D["写入 documents 表"]
     D --> E["解析文件为标准文本/Markdown"]
     E --> F["抽取知识单元 KnowledgeUnit"]
@@ -99,22 +99,21 @@ flowchart TD
 
 ### 4.1 原始文件层
 
-第一阶段可以使用本地目录：
+当前统一使用 MinIO 保存原始文件：
 
 ```text
-uploads/
+MinIO bucket: pub
+documents/
   doc_001/
     original.pdf
   doc_002/
     选购指南.txt
 ```
 
-后续生产环境可替换为：
+后续如需替换对象存储，业务层仍通过 `FileStorageService` 收口：
 
-- MinIO
 - S3
 - OSS
-- NAS
 
 ### 4.2 数据库层
 
@@ -169,7 +168,7 @@ CREATE TABLE documents (
 |---|---|
 | `document_id` | 文件唯一 ID |
 | `filename` | 原始文件名 |
-| `file_path` | 原始文件保存路径 |
+| `file_path` | MinIO 存储 URI，格式为 `minio://桶名/对象路径` |
 | `file_type` | 文件类型，例如 txt/pdf/docx |
 | `file_md5` | 文件内容 MD5 |
 | `status` | uploaded/indexing/indexed/failed/deleted |

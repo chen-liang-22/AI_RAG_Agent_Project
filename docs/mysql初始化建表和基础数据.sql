@@ -95,6 +95,21 @@ CREATE TABLE IF NOT EXISTS dictionary_items (
     ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='系统字典表';
 
+CREATE TABLE IF NOT EXISTS system_users (
+  user_id VARCHAR(64) NOT NULL COMMENT '用户唯一编号',
+  username VARCHAR(128) NOT NULL COMMENT '登录账号',
+  display_name VARCHAR(128) NOT NULL COMMENT '展示名称',
+  password_hash VARCHAR(512) NOT NULL COMMENT '密码哈希，禁止保存明文密码',
+  role VARCHAR(64) NOT NULL DEFAULT 'admin' COMMENT '用户角色，例如 admin、user',
+  status VARCHAR(32) NOT NULL DEFAULT 'active' COMMENT '用户状态，例如 active、disabled',
+  last_login_at DATETIME NULL COMMENT '最后登录时间',
+  created_at DATETIME NOT NULL COMMENT '创建时间',
+  updated_at DATETIME NOT NULL COMMENT '更新时间',
+  PRIMARY KEY (user_id),
+  UNIQUE KEY uk_system_users_username (username),
+  KEY idx_system_users_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='系统登录用户表';
+
 CREATE TABLE IF NOT EXISTS exam_sessions (
   session_id VARCHAR(64) NOT NULL COMMENT '测评会话编号',
   user_id VARCHAR(128) NULL COMMENT '用户编号，当前可为空',

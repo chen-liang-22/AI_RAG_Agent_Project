@@ -13,6 +13,7 @@ from fastapi import HTTPException, UploadFile
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from api.services.document_asset_service import DocumentAssetService
 from infrastructure.file_storage_service import get_file_storage_service
 from infrastructure.vector_store_service import VectorStoreService
 from model.factory import get_chat_model
@@ -390,42 +391,16 @@ class SalesTrainingService:
         )
 
     def delete_batch(self, batch_id: str) -> TrainingKnowledgeDeleteResponse:
-        """删除训练资料批次。
-
-        删除动作包含两层：
-        1. Qdrant 正式库和临时库中按 batch_id 删除本批次向量点；
-        2. 业务数据库批次状态改成 deleted，并同步物理删除 MinIO 原文件。
-        """
+        """删除训练资料批次，并通过统一文件资产服务清理全链路数据。"""
 
         batch = self._get_active_batch(batch_id)
-        file_info = self._batch_file_info(batch)
-        try:
-            # 正式库和临时库都按 batch_id 删除，兼容待审核、已发布两种状态。
-            self.vector_service.delete_by_metadata("batch_id", batch_id)
-            self.staging_vector_service.delete_by_metadata("batch_id", batch_id)
-            deleted = self.repository.mark_batch_deleted(batch_id)
-            if not deleted:
-                raise HTTPException(status_code=404, detail=f"训练资料不存在：{batch_id}")
-            # 文件基础信息统一保存在 documents 表，删除批次时同步软删除文件台账记录。
-            document_id = str(batch.get("document_id") or "").strip()
-            if document_id:
-                self.knowledge_store.mark_document_deleted(document_id)
-            get_file_storage_service().delete_object(
-                bucket_name=file_info.get("bucket_name"),
-                object_name=file_info.get("object_name"),
-            )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.error("[销售训练] 训练资料删除失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
-            raise HTTPException(status_code=500, detail=f"训练资料删除失败：{exc}") from exc
+        document_id = str(batch.get("document_id") or "").strip()
+        if not document_id:
+            logger.error("[销售训练] 训练资料缺少 document_id，无法执行统一删除 批次编号=%s", batch_id)
+            raise HTTPException(status_code=500, detail=f"训练资料缺少 document_id：{batch_id}")
 
-        logger.info(
-            "[销售训练] 训练资料已删除 批次编号=%s 正式向量库=%s 临时向量库=%s",
-            batch_id,
-            self.training_collection_name,
-            self.staging_collection_name,
-        )
+        DocumentAssetService().delete_document_asset(document_id)
+        logger.info("[销售训练] 训练资料已删除 批次编号=%s 文档编号=%s", batch_id, document_id)
         return TrainingKnowledgeDeleteResponse(status="deleted", batch_id=batch_id)
 
     def publish_batch(self, batch_id: str) -> TrainingKnowledgePublishResponse:

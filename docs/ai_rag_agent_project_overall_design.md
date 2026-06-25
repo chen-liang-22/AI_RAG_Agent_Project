@@ -120,7 +120,7 @@ flowchart TD
 | `Dockerfile` | 后端 API 镜像构建文件 |
 | `docker-compose.yml` | API、Qdrant、前端组合部署 |
 | `data/` | 内置知识库文件目录 |
-| `uploads/` | 用户上传文件保存目录 |
+| MinIO | 用户上传文件唯一持久化存储；本地目录只允许临时缓存 |
 | `config/database.yml` | MySQL 业务数据库连接配置 |
 
 ## 1. 设计结论
@@ -194,7 +194,7 @@ documents
 | --- | --- |
 | document_id | 文件唯一标识，用于删除和重建索引 |
 | filename | 原始文件名 |
-| file_path | 服务端文件路径 |
+| file_path | MinIO 存储 URI，格式为 `minio://桶名/对象路径` |
 | file_md5 | 去重 |
 | status | uploaded / indexing / indexed / failed / deleted |
 | version | 重建索引版本 |
@@ -963,23 +963,24 @@ knowledge_units
 | 来源 | 目录 | 说明 |
 | --- | --- | --- |
 | 内置知识库 | `data/` | 项目自带知识文件，例如 FAQ、选购指南、维护保养 |
-| 用户上传 | `uploads/` | 前端上传的文件，按 `document_id` 分目录保存 |
+| 用户上传 | MinIO | 前端上传的文件，按 `previews/`、`documents/`、`training/` 前缀保存 |
 
-上传文件保存结构：
+正式文件对象结构：
 
 ```text
-uploads/
+MinIO bucket: pub
+documents/
   doc_xxx/
     用户上传文件.pdf
 ```
 
-临时预览文件：
+临时预览对象结构：
 
 ```text
-uploads/
-  _preview/
-    tmp_xxx/
-      待确认文件.pdf
+MinIO bucket: pub
+previews/
+  tmp_xxx/
+    待确认文件.pdf
 ```
 
 ### 11.2 上传预览接口
@@ -1002,7 +1003,7 @@ POST /knowledge/upload/preview
 
 ```text
 1. 前端选择文件。
-2. 后端保存到 uploads/_preview/{upload_id}/。
+2. 后端保存到 MinIO `previews/{upload_id}/{filename}`。
 3. 计算 MD5，判断是否重复。
 4. 读取文件样本文本。
 5. 判断 document_type 和 split_strategy。
@@ -1043,7 +1044,7 @@ POST /knowledge/upload/confirm
 
 ```text
 1. 前端提交 upload_id、document_type、split_strategy。
-2. 后端把文件从 uploads/_preview 移动到 uploads/{document_id}/。
+2. 后端把 MinIO 预览对象复制为 `documents/{document_id}/{filename}` 正式对象。
 3. 写入 documents。
 4. 根据 document_type / split_strategy 切分。
 5. 生成 embedding。

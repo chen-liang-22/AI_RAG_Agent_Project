@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, inspect, or_, select, text
 from sqlalchemy.orm import Session
 
 from domain.entities import (
@@ -17,6 +17,7 @@ from domain.entities import (
     TrainingRoleProfileEntity,
 )
 from infrastructure.orm_session import orm_session_context
+from utils.logger_handler import logger
 
 
 def utc_now_text() -> str:
@@ -58,9 +59,37 @@ class TrainingRepository:
     """
 
     def __init__(self):
-        # 表结构由 docs/mysql初始化建表和基础数据.sql 管理。
-        # 仓储层只负责业务 CRUD，不在运行时偷偷补表，避免结构来源分裂。
-        pass
+        # 表结构主来源仍是 docs/mysql初始化建表和基础数据.sql。
+        # 这里仅补齐轻量兼容字段，避免旧库没执行迁移 SQL 时一启动就因为 document_id 字段缺失失败。
+        self.ensure_training_batch_document_columns()
+
+    @staticmethod
+    def ensure_training_batch_document_columns() -> None:
+        """确保训练批次表具备关联 documents 的字段和索引。
+
+        老库可能已经有 training_knowledge_batches，但没有 document_id。
+        新代码的查询会 outer join documents；如果字段不存在，列表、上传、去重都会报 SQL 错。
+        这里做幂等补齐，真正的历史数据回填仍由 scripts/migrate_local_files_to_minio.py 完成。
+        """
+
+        with orm_session_context() as session:
+            bind = session.get_bind()
+            inspector = inspect(bind)
+            columns = {column["name"] for column in inspector.get_columns("training_knowledge_batches")}
+            if "document_id" not in columns:
+                session.execute(text(
+                    "ALTER TABLE training_knowledge_batches "
+                    "ADD COLUMN document_id VARCHAR(64) NULL "
+                    "COMMENT '关联 documents.document_id，文件基础信息统一保存在 documents 表' AFTER batch_id"
+                ))
+                logger.info("[销售训练] training_knowledge_batches.document_id 字段已自动补齐")
+
+            indexes = {index["name"] for index in inspector.get_indexes("training_knowledge_batches")}
+            if "idx_training_batches_document" not in indexes:
+                session.execute(text(
+                    "CREATE INDEX idx_training_batches_document ON training_knowledge_batches(document_id)"
+                ))
+                logger.info("[销售训练] training_knowledge_batches.document_id 索引已自动补齐")
 
     @staticmethod
     def _json(data: Any) -> str:
@@ -329,6 +358,38 @@ class TrainingRepository:
             batch.status = "deleted"
             batch.updated_at = utc_now()
             return True
+
+    def list_batches_by_document_id(self, document_id: str) -> list[TrainingKnowledgeBatchEntity]:
+        """按 document_id 查询训练资料批次。"""
+
+        statement = self._batch_select_statement().where(
+            TrainingKnowledgeBatchEntity.document_id == document_id
+        )
+        with orm_session_context() as session:
+            rows = session.execute(statement).all()
+        return self._scalars_to_batches(rows)
+
+    def delete_batch(self, batch_id: str) -> bool:
+        """物理删除单个训练资料批次。"""
+
+        with orm_session_context() as session:
+            batch = session.get(TrainingKnowledgeBatchEntity, batch_id)
+            if batch is None:
+                return False
+            session.delete(batch)
+            return True
+
+    def delete_batches_by_document_id(self, document_id: str) -> int:
+        """按 document_id 物理删除训练资料批次，返回删除数量。"""
+
+        statement = select(TrainingKnowledgeBatchEntity).where(
+            TrainingKnowledgeBatchEntity.document_id == document_id
+        )
+        with orm_session_context() as session:
+            batches = list(session.scalars(statement).all())
+            for batch in batches:
+                session.delete(batch)
+            return len(batches)
 
     def get_batch(self, batch_id: str) -> TrainingKnowledgeBatchEntity | None:
         """按批次编号查询训练资料批次。"""

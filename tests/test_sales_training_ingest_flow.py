@@ -1,3 +1,4 @@
+import uuid
 from io import BytesIO
 
 from fastapi import UploadFile
@@ -164,6 +165,45 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
     published_batch = repository.get_batch(upload_result.batch_id)
     assert published_batch["status"] == "published"
     assert all(item.metadata["document_id"] == upload_result.document_id for item in fake_vector_service.documents)
+
+
+def test_training_delete_uses_document_asset_service(monkeypatch):
+    """删除训练资料时应复用统一文件资产服务，避免清理逻辑分散。"""
+
+    repository = TrainingRepository()
+    service = SalesTrainingService(repository=repository)
+    deleted_document_ids = []
+
+    class FakeAssetService:
+        def delete_document_asset(self, document_id):
+            deleted_document_ids.append(document_id)
+            return type("DeleteResult", (), {
+                "document_id": document_id,
+                "deleted_batch_ids": ["batch_test"],
+                "deleted_training_batches": 1,
+                "deleted_document": True,
+                "deleted_minio_object": True,
+            })()
+
+    monkeypatch.setattr(
+        "training.services.sales_training_service.DocumentAssetService",
+        lambda: FakeAssetService(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_get_active_batch",
+        lambda batch_id: {
+            "batch_id": batch_id,
+            "document_id": "doc_training",
+            "status": "published",
+        },
+    )
+
+    result = service.delete_batch("batch_test")
+
+    assert result.status == "deleted"
+    assert result.batch_id == "batch_test"
+    assert deleted_document_ids == ["doc_training"]
 
 
 def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeypatch):
@@ -398,8 +438,8 @@ def test_training_publish_writes_validation_report(tmp_path):
     assert saved_report["publish_validation"]["hit_count"] > 0
 
 
-def test_training_delete_batch_marks_document_deleted(tmp_path):
-    """删除训练批次时，应同步软删除 documents 文件台账记录。"""
+def test_training_delete_batch_removes_document_asset_chain(tmp_path):
+    """删除训练批次时，应同步硬删除 documents 文件台账和训练批次记录。"""
 
     repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
@@ -425,10 +465,8 @@ def test_training_delete_batch_marks_document_deleted(tmp_path):
     document = service.knowledge_store.get_document(upload_result.document_id)
 
     assert delete_result.status == "deleted"
-    assert batch["status"] == "deleted"
-    assert document["status"] == "deleted"
-    assert fake_vector_service.documents == []
-    assert fake_staging_service.documents == []
+    assert batch is None
+    assert document is None
 
 
 def test_training_publish_archives_previous_version_and_rollback(tmp_path):
@@ -437,10 +475,12 @@ def test_training_publish_archives_previous_version_and_rollback(tmp_path):
     repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
+    unique_suffix = uuid.uuid4().hex
+    filename = f"version_{unique_suffix}.txt"
 
     first_content = "\n".join([
         "一、客户案例",
-        "企业：第一版公司",
+        f"企业：第一版公司-{unique_suffix}",
         "任务要求",
         "完成需求挖掘。",
         "匹配答案",
@@ -451,13 +491,13 @@ def test_training_publish_archives_previous_version_and_rollback(tmp_path):
     second_content = first_content.replace("第一版公司", "第二版公司")
 
     first_upload = service.upload_knowledge(
-        file=UploadFile(filename="version.txt", file=BytesIO(first_content.encode("utf-8"))),
+        file=UploadFile(filename=filename, file=BytesIO(first_content.encode("utf-8"))),
         source_type="lms_case",
         created_by="tester",
     )
     first_publish = service.publish_batch(first_upload.batch_id)
     second_upload = service.upload_knowledge(
-        file=UploadFile(filename="version.txt", file=BytesIO(second_content.encode("utf-8"))),
+        file=UploadFile(filename=filename, file=BytesIO(second_content.encode("utf-8"))),
         source_type="lms_case",
         created_by="tester",
     )
@@ -496,10 +536,12 @@ def test_training_list_batch_versions_returns_version_chain(tmp_path):
     repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     attach_fake_vector_services(service)
+    unique_suffix = uuid.uuid4().hex
+    filename = f"chain_{unique_suffix}.txt"
 
     first_content = "\n".join([
         "一、客户案例",
-        "企业：第一版客户",
+        f"企业：第一版客户-{unique_suffix}",
         "任务要求",
         "完成需求挖掘。",
         "匹配答案",
@@ -509,13 +551,13 @@ def test_training_list_batch_versions_returns_version_chain(tmp_path):
     ])
     second_content = first_content.replace("第一版客户", "第二版客户")
     first_upload = service.upload_knowledge(
-        file=UploadFile(filename="chain.txt", file=BytesIO(first_content.encode("utf-8"))),
+        file=UploadFile(filename=filename, file=BytesIO(first_content.encode("utf-8"))),
         source_type="lms_case",
         created_by="tester",
     )
     service.publish_batch(first_upload.batch_id)
     second_upload = service.upload_knowledge(
-        file=UploadFile(filename="chain.txt", file=BytesIO(second_content.encode("utf-8"))),
+        file=UploadFile(filename=filename, file=BytesIO(second_content.encode("utf-8"))),
         source_type="lms_case",
         created_by="tester",
     )

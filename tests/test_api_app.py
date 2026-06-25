@@ -18,6 +18,9 @@ def test_openapi_exposes_core_routes():
     assert response.status_code == 200
     paths = response.json()["paths"]
     assert "/health" in paths
+    assert "/auth/login" in paths
+    assert "/auth/me" in paths
+    assert "/auth/logout" in paths
     assert "/chat" in paths
     assert "/chat/stream" in paths
     assert "/conversations" in paths
@@ -181,6 +184,75 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
     assert data["preview_type"] == "text"
     assert data["content"].strip()
     assert data["page_count"] is None
+
+
+def test_knowledge_files_excludes_training_collections_by_default(monkeypatch):
+    client = TestClient(app)
+
+    class FakeKnowledgeStore:
+        def normalize_dictionary_code(self, dictionary_code, item_code):
+            return item_code
+
+        def list_dictionary_items(self, *, dictionary_code=None):
+            if dictionary_code == "document_structure":
+                return [{"item_code": "text", "enabled": 1}]
+            if dictionary_code == "split_strategy":
+                return [{"item_code": "recursive", "enabled": 1}]
+            return []
+
+        def list_documents(self, *, include_training=False):
+            assert include_training is False
+            return [
+                {
+                    "document_id": "doc_general",
+                    "filename": "general.txt",
+                    "file_path": "minio://pub/documents/doc_general/general.txt",
+                    "storage_type": "minio",
+                    "bucket_name": "pub",
+                    "object_name": "documents/doc_general/general.txt",
+                    "public_url": None,
+                    "file_type": "txt",
+                    "file_md5": "md5_general",
+                    "file_size": 10,
+                    "status": "indexed",
+                    "version": 1,
+                    "chunk_count": 1,
+                    "collection_name": "agent",
+                    "document_type": "text",
+                    "split_strategy": "recursive",
+                    "created_at": "2026-01-01 00:00:00",
+                    "updated_at": "2026-01-01 00:00:00",
+                    "error_message": None,
+                }
+            ]
+
+    monkeypatch.setattr(knowledge_router, "_get_knowledge_store", lambda: FakeKnowledgeStore())
+
+    response = client.get("/knowledge/files")
+
+    assert response.status_code == 200
+    assert [item["document_id"] for item in response.json()] == ["doc_general"]
+
+
+def test_delete_knowledge_file_uses_document_asset_service(monkeypatch):
+    client = TestClient(app)
+    deleted_document_ids = []
+
+    class FakeDeleteResult:
+        document_id = "doc_general"
+
+    class FakeAssetService:
+        def delete_document_asset(self, document_id):
+            deleted_document_ids.append(document_id)
+            return FakeDeleteResult()
+
+    monkeypatch.setattr(knowledge_router, "DocumentAssetService", lambda: FakeAssetService())
+
+    response = client.delete("/knowledge/files/doc_general")
+
+    assert response.status_code == 200
+    assert response.json()["document_id"] == "doc_general"
+    assert deleted_document_ids == ["doc_general"]
 
 
 def test_exam_sections_only_expose_first_level_directory(monkeypatch):

@@ -16,6 +16,7 @@ from domain.entities import (
 )
 from infrastructure.orm_session import orm_session_context
 from rag.profile_dictionaries import PROFILE_DICTIONARY_ITEMS
+from utils.knowledge_asset_constants import TRAINING_COLLECTION_NAMES
 from utils.logger_handler import logger
 from utils.redis_client import get_redis_client
 
@@ -256,6 +257,14 @@ class KnowledgeStore:
             session.execute(text(ddl_statement))
         if ddl_statements:
             logger.info("[知识库] documents 表 MinIO 存储字段已自动补齐 字段数量=%s", len(ddl_statements))
+
+        indexes = {index["name"] for index in inspector.get_indexes("documents")}
+        if "idx_documents_storage_object" not in indexes:
+            session.execute(text(
+                "CREATE INDEX idx_documents_storage_object "
+                "ON documents(storage_type, bucket_name, object_name(255))"
+            ))
+            logger.info("[知识库] documents 表 MinIO 存储索引已自动补齐 索引名=idx_documents_storage_object")
 
     def seed_default_dictionaries(self, session: Session) -> None:
         """初始化系统默认字典项，已有字典项只更新展示信息。"""
@@ -658,12 +667,15 @@ class KnowledgeStore:
         with orm_session_context() as session:
             return session.get(DocumentEntity, document_id)
 
-    def list_documents(self) -> list[DocumentEntity]:
+    def list_documents(self, *, include_training: bool = False) -> list[DocumentEntity]:
         """查询全部未删除文档。"""
 
+        conditions = [DocumentEntity.status != "deleted"]
+        if not include_training:
+            conditions.append(DocumentEntity.collection_name.not_in(TRAINING_COLLECTION_NAMES))
         statement = (
             select(DocumentEntity)
-            .where(DocumentEntity.status != "deleted")
+            .where(*conditions)
             .order_by(DocumentEntity.created_at.desc())
         )
         with orm_session_context() as session:
@@ -701,6 +713,16 @@ class KnowledgeStore:
         """把文档标记为删除。"""
 
         self.update_document_status(document_id, "deleted")
+
+    def delete_document(self, document_id: str) -> bool:
+        """从 documents 表物理删除文件资产记录。"""
+
+        with orm_session_context() as session:
+            document = session.get(DocumentEntity, document_id)
+            if document is None:
+                return False
+            session.delete(document)
+            return True
 
     def ensure_conversation(
             self,
