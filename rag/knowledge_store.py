@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, inspect, or_, select, text
 from sqlalchemy.orm import Session
 
 from domain.entities import (
@@ -222,9 +222,40 @@ class KnowledgeStore:
         if _MYSQL_DEFAULT_DICTIONARY_SYNCED:
             return
         with orm_session_context() as session:
+            self.ensure_document_storage_columns(session)
             self.seed_default_dictionaries(session)
         _MYSQL_DEFAULT_DICTIONARY_SYNCED = True
         self.refresh_all_dictionary_cache()
+
+    @staticmethod
+    def ensure_document_storage_columns(session: Session) -> None:
+        """确保 documents 表具备 MinIO 存储字段，便于旧库平滑启动。"""
+
+        bind = session.get_bind()
+        inspector = inspect(bind)
+        columns = {column["name"] for column in inspector.get_columns("documents")}
+        ddl_statements: list[str] = []
+        if "storage_type" not in columns:
+            ddl_statements.append(
+                "ALTER TABLE documents ADD COLUMN storage_type VARCHAR(32) NOT NULL DEFAULT 'minio' "
+                "COMMENT '文件存储类型：minio 表示对象存储' AFTER file_path"
+            )
+        if "bucket_name" not in columns:
+            ddl_statements.append(
+                "ALTER TABLE documents ADD COLUMN bucket_name VARCHAR(128) NULL COMMENT 'MinIO 桶名' AFTER storage_type"
+            )
+        if "object_name" not in columns:
+            ddl_statements.append(
+                "ALTER TABLE documents ADD COLUMN object_name VARCHAR(1024) NULL COMMENT 'MinIO 对象路径' AFTER bucket_name"
+            )
+        if "public_url" not in columns:
+            ddl_statements.append(
+                "ALTER TABLE documents ADD COLUMN public_url VARCHAR(2048) NULL COMMENT 'MinIO 公共访问地址' AFTER object_name"
+            )
+        for ddl_statement in ddl_statements:
+            session.execute(text(ddl_statement))
+        if ddl_statements:
+            logger.info("[知识库] documents 表 MinIO 存储字段已自动补齐 字段数量=%s", len(ddl_statements))
 
     def seed_default_dictionaries(self, session: Session) -> None:
         """初始化系统默认字典项，已有字典项只更新展示信息。"""
@@ -559,6 +590,10 @@ class KnowledgeStore:
             file_type: str,
             file_md5: str,
             file_size: int,
+            storage_type: str = "minio",
+            bucket_name: str | None = None,
+            object_name: str | None = None,
+            public_url: str | None = None,
             status: str = "uploaded",
             collection_name: str = "agent",
             document_type: str = "text",
@@ -571,6 +606,10 @@ class KnowledgeStore:
             document_id=document_id,
             filename=filename,
             file_path=file_path,
+            storage_type=storage_type,
+            bucket_name=bucket_name,
+            object_name=object_name,
+            public_url=public_url,
             file_type=file_type,
             file_md5=file_md5,
             file_size=int(file_size),

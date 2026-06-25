@@ -8,6 +8,7 @@ from qdrant_client import QdrantClient, models  # QdrantClient 用于按 documen
 from model.factory import embed_model  # embedding 模型，用于把文本分片转成向量
 from rag.document_parser import DocumentParser  # 通用文档解析器，负责识别、切分和 FAQ 抽取
 from rag.file_processors import FileProcessorFactory  # 文件处理器工厂，根据类型选择具体读取策略
+from infrastructure.file_storage_service import get_file_storage_service  # MinIO 文件读取服务
 from utils.config_handler import qdrant_conf  # 读取 config/qdrant.yml 中的向量库配置
 from utils.file_handler import (  # 文件处理工具
     pdf_loader,  # PDF 加载器
@@ -537,15 +538,22 @@ class VectorStoreService:
         它会先删除该 document_id 的旧向量，再写入新向量。
         """
 
-        file_path = document["file_path"]
         document_id = document["document_id"]
         filename = document["filename"]
         file_md5 = document["file_md5"]
         version = int(document["version"])
+        object_name = str(document.get("object_name") or "").strip()
+        if not object_name:
+            raise ValueError(f"文件 {document_id} 缺少 MinIO 对象路径，请先完成历史文件迁移")
 
-        documents = self.get_file_documents(file_path)
+        with get_file_storage_service().downloaded_temp_file(
+                bucket_name=document.get("bucket_name"),
+                object_name=object_name,
+                filename=filename,
+        ) as file_path:
+            documents = self.get_file_documents(file_path)
         if not documents:
-            raise ValueError(f"文件 {file_path} 没有有效文本内容")
+            raise ValueError(f"文件 {filename} 没有有效文本内容")
 
         document_type = document_type or document.get("document_type") or "text"
         split_strategy = split_strategy or document.get("split_strategy") or "recursive"
@@ -561,7 +569,7 @@ class VectorStoreService:
         )
 
         if not index_documents:
-            raise ValueError(f"文件 {file_path} 分片后没有有效文本内容")
+            raise ValueError(f"文件 {filename} 分片后没有有效文本内容")
 
         self.delete_document_vectors(document_id, collection_name=self.collection_name)
         self.vector_store.add_documents(index_documents)

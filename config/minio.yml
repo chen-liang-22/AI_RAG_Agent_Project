@@ -38,3 +38,8 @@ public_base_url: http://127.0.0.1:9000
 # 公共桶通常建议手动创建后再用。
 auto_create_bucket: false
 
+# 是否自动把桶设置为公开读取。
+# 枚举：
+# - true：后端首次访问桶时自动写入 GetObject 公开读策略，浏览器可直接打开 public_base_url 拼出的文件地址。
+# - false：保持桶私有，只能通过 MinIO 控制台或后端签名地址访问。
+public_read: true

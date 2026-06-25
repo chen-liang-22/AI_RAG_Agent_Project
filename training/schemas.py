@@ -30,7 +30,7 @@ class TrainingKnowledgeBatchResponse(BaseModel):
     document_id: str | None = None  # 关联的 documents 文件 ID。
     source_type: str  # 来源类型，例如 lms_case。
     source_file: str  # 上传文件名。
-    file_path: str | None = None  # 原始文件在服务端的保存路径，用于预览和排查。
+    file_path: str | None = None  # 文件存储 URI，MinIO 模式下格式为 minio://桶名/对象路径。
     file_md5: str | None = None  # 文件 MD5，用于判断重复上传。
     version_group_id: str | None = None  # 版本组 ID，同一个文件多次发布会归到同一版本组。
     version_no: int = 1  # 版本号，从 1 开始递增。

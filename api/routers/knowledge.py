@@ -1,5 +1,4 @@
 import json
-import os
 import uuid
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
@@ -18,19 +17,18 @@ from api.schemas import (
 )
 from api.services.common_services import _document_to_response, _get_knowledge_store, build_document_dictionary_snapshot
 from api.services.indexing_services import _index_document, _sync_data_files_to_documents
-from api.services.upload_cleanup_services import delete_upload_path
 from api.services.upload_services import (
+    _delete_preview_file,
     _get_preview_file,
-    _move_upload_file,
+    _promote_preview_file,
     _recommend_upload_split_strategy,
-    _remove_created_upload_dir,
     _sanitize_upload_filename,
     _save_preview_file,
     _validate_file_type,
 )
-from utils.file_handler import get_file_md5_hex, pdf_loader
+from infrastructure.file_storage_service import get_file_storage_service
+from utils.file_handler import pdf_loader
 from utils.logger_handler import logger
-from utils.path_tool import get_abs_path
 from utils.qdrant_options import get_qdrant_collection_name
 from utils.qdrant_options import normalize_qdrant_collection_name
 
@@ -47,42 +45,6 @@ def _dictionary_status(dictionary_code: str, item_code: str) -> str:
     if hasattr(store, "normalize_dictionary_code"):
         return store.normalize_dictionary_code(dictionary_code, item_code)
     return item_code
-
-
-def _is_path_inside(child_path: str, parent_path: str) -> bool:
-    """判断 child_path 是否位于 parent_path 下。
-
-    文件预览会读取 documents.file_path 指向的本地文件。
-    这里先做路径白名单校验，避免数据库中异常路径导致接口读取项目外文件。
-    """
-
-    try:
-        return os.path.commonpath([parent_path, child_path]) == parent_path
-    except ValueError:
-        return False
-
-
-def _validate_preview_file_path(file_path: str) -> str:
-    """校验知识库文件是否允许被预览，并返回绝对路径。"""
-
-    target_path = os.path.abspath(file_path)
-    uploads_root = os.path.abspath(get_abs_path("uploads"))
-    data_root = os.path.abspath(get_abs_path("data"))
-    preview_root = os.path.abspath(os.path.join(uploads_root, "_preview"))
-
-    allowed_roots = (uploads_root, data_root)
-    if not any(_is_path_inside(target_path, root) for root in allowed_roots):
-        logger.warning(f"[知识库] 拒绝预览非知识库目录文件 路径={target_path}")
-        raise HTTPException(status_code=403, detail="该文件路径不允许预览")
-
-    if _is_path_inside(target_path, preview_root):
-        logger.warning(f"[知识库] 拒绝预览临时上传目录文件 路径={target_path}")
-        raise HTTPException(status_code=403, detail="临时上传文件不允许通过正式预览接口访问")
-
-    if not os.path.isfile(target_path):
-        raise HTTPException(status_code=404, detail="原始文件不存在，可能已被移动或删除")
-
-    return target_path
 
 
 def _read_text_file_preview(file_path: str, max_chars: int) -> tuple[str, bool]:
@@ -150,28 +112,35 @@ def _read_pdf_file_preview(file_path: str, max_chars: int) -> tuple[str, bool, i
 
 
 def _read_knowledge_file_preview(document: dict, max_chars: int) -> dict:
-    """按文件类型读取预览文本。"""
+    """从 MinIO 下载原文件并按文件类型读取预览文本。"""
 
-    file_path = _validate_preview_file_path(document["file_path"])
     file_type = str(document["file_type"]).lower().lstrip(".")
+    object_name = str(document.get("object_name") or "").strip()
+    if not object_name:
+        raise HTTPException(status_code=400, detail="文件缺少 MinIO 对象路径，请先完成历史文件迁移")
 
-    if file_type == "txt":
-        content, truncated = _read_text_file_preview(file_path, max_chars)
-        return {
-            "preview_type": "text",
-            "content": content,
-            "truncated": truncated,
-            "page_count": None,
-        }
+    with get_file_storage_service().downloaded_temp_file(
+            bucket_name=document.get("bucket_name"),
+            object_name=object_name,
+            filename=document["filename"],
+    ) as file_path:
+        if file_type == "txt":
+            content, truncated = _read_text_file_preview(file_path, max_chars)
+            return {
+                "preview_type": "text",
+                "content": content,
+                "truncated": truncated,
+                "page_count": None,
+            }
 
-    if file_type == "pdf":
-        content, truncated, page_count = _read_pdf_file_preview(file_path, max_chars)
-        return {
-            "preview_type": "pdf_text",
-            "content": content,
-            "truncated": truncated,
-            "page_count": page_count,
-        }
+        if file_type == "pdf":
+            content, truncated, page_count = _read_pdf_file_preview(file_path, max_chars)
+            return {
+                "preview_type": "pdf_text",
+                "content": content,
+                "truncated": truncated,
+                "page_count": page_count,
+            }
 
     raise HTTPException(status_code=400, detail=f"当前文件类型不支持预览：{file_type}")
 
@@ -187,27 +156,27 @@ def preview_knowledge_file(file: UploadFile = File(...)) -> KnowledgeUploadPrevi
     logger.info(f"[知识库] 上传预览开始 文件名={filename} 上传编号={upload_id}")
 
     try:
-        file_path, file_size = _save_preview_file(file, filename, upload_id)
+        stored_file = _save_preview_file(file, filename, upload_id)
     except HTTPException:
         raise
     except Exception as exc:
         logger.error(f"[知识库] 上传预览保存失败 文件名={filename} 错误={exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"上传文件保存失败：{exc}") from exc
 
-    file_md5 = get_file_md5_hex(file_path)
-    if not file_md5:
-        _remove_created_upload_dir(os.path.dirname(file_path))
-        raise HTTPException(status_code=500, detail="上传文件 MD5 计算失败")
-
     store = _get_knowledge_store()
-    duplicate_document = store.find_active_document_by_md5(file_md5)
+    duplicate_document = store.find_active_document_by_md5(stored_file.file_md5)
 
     try:
         from infrastructure.vector_store_service import VectorStoreService
 
-        preview = VectorStoreService().preview_file(filename=filename, file_path=file_path)
+        with get_file_storage_service().downloaded_temp_file(
+                bucket_name=stored_file.bucket_name,
+                object_name=stored_file.object_name,
+                filename=stored_file.filename,
+        ) as file_path:
+            preview = VectorStoreService().preview_file(filename=filename, file_path=file_path)
     except Exception as exc:
-        _remove_created_upload_dir(os.path.dirname(file_path))
+        _delete_preview_file(upload_id)
         logger.error(f"[知识库] 上传预览解析失败 文件名={filename} 错误={exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"文件预解析失败：{exc}") from exc
 
@@ -215,8 +184,8 @@ def preview_knowledge_file(file: UploadFile = File(...)) -> KnowledgeUploadPrevi
         upload_id=upload_id,
         filename=filename,
         file_type=file_type,
-        file_size=file_size,
-        file_md5=file_md5,
+        file_size=stored_file.file_size,
+        file_md5=stored_file.file_md5,
         duplicate=duplicate_document is not None,
         duplicate_document=_document_to_response(duplicate_document) if duplicate_document else None,
         detected_type=preview["document_type"],
@@ -248,17 +217,15 @@ def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeU
     """确认预览结果，并正式写入 MySQL 业务表和 Qdrant。"""
 
     upload_id = request.upload_id.strip()
-    preview_dir, preview_path = _get_preview_file(upload_id)
-    filename = _sanitize_upload_filename(os.path.basename(preview_path))
+    preview_file = _get_preview_file(upload_id)
+    filename = _sanitize_upload_filename(preview_file.filename)
     file_type = _validate_file_type(filename)
-    file_md5 = get_file_md5_hex(preview_path)
-    file_size = os.path.getsize(preview_path)
 
     store = _get_knowledge_store()
     collection_name = normalize_qdrant_collection_name(request.collection_name)
-    duplicate_document = store.find_active_document_by_md5(file_md5, collection_name=collection_name)
+    duplicate_document = store.find_active_document_by_md5(preview_file.file_md5, collection_name=collection_name)
     if duplicate_document is not None:
-        _remove_created_upload_dir(preview_dir)
+        _delete_preview_file(upload_id)
         return KnowledgeUploadResponse(
             status=_dictionary_status("knowledge_result_status", "duplicate"),
             message="相同内容的文件已经存在，本次没有重复入库。",
@@ -267,19 +234,22 @@ def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeU
 
     document_id = f"doc_{uuid.uuid4().hex}"
     try:
-        file_path = _move_upload_file(preview_path, document_id, filename)
-        _remove_created_upload_dir(preview_dir)
+        stored_file = _promote_preview_file(upload_id, document_id)
     except Exception as exc:
-        logger.error(f"[知识库] 上传确认移动文件失败 上传编号={upload_id} 错误={exc}", exc_info=True)
+        logger.error(f"[知识库] 上传确认转正式对象失败 上传编号={upload_id} 错误={exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"临时文件转正式文件失败：{exc}") from exc
 
     document = store.create_document(
         document_id=document_id,
         filename=filename,
-        file_path=file_path,
+        file_path=stored_file.file_path,
         file_type=file_type,
-        file_md5=file_md5,
-        file_size=file_size,
+        file_md5=stored_file.file_md5,
+        file_size=stored_file.file_size,
+        storage_type="minio",
+        bucket_name=stored_file.bucket_name,
+        object_name=stored_file.object_name,
+        public_url=stored_file.public_url,
         status=_dictionary_status("document_status", "uploaded"),
         collection_name=collection_name,
         document_type=request.document_type,
@@ -345,8 +315,7 @@ def preview_indexed_knowledge_file(
     """预览已入库知识库文件的原始文本内容。
 
     这个接口服务于知识库管理页面：
-    - 它读取 documents 表中的 file_path。
-    - 它只允许访问 uploads/ 和 data/ 下的知识库文件。
+    - 它读取 documents 表中的 MinIO 对象路径。
     - 它不访问 Qdrant，不触发 embedding，不改变索引。
     """
 
@@ -381,7 +350,7 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
     这里的“删除”是知识库层面的删除：
     - Qdrant 中该 document_id 的 points 会被删除。
     - MySQL documents 中该文件会标记为 deleted。
-    - uploads/{document_id} 下的原始文件会被物理删除。
+    - MinIO 中该文件对象会被物理删除。
     """
 
     logger.info(f"[知识库] 删除文件 文档编号={document_id}")
@@ -396,7 +365,10 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
 
         VectorStoreService.delete_document_vectors(document_id, collection_name=document.get("collection_name"))
         store.mark_document_deleted(document_id)
-        delete_upload_path(document.get("file_path"), document_id=document_id)
+        get_file_storage_service().delete_object(
+            bucket_name=document.get("bucket_name"),
+            object_name=document.get("object_name"),
+        )
     except Exception as exc:
         logger.error(f"[知识库] 删除文件失败 文档编号={document_id} 错误={exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"知识库文件删除失败：{exc}") from exc

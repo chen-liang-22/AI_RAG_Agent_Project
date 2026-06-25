@@ -84,6 +84,9 @@ class TrainingRepository:
         batch.document_file_md5 = document.file_md5 if document else None
         batch.document_file_type = document.file_type if document else None
         batch.document_file_size = document.file_size if document else None
+        batch.document_bucket_name = document.bucket_name if document else None
+        batch.document_object_name = document.object_name if document else None
+        batch.document_public_url = document.public_url if document else None
         batch.document_status = document.status if document else None
         return batch
 

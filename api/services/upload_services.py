@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import shutil
 
 from fastapi import HTTPException, UploadFile
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -11,10 +10,10 @@ from api.services.common_services import (
     _normalize_document_structure_type,
     _normalize_split_strategy,
 )
+from infrastructure.file_storage_service import StoredFileInfo, get_file_storage_service
 from model.factory import get_chat_model, get_chat_model_name_for_mode
 from utils.config_handler import qdrant_conf
 from utils.logger_handler import logger
-from utils.path_tool import get_abs_path
 
 
 def _sanitize_upload_filename(filename: str | None) -> str:
@@ -43,72 +42,75 @@ def _validate_file_type(filename: str) -> str:
     return file_type
 
 
+_PREVIEW_UPLOADS: dict[str, StoredFileInfo] = {}
+
+
 def _remove_created_upload_dir(upload_dir: str) -> None:
-    """删除本次上传刚创建的临时目录。"""
+    """兼容旧调用的清理函数；MinIO 模式下不再清理本地上传目录。"""
 
-    uploads_root = os.path.abspath(get_abs_path("uploads"))
-    target_dir = os.path.abspath(upload_dir)
+    logger.debug("[知识库] MinIO 模式无需清理本地上传目录 目录=%s", upload_dir)
 
-    if os.path.commonpath([uploads_root, target_dir]) != uploads_root:
-        logger.warning("[知识库] 跳过不安全的上传目录清理 目录=%s", target_dir)
-        return
 
-    shutil.rmtree(target_dir, ignore_errors=True)
+def _save_preview_file(file: UploadFile, filename: str, upload_id: str) -> StoredFileInfo:
+    """把上传文件保存到 MinIO 预览对象。"""
+
+    stored_file = get_file_storage_service().save_upload_file(
+        file=file,
+        filename=filename,
+        prefix="previews",
+        owner_id=upload_id,
+    )
+    _PREVIEW_UPLOADS[upload_id] = stored_file
+    logger.info(
+        "[知识库] 上传预览文件已保存到 MinIO 上传编号=%s 对象名=%s",
+        upload_id,
+        stored_file.object_name,
+    )
+    return stored_file
 
 
 def _move_upload_file(source_path: str, document_id: str, filename: str) -> str:
-    """把临时上传文件移动到正式 uploads/{document_id}/ 目录。"""
+    """兼容旧接口的移动函数；MinIO 模式下不再移动本地文件。"""
 
-    upload_dir = os.path.join(get_abs_path("uploads"), document_id)
-    os.makedirs(upload_dir, exist_ok=True)
-    target_path = os.path.join(upload_dir, filename)
-    shutil.move(source_path, target_path)
-    return target_path
+    raise RuntimeError("MinIO 模式不支持移动本地上传文件，请使用 _promote_preview_file")
 
 
-def _save_preview_file(file: UploadFile, filename: str, upload_id: str) -> tuple[str, int]:
-    """把上传文件保存到临时 preview 目录。"""
-
-    preview_dir = os.path.join(get_abs_path("uploads"), "_preview", upload_id)
-    os.makedirs(preview_dir, exist_ok=True)
-    file_path = os.path.join(preview_dir, filename)
-    file_size = 0
-
-    try:
-        with open(file_path, "wb") as target:
-            while True:
-                chunk = file.file.read(1024 * 1024)
-                if not chunk:
-                    break
-                file_size += len(chunk)
-                target.write(chunk)
-    except OSError:
-        _remove_created_upload_dir(preview_dir)
-        raise
-
-    if file_size <= 0:
-        _remove_created_upload_dir(preview_dir)
-        raise HTTPException(status_code=400, detail="上传文件不能为空")
-
-    return file_path, file_size
-
-
-def _get_preview_file(upload_id: str) -> tuple[str, str]:
-    """根据上传编号找到临时预览文件，并返回预览目录和文件路径。"""
+def _get_preview_file(upload_id: str) -> StoredFileInfo:
+    """根据上传编号找到 MinIO 临时预览对象。"""
 
     clean_upload_id = upload_id.strip()
-    preview_root = os.path.abspath(os.path.join(get_abs_path("uploads"), "_preview"))
-    preview_dir = os.path.abspath(os.path.join(preview_root, clean_upload_id))
-
-    if os.path.commonpath([preview_root, preview_dir]) != preview_root or not os.path.isdir(preview_dir):
+    stored_file = _PREVIEW_UPLOADS.get(clean_upload_id)
+    if stored_file is None:
         raise HTTPException(status_code=404, detail=f"临时上传不存在：{clean_upload_id}")
+    return stored_file
 
-    files = [name for name in os.listdir(preview_dir) if os.path.isfile(os.path.join(preview_dir, name))]
-    if len(files) != 1:
-        raise HTTPException(status_code=400, detail="临时上传文件状态异常")
 
-    filename = _sanitize_upload_filename(files[0])
-    return preview_dir, os.path.join(preview_dir, filename)
+def _delete_preview_file(upload_id: str) -> None:
+    """删除 MinIO 临时预览对象。"""
+
+    stored_file = _PREVIEW_UPLOADS.pop(upload_id.strip(), None)
+    if stored_file is None:
+        return
+    try:
+        get_file_storage_service().delete_object(
+            bucket_name=stored_file.bucket_name,
+            object_name=stored_file.object_name,
+        )
+    except Exception as exc:
+        logger.warning("[知识库] 删除 MinIO 临时预览对象失败 上传编号=%s 错误=%s", upload_id, exc)
+
+
+def _promote_preview_file(upload_id: str, document_id: str) -> StoredFileInfo:
+    """把 MinIO 预览对象复制为正式知识库对象，并删除临时对象。"""
+
+    stored_file = _get_preview_file(upload_id)
+    final_file = get_file_storage_service().copy_object(
+        source=stored_file,
+        prefix="documents",
+        owner_id=document_id,
+    )
+    _delete_preview_file(upload_id)
+    return final_file
 
 
 def _slice_text_window(text: str, start: int, length: int) -> str:
@@ -240,12 +242,17 @@ def _get_recommendation_model_mode() -> str:
 def _recommend_upload_split_strategy(upload_id: str) -> dict:
     """读取临时上传文件样本，并调用低延迟模型推荐文档类型和切分策略。"""
 
-    _, file_path = _get_preview_file(upload_id)
-    filename = os.path.basename(file_path)
+    stored_file = _get_preview_file(upload_id)
+    filename = stored_file.filename
     file_type = _validate_file_type(filename)
     from infrastructure.vector_store_service import VectorStoreService
 
-    documents = VectorStoreService().get_file_documents(file_path)
+    with get_file_storage_service().downloaded_temp_file(
+            bucket_name=stored_file.bucket_name,
+            object_name=stored_file.object_name,
+            filename=stored_file.filename,
+    ) as file_path:
+        documents = VectorStoreService().get_file_documents(file_path)
     full_text = "\n\n".join(document.page_content for document in documents)
     sample_text = _build_structure_sample(full_text, max_chars=10000)
     if not sample_text:

@@ -1,10 +1,10 @@
 import json
 import os
 import re
-import shutil
 import time
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any
 
@@ -13,7 +13,7 @@ from fastapi import HTTPException, UploadFile
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from api.services.upload_cleanup_services import delete_upload_path
+from infrastructure.file_storage_service import get_file_storage_service
 from infrastructure.vector_store_service import VectorStoreService
 from model.factory import get_chat_model
 from rag.file_processors import FileProcessorFactory
@@ -60,7 +60,6 @@ from training.schemas import (
     TrainingTurnResponse,
 )
 from utils.database_connection import DatabaseErrorTypes
-from utils.file_handler import get_file_md5_hex
 from utils.logger_handler import logger
 from utils.path_tool import get_abs_path
 
@@ -149,7 +148,7 @@ class SalesTrainingService:
         """上传训练资料并生成待确认预览。
 
         主流程：
-        1. 保存上传文件到 uploads/batch_xxx；
+        1. 保存上传文件到 MinIO；
         2. 创建上传批次记录，状态为 parsing；
         3. 根据 source_type 选择切片策略；
         4. 对切片结果做质量评估；
@@ -168,29 +167,28 @@ class SalesTrainingService:
         # document_id 管文件台账，batch_id 管训练资料的审核、发布、回滚流程。
         document_id = f"doc_{uuid.uuid4().hex}"
         batch_id = f"batch_{uuid.uuid4().hex}"
-        # 拼出本文件上传目录的绝对路径，例如 uploads/doc_xxx，用来按文件维度保存原始资料。
-        upload_dir = get_abs_path(os.path.join("uploads", document_id))
-        # 确保上传目录存在；exist_ok=True 表示目录已存在时不报错，便于重复执行或异常重试。
-        os.makedirs(upload_dir, exist_ok=True)
-        # 拼出原始文件最终保存路径，把清洗后的文件名放到本批次上传目录下。
-        file_path = os.path.join(upload_dir, filename)
-        # 以二进制写入模式打开本地目标文件：w 表示写入，b 表示二进制。
-        # 如果文件不存在会自动创建；如果文件已存在会先清空，适配 txt、pdf、docx 等不同文件格式。
-        with open(file_path, "wb") as target:
-            # 把 FastAPI 上传文件流复制到本地文件中，完成原始文件落盘保存。
-            shutil.copyfileobj(file.file, target)
+        # 原始文件直接持久化到 MinIO，本地只在解析时使用临时下载文件。
+        stored_file = get_file_storage_service().save_upload_file(
+            file=file,
+            filename=filename,
+            prefix="training",
+            owner_id=document_id,
+        )
 
         # 阶段 3：计算文件 MD5 做内容级去重。
         # 只要文件内容完全相同，就直接复用已经 published 的历史批次。
-        # 根据本地保存后的原始文件计算 MD5，MD5 可以理解为文件内容的唯一指纹。
-        file_md5 = get_file_md5_hex(file_path)
+        # 文件上传 MinIO 前已经计算过 MD5，MD5 可以理解为文件内容的唯一指纹。
+        file_md5 = stored_file.file_md5
         # 用文件 MD5 查询是否已经存在发布成功的同内容批次，避免重复解析和重复写入向量库。
         existing_batch = self.repository.get_published_batch_by_md5(file_md5)
         # Python 中有值的对象会被当作 True；这里表示查到了重复文件批次，就进入复用逻辑。
         if existing_batch:
             # 文件内容完全一样时不重复写入向量库，直接返回已有批次。
-            # 临时上传文件已经落到新目录里，这里删除它，避免 uploads 下堆重复文件。
-            shutil.rmtree(upload_dir, ignore_errors=True)
+            # 刚上传到 MinIO 的重复对象不再保留，避免对象存储堆积重复文件。
+            get_file_storage_service().delete_object(
+                bucket_name=stored_file.bucket_name,
+                object_name=stored_file.object_name,
+            )
             logger.info(
                 "[销售训练] 训练知识命中重复文件 已复用批次=%s 文件名=%s",
                 existing_batch["batch_id"],
@@ -213,10 +211,14 @@ class SalesTrainingService:
         self.knowledge_store.create_document(
             document_id=document_id,
             filename=filename,
-            file_path=file_path,
+            file_path=stored_file.file_path,
             file_type=file_type,
             file_md5=file_md5,
-            file_size=os.path.getsize(file_path),
+            file_size=stored_file.file_size,
+            storage_type="minio",
+            bucket_name=stored_file.bucket_name,
+            object_name=stored_file.object_name,
+            public_url=stored_file.public_url,
             status="indexing",
             collection_name=self.training_collection_name,
             document_type="text",
@@ -258,24 +260,25 @@ class SalesTrainingService:
 
         try:
             # 阶段 5：解析文件并生成预览切片；待审核正文只写入临时向量库。
-            chunks = self._parse_training_chunks(
-                file_path=file_path,
-                batch_id=batch_id,
-                source_file=filename,
-                source_type=source_type,
-            )
-            if not chunks:
-                raise ValueError("文件没有切出有效训练知识")
+            with self._download_batch_file(batch) as file_path:
+                chunks = self._parse_training_chunks(
+                    file_path=file_path,
+                    batch_id=batch_id,
+                    source_file=filename,
+                    source_type=source_type,
+                )
+                if not chunks:
+                    raise ValueError("文件没有切出有效训练知识")
 
-            # 阶段 6：计算切片质量报告；质量较低时才尝试 LLM 兜底切分。
-            chunks, quality_report = self._improve_training_chunks_if_needed(
-                chunks=chunks,
-                file_path=file_path,
-                batch_id=batch_id,
-                source_file=filename,
-                source_type=source_type,
-                model_mode=model_mode,
-            )
+                # 阶段 6：计算切片质量报告；质量较低时才尝试 LLM 兜底切分。
+                chunks, quality_report = self._improve_training_chunks_if_needed(
+                    chunks=chunks,
+                    file_path=file_path,
+                    batch_id=batch_id,
+                    source_file=filename,
+                    source_type=source_type,
+                    model_mode=model_mode,
+                )
             # 阶段 7：把待审核切片写入临时向量库，前端预览也从临时库按 batch_id 读取。
             point_count = self._write_staging_chunks(batch=batch, chunks=chunks, source_type=source_type)
             # 阶段 8：上传预览完成，等待人工确认发布。
@@ -348,7 +351,6 @@ class SalesTrainingService:
         """
 
         batch = self._get_active_batch(batch_id)
-        file_path = self._resolve_batch_file_path(batch)
         source_file = str(self._batch_file_info(batch).get("source_file") or batch.get("source_file") or "")
         file_type = source_file.rsplit(".", 1)[-1].lower() if "." in source_file else ""
         safe_max_chars = max(500, min(100000, max_chars))
@@ -358,25 +360,27 @@ class SalesTrainingService:
             content = stored_preview["content"]
             truncated = stored_preview["truncated"]
             preview_type = "saved_chunks"
-        elif file_type == "txt":
-            with open(file_path, "r", encoding="utf-8", errors="replace") as file:
-                content = file.read(safe_max_chars + 1)
-            truncated = len(content) > safe_max_chars
-            preview_type = "text"
-        elif file_type in ALLOWED_TRAINING_FILE_TYPES:
-            # 兼容旧批次：如果数据库没有切片，再临时解析原文件做只读预览。
-            strategy = KnowledgeIngestStrategyFactory.create(batch.get("source_type") or "lms_case")
-            chunks = strategy.parse_chunks(file_path, {
-                "batch_id": batch_id,
-                "source_file": source_file,
-                "source_type": batch.get("source_type"),
-                "visibility_default": batch.get("visibility_default") or DEFAULT_TRAINING_VISIBILITY,
-            })
-            content = "\n\n".join(f"{chunk.case_part}\n{chunk.text.strip()}" for chunk in chunks)[:safe_max_chars]
-            truncated = len(content) >= safe_max_chars
-            preview_type = "document_text"
         else:
-            raise HTTPException(status_code=400, detail=f"当前训练资料类型不支持预览：{file_type}")
+            with self._download_batch_file(batch) as file_path:
+                if file_type == "txt":
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as file:
+                        content = file.read(safe_max_chars + 1)
+                    truncated = len(content) > safe_max_chars
+                    preview_type = "text"
+                elif file_type in ALLOWED_TRAINING_FILE_TYPES:
+                    # 如果数据库没有切片，再临时解析原文件做只读预览。
+                    strategy = KnowledgeIngestStrategyFactory.create(batch.get("source_type") or "lms_case")
+                    chunks = strategy.parse_chunks(file_path, {
+                        "batch_id": batch_id,
+                        "source_file": source_file,
+                        "source_type": batch.get("source_type"),
+                        "visibility_default": batch.get("visibility_default") or DEFAULT_TRAINING_VISIBILITY,
+                    })
+                    content = "\n\n".join(f"{chunk.case_part}\n{chunk.text.strip()}" for chunk in chunks)[:safe_max_chars]
+                    truncated = len(content) >= safe_max_chars
+                    preview_type = "document_text"
+                else:
+                    raise HTTPException(status_code=400, detail=f"当前训练资料类型不支持预览：{file_type}")
 
         return TrainingKnowledgePreviewResponse(
             batch=self._batch_response(batch),
@@ -390,7 +394,7 @@ class SalesTrainingService:
 
         删除动作包含两层：
         1. Qdrant 正式库和临时库中按 batch_id 删除本批次向量点；
-        2. 业务数据库批次状态改成 deleted，并同步物理删除 uploads 原文件。
+        2. 业务数据库批次状态改成 deleted，并同步物理删除 MinIO 原文件。
         """
 
         batch = self._get_active_batch(batch_id)
@@ -406,7 +410,10 @@ class SalesTrainingService:
             document_id = str(batch.get("document_id") or "").strip()
             if document_id:
                 self.knowledge_store.mark_document_deleted(document_id)
-            delete_upload_path(file_info.get("file_path"), document_id=document_id or None)
+            get_file_storage_service().delete_object(
+                bucket_name=file_info.get("bucket_name"),
+                object_name=file_info.get("object_name"),
+            )
         except HTTPException:
             raise
         except Exception as exc:
@@ -561,32 +568,32 @@ class SalesTrainingService:
         if batch["status"] not in {"pending_review", "parsing_failed", "publish_failed"}:
             raise HTTPException(status_code=400, detail=f"当前状态不允许重新切分：{batch['status']}")
 
-        file_path = self._resolve_batch_file_path(batch)
         source_type = str(batch.get("source_type") or "lms_case")
         source_file = str(batch.get("source_file") or "")
         try:
-            rule_chunks = self._parse_training_chunks(
-                file_path=file_path,
-                batch_id=batch_id,
-                source_file=source_file,
-                source_type=source_type,
-            )
-            if use_llm_fallback:
-                chunks, quality_report = self._force_llm_reparse_chunks(
-                    rule_chunks=rule_chunks,
+            with self._download_batch_file(batch) as file_path:
+                rule_chunks = self._parse_training_chunks(
                     file_path=file_path,
                     batch_id=batch_id,
                     source_file=source_file,
                     source_type=source_type,
-                    model_mode=model_mode,
                 )
-            else:
-                evaluator = TrainingIngestQualityEvaluator()
-                chunks = rule_chunks
-                quality_report = evaluator.evaluate(chunks).to_dict()
-                quality_report["selected_splitter"] = "rule_config"
-                quality_report["llm_fallback_used"] = False
-                quality_report["rule_score"] = quality_report.get("score")
+                if use_llm_fallback:
+                    chunks, quality_report = self._force_llm_reparse_chunks(
+                        rule_chunks=rule_chunks,
+                        file_path=file_path,
+                        batch_id=batch_id,
+                        source_file=source_file,
+                        source_type=source_type,
+                        model_mode=model_mode,
+                    )
+                else:
+                    evaluator = TrainingIngestQualityEvaluator()
+                    chunks = rule_chunks
+                    quality_report = evaluator.evaluate(chunks).to_dict()
+                    quality_report["selected_splitter"] = "rule_config"
+                    quality_report["llm_fallback_used"] = False
+                    quality_report["rule_score"] = quality_report.get("score")
 
             if not chunks:
                 raise ValueError("重新切分没有生成有效训练切片")
@@ -2184,7 +2191,7 @@ class SalesTrainingService:
         """读取训练资料关联的文件基础信息。
 
         新数据以 documents 表为准；历史批次可能没有 document_id，
-        因此仍保留 source_file、file_path、file_md5 旧字段兜底。
+        新数据以 documents 表为准；旧批次如果缺少 MinIO 对象路径，需要先执行历史文件迁移。
         """
 
         document_id = str(row.get("document_id") or "").strip()
@@ -2192,6 +2199,9 @@ class SalesTrainingService:
         joined_source_file = row.get("document_filename")
         joined_file_path = row.get("document_file_path")
         joined_file_md5 = row.get("document_file_md5")
+        joined_bucket_name = row.get("document_bucket_name")
+        joined_object_name = row.get("document_object_name")
+        joined_public_url = row.get("document_public_url")
         if document_id and not any((joined_source_file, joined_file_path, joined_file_md5)):
             document = self.knowledge_store.get_document(document_id)
         return {
@@ -2199,6 +2209,9 @@ class SalesTrainingService:
             "source_file": joined_source_file or (document or {}).get("filename") or row.get("source_file"),
             "file_path": joined_file_path or (document or {}).get("file_path") or row.get("file_path"),
             "file_md5": joined_file_md5 or (document or {}).get("file_md5") or row.get("file_md5"),
+            "bucket_name": joined_bucket_name or (document or {}).get("bucket_name"),
+            "object_name": joined_object_name or (document or {}).get("object_name"),
+            "public_url": joined_public_url or (document or {}).get("public_url"),
         }
 
     def _batch_response(self, row: dict[str, Any]) -> TrainingKnowledgeBatchResponse:
@@ -2239,30 +2252,20 @@ class SalesTrainingService:
             raise HTTPException(status_code=404, detail=f"训练资料不存在：{batch_id}")
         return batch
 
-    def _resolve_batch_file_path(self, batch: dict[str, Any]) -> str:
-        """获取训练资料原文件路径。
-
-        新数据从 documents 读取文件路径；旧批次可能没有 document_id。
-        为了兼容已经上传过的老资料，这里按 uploads/{batch_id}/{source_file} 再兜底找一次。
-        """
+    @contextmanager
+    def _download_batch_file(self, batch: dict[str, Any]) -> Iterator[str]:
+        """从 MinIO 下载训练资料原文件到临时路径。"""
 
         file_info = self._batch_file_info(batch)
-        file_path = str(file_info.get("file_path") or "").strip()
-        if not file_path:
-            file_path = get_abs_path(os.path.join("uploads", batch["batch_id"], batch["source_file"]))
-        return self._validate_training_file_path(file_path)
-
-    @staticmethod
-    def _validate_training_file_path(file_path: str) -> str:
-        """校验训练资料原文件路径是否允许读取。"""
-
-        target_path = os.path.abspath(file_path)
-        uploads_root = os.path.abspath(get_abs_path("uploads"))
-        if not os.path.commonpath([uploads_root, target_path]) == uploads_root:
-            raise HTTPException(status_code=403, detail="训练资料文件路径不允许预览")
-        if not os.path.isfile(target_path):
-            raise HTTPException(status_code=404, detail="训练资料原文件不存在")
-        return target_path
+        object_name = str(file_info.get("object_name") or "").strip()
+        if not object_name:
+            raise HTTPException(status_code=400, detail="训练资料缺少 MinIO 对象路径，请先完成历史文件迁移")
+        with get_file_storage_service().downloaded_temp_file(
+                bucket_name=file_info.get("bucket_name"),
+                object_name=object_name,
+                filename=str(file_info.get("source_file") or batch.get("source_file") or "training_file"),
+        ) as file_path:
+            yield file_path
 
     def _goal_response(self, row: dict[str, Any]) -> GoalSettingResponse:
         """把数据库训练设置行转换成 Pydantic 响应。"""

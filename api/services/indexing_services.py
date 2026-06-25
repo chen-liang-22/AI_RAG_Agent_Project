@@ -8,6 +8,7 @@ from api.services.common_services import (
     _normalize_document_structure_type,
     _normalize_split_strategy,
 )
+from infrastructure.file_storage_service import get_file_storage_service
 from rag.knowledge_store import KnowledgeStore
 from utils.config_handler import qdrant_conf
 from utils.file_handler import get_file_md5_hex, listdir_with_allowed_type
@@ -94,9 +95,9 @@ def _index_document(
 
 
 def _load_data_manifest() -> dict:
-    """读取 data/knowledge_manifest.yml，缺失时返回空配置。"""
+    """读取 config/knowledge_manifest.yml，缺失时返回空配置。"""
 
-    manifest_path = get_abs_path(os.path.join(qdrant_conf["data_path"], "knowledge_manifest.yml"))
+    manifest_path = get_abs_path(os.path.join("config", "knowledge_manifest.yml"))
     if not os.path.exists(manifest_path):
         return {"defaults": {}, "files": {}}
 
@@ -161,14 +162,24 @@ def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
             continue
 
         document_id = f"doc_{uuid.uuid4().hex}"
+        file_storage = get_file_storage_service()
+        stored_file = file_storage.client.upload_file(
+            file_path,
+            object_name=f"documents/{document_id}/{filename}",
+        )
+        storage_uri = file_storage.build_storage_uri(stored_file.bucket_name, stored_file.object_name)
         documents.append(
             store.create_document(
                 document_id=document_id,
                 filename=filename,
-                file_path=file_path,
+                file_path=storage_uri,
                 file_type=file_type,
                 file_md5=file_md5,
                 file_size=os.path.getsize(file_path),
+                storage_type="minio",
+                bucket_name=stored_file.bucket_name,
+                object_name=stored_file.object_name,
+                public_url=stored_file.public_url,
                 status="uploaded",
                 collection_name=manifest_entry["collection_name"],
                 document_type=manifest_entry["document_type"],

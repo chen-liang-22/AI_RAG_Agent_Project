@@ -95,7 +95,11 @@ class DocumentEntity(BaseOrmModel, DictMixin):
 
     document_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="文件唯一编号")
     filename: Mapped[str] = mapped_column(String(255), nullable=False, comment="原始文件名")
-    file_path: Mapped[str] = mapped_column(String(1024), nullable=False, comment="本地存储路径")
+    file_path: Mapped[str] = mapped_column(String(1024), nullable=False, comment="MinIO 存储 URI，格式为 minio://桶名/对象路径")
+    storage_type: Mapped[str] = mapped_column(String(32), nullable=False, default="minio", comment="文件存储类型")
+    bucket_name: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="MinIO 桶名")
+    object_name: Mapped[str | None] = mapped_column(String(1024), nullable=True, comment="MinIO 对象路径")
+    public_url: Mapped[str | None] = mapped_column(String(2048), nullable=True, comment="MinIO 公共访问地址")
     file_type: Mapped[str] = mapped_column(String(32), nullable=False, comment="文件扩展类型")
     file_md5: Mapped[str] = mapped_column(String(64), nullable=False, comment="文件内容 MD5")
     file_size: Mapped[int] = mapped_column(Integer, nullable=False, comment="文件大小，单位字节")

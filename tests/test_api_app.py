@@ -131,7 +131,6 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
     client = TestClient(app)
     data_path = get_abs_path("data")
     filename = next(name for name in os.listdir(data_path) if name.endswith(".txt"))
-    file_path = os.path.join(data_path, filename)
 
     class FakeKnowledgeStore:
         def get_document(self, document_id: str):
@@ -139,7 +138,11 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
             return {
                 "document_id": "doc_test",
                 "filename": filename,
-                "file_path": file_path,
+                "file_path": f"minio://pub/documents/doc_test/{filename}",
+                "storage_type": "minio",
+                "bucket_name": "pub",
+                "object_name": f"documents/doc_test/{filename}",
+                "public_url": f"http://127.0.0.1:9000/pub/documents/doc_test/{filename}",
                 "file_type": "txt",
                 "file_md5": "md5_for_test",
                 "file_size": 1024,
@@ -154,7 +157,21 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
                 "error_message": None,
             }
 
+    class FakeFileStorage:
+        """测试用文件存储服务，把 MinIO 下载动作映射到 data 目录样例文件。"""
+
+        def downloaded_temp_file(self, **kwargs):
+            class TempFileContext:
+                def __enter__(self):
+                    return os.path.join(data_path, filename)
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return False
+
+            return TempFileContext()
+
     monkeypatch.setattr(knowledge_router, "_get_knowledge_store", lambda: FakeKnowledgeStore())
+    monkeypatch.setattr(knowledge_router, "get_file_storage_service", lambda: FakeFileStorage())
 
     response = client.get("/knowledge/files/doc_test/preview?max_chars=1000")
 

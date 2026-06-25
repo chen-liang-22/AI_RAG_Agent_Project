@@ -9,6 +9,7 @@ from __future__ import annotations
 import mimetypes
 import os
 import uuid
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -22,9 +23,11 @@ from utils.path_tool import get_abs_path
 
 try:
     import minio
+    from minio.commonconfig import CopySource
     from minio.error import S3Error
 except ImportError:  # pragma: no cover - 没装依赖时通过明确异常提示。
     minio = None
+    CopySource = None  # type: ignore[assignment]
     S3Error = RuntimeError  # type: ignore[assignment]
 
 
@@ -38,6 +41,7 @@ DEFAULT_MINIO_CONFIG: dict[str, Any] = {
     "public_base_url": "",
     "region": None,
     "auto_create_bucket": False,
+    "public_read": False,
 }
 
 _minio_client: "MinioStorageClient | None" = None
@@ -83,6 +87,7 @@ def load_minio_config(config_path: str = get_abs_path("config/minio.yml")) -> di
             "MINIO_AUTO_CREATE_BUCKET",
             bool(config.get("auto_create_bucket")),
         ),
+        "public_read": _env_bool("MINIO_PUBLIC_READ", bool(config.get("public_read"))),
     })
     return config
 
@@ -118,6 +123,7 @@ class MinioStorageClient:
         self.config = dict(DEFAULT_MINIO_CONFIG)
         self.config.update(config or {})
         self._client = None
+        self._public_read_buckets: set[str] = set()
 
     @property
     def enabled(self) -> bool:
@@ -161,7 +167,38 @@ class MinioStorageClient:
                 raise RuntimeError(f"创建 MinIO 存储桶失败：{exc}") from exc
         if not exists:
             raise RuntimeError(f"MinIO 存储桶不存在：{final_bucket}，请先创建或开启自动创建")
+        if bool(self.config.get("public_read")):
+            self._ensure_public_read_policy(final_bucket)
         return final_bucket
+
+    def _ensure_public_read_policy(self, bucket_name: str) -> None:
+        """确保桶拥有公开读取对象的策略。
+
+        这里只开放 GetObject，方便浏览器直接访问 public_url；
+        不开放写入权限，上传和删除仍然必须走后端密钥。
+        """
+
+        if bucket_name in self._public_read_buckets:
+            return
+
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:GetObject"],
+                    "Resource": [f"arn:aws:s3:::{bucket_name}/*"],
+                }
+            ],
+        }
+        try:
+            self.client().set_bucket_policy(bucket_name, json.dumps(policy, ensure_ascii=False))
+        except S3Error as exc:
+            raise RuntimeError(f"设置 MinIO 存储桶公开读取策略失败：{exc}") from exc
+
+        self._public_read_buckets.add(bucket_name)
+        logger.info("[MinIO] 存储桶公开读取策略已同步 桶名=%s", bucket_name)
 
     def upload_file(
             self,
@@ -264,6 +301,66 @@ class MinioStorageClient:
 
         logger.info("[MinIO] 对象删除完成 桶名=%s 对象名=%s", final_bucket, clean_object_name)
         return True
+
+    def copy_object(
+            self,
+            source_object_name: str,
+            target_object_name: str,
+            *,
+            source_bucket_name: str | None = None,
+            target_bucket_name: str | None = None,
+    ) -> MinioObjectInfo:
+        """在 MinIO 内部复制对象，常用于把预览临时文件转成正式文件。"""
+
+        if CopySource is None:
+            raise RuntimeError("缺少 MinIO CopySource 依赖，请检查 minio 包是否安装完整")
+
+        source_bucket = self._bucket_name(source_bucket_name)
+        target_bucket = self.ensure_bucket(target_bucket_name)
+        clean_source = self._clean_object_name(source_object_name)
+        clean_target = self._clean_object_name(target_object_name)
+
+        try:
+            result = self.client().copy_object(
+                bucket_name=target_bucket,
+                object_name=clean_target,
+                source=CopySource(source_bucket, clean_source),
+            )
+            stat = self.client().stat_object(target_bucket, clean_target)
+        except S3Error as exc:
+            raise RuntimeError(f"复制 MinIO 对象失败：{exc}") from exc
+
+        public_url = self.get_public_url(clean_target, target_bucket)
+        logger.info(
+            "[MinIO] 对象复制完成 源=%s/%s 目标=%s/%s",
+            source_bucket,
+            clean_source,
+            target_bucket,
+            clean_target,
+        )
+        return MinioObjectInfo(
+            bucket_name=target_bucket,
+            object_name=clean_target,
+            public_url=public_url,
+            etag=getattr(result, "etag", None),
+            file_size=getattr(stat, "size", None),
+            content_type=getattr(stat, "content_type", None),
+        )
+
+    def download_file(self, object_name: str, target_path: str, bucket_name: str | None = None) -> str:
+        """把 MinIO 对象下载到指定本地临时路径，返回下载后的路径。"""
+
+        final_bucket = self._bucket_name(bucket_name)
+        clean_object_name = self._clean_object_name(object_name)
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.client().fget_object(final_bucket, clean_object_name, str(target))
+        except S3Error as exc:
+            raise RuntimeError(f"下载 MinIO 对象失败：{exc}") from exc
+
+        logger.info("[MinIO] 对象下载完成 桶名=%s 对象名=%s 本地路径=%s", final_bucket, clean_object_name, target)
+        return str(target)
 
     def object_exists(self, object_name: str, bucket_name: str | None = None) -> bool:
         """判断对象是否存在。"""

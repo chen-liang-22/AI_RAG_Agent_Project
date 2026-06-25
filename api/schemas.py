@@ -150,7 +150,11 @@ class KnowledgeFileResponse(BaseModel):
 
     document_id: str  # 文件唯一 ID；删除和重建索引都靠它定位文件
     filename: str  # 用户上传时的原始文件名
-    file_path: str  # 文件在服务端 uploads/ 目录下的保存路径
+    file_path: str  # 文件存储 URI，MinIO 模式下格式为 minio://桶名/对象路径
+    storage_type: str = "minio"  # 文件存储类型；当前统一使用 minio
+    bucket_name: str | None = None  # MinIO 桶名
+    object_name: str | None = None  # MinIO 对象路径
+    public_url: str | None = None  # MinIO 公共访问地址
     file_type: str  # 文件类型，例如 txt/pdf
     file_md5: str  # 文件内容 MD5；用于判断重复上传
     file_size: int  # 文件大小，单位字节
@@ -169,7 +173,7 @@ class KnowledgeFilePreviewResponse(BaseModel):
     """已入库知识库文件的预览响应体。
 
     这个模型用于知识库管理页面查看原始文件内容。
-    它只读取 documents.file_path 指向的服务端原文件，不参与 Qdrant 检索，也不改变索引数据。
+    它从 documents.object_name 对应的 MinIO 对象读取原文件，不参与 Qdrant 检索，也不改变索引数据。
     """
 
     document: KnowledgeFileResponse  # 被预览的文件元数据
