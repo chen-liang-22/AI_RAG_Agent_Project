@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,20 @@ from rag.knowledge_store import DEFAULT_DICTIONARY_ITEMS
 
 
 OUTPUT_PATH = Path("docs/mysql初始化建表和基础数据.sql")
+
+FIELD_DEFINITION_PATTERN = re.compile(
+    r"^`?[A-Za-z_][A-Za-z0-9_]*`?\s+"
+    r"(?:VARCHAR|CHAR|BIGINT|INT|TINYINT|TEXT|LONGTEXT|JSON|DATETIME|DECIMAL)\b",
+    re.IGNORECASE,
+)
+NON_FIELD_PREFIXES = (
+    "PRIMARY KEY",
+    "KEY ",
+    "UNIQUE KEY",
+    "CONSTRAINT ",
+    "FOREIGN KEY",
+    "ON DELETE",
+)
 
 
 def sql_quote(value: Any) -> str:
@@ -92,6 +107,46 @@ def render_dictionary_seed_sql() -> str:
             )
             item_id_by_code[str(item_code)] = item_id
     return "\n".join(lines)
+
+
+def validate_mysql_comments(sql: str) -> None:
+    """校验 MySQL 建表 SQL 是否包含完整中文表注释和字段注释。"""
+
+    missing_table_comments: list[str] = []
+    missing_column_comments: list[str] = []
+
+    table_blocks = re.finditer(
+        r"CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\((.*?)\)\s*ENGINE=InnoDB\s+([^;]*);",
+        sql,
+        re.DOTALL,
+    )
+    for table_match in table_blocks:
+        table_name = table_match.group(1)
+        table_body = table_match.group(2)
+        table_suffix = table_match.group(3)
+        if not re.search(r"COMMENT\s*=\s*['\"]", table_suffix, re.IGNORECASE):
+            missing_table_comments.append(table_name)
+
+        for raw_line in table_body.splitlines():
+            line = raw_line.strip().rstrip(",")
+            if not line:
+                continue
+            upper_line = line.upper()
+            if upper_line.startswith(NON_FIELD_PREFIXES):
+                continue
+            if not FIELD_DEFINITION_PATTERN.match(line):
+                continue
+            column_name = re.match(r"`?(\w+)`?", line).group(1)
+            if not re.search(r"\bCOMMENT\b", line, re.IGNORECASE):
+                missing_column_comments.append(f"{table_name}.{column_name}")
+
+    if missing_table_comments or missing_column_comments:
+        details = []
+        if missing_table_comments:
+            details.append(f"缺少表注释：{', '.join(missing_table_comments)}")
+        if missing_column_comments:
+            details.append(f"缺少字段注释：{', '.join(missing_column_comments)}")
+        raise ValueError("MySQL 初始化 SQL 注释不完整；" + "；".join(details))
 
 
 DDL_SQL = """-- AI_RAG_Agent_Project MySQL 初始化脚本。
@@ -220,7 +275,7 @@ CREATE TABLE IF NOT EXISTS exam_questions (
   source_filename VARCHAR(255) NULL COMMENT '来源文件名',
   source_page INT NULL COMMENT '来源页码',
   section_path VARCHAR(1024) NULL COMMENT '来源章节路径',
-  question_type VARCHAR(32) NOT NULL COMMENT '题型，例如 single_choice、multi_choice、judge、short_answer',
+  question_type VARCHAR(32) NOT NULL COMMENT '题型，例如 single_choice、multiple_choice、true_false、short_answer、fill_blank',
   prompt LONGTEXT NOT NULL COMMENT '题干',
   options_json JSON NULL COMMENT '选择题选项',
   correct_answer_json JSON NULL COMMENT '正确答案',
@@ -243,10 +298,11 @@ CREATE TABLE IF NOT EXISTS exam_questions (
 
 CREATE TABLE IF NOT EXISTS training_knowledge_batches (
   batch_id VARCHAR(64) NOT NULL COMMENT '训练资料上传批次编号',
+  document_id VARCHAR(64) NULL COMMENT '关联 documents.document_id，文件基础信息统一保存在 documents 表',
   source_type VARCHAR(64) NOT NULL COMMENT '资料来源类型，例如 lms_case',
-  source_file VARCHAR(255) NOT NULL COMMENT '原始文件名',
-  file_path VARCHAR(1024) NULL COMMENT '服务端保存路径',
-  file_md5 CHAR(32) NULL COMMENT '文件 MD5',
+  source_file VARCHAR(255) NOT NULL COMMENT '历史兼容文件名，新数据优先读取 documents.filename',
+  file_path VARCHAR(1024) NULL COMMENT '历史兼容保存路径，新数据优先读取 documents.file_path',
+  file_md5 CHAR(32) NULL COMMENT '历史兼容文件 MD5，新数据优先读取 documents.file_md5',
   version_group_id VARCHAR(64) NULL COMMENT '版本组编号，同一资料多版本共享',
   version_no INT NOT NULL DEFAULT 1 COMMENT '版本号，从 1 递增',
   previous_batch_id VARCHAR(64) NULL COMMENT '上一版本批次编号',
@@ -265,9 +321,13 @@ CREATE TABLE IF NOT EXISTS training_knowledge_batches (
   created_at DATETIME NOT NULL COMMENT '创建时间',
   updated_at DATETIME NOT NULL COMMENT '更新时间',
   PRIMARY KEY (batch_id),
+  KEY idx_training_batches_document (document_id),
   KEY idx_training_batches_md5_status (file_md5, status),
   KEY idx_training_batches_version_group (version_group_id, version_no),
-  KEY idx_training_batches_current_status (status, is_current, updated_at)
+  KEY idx_training_batches_current_status (status, is_current, updated_at),
+  CONSTRAINT fk_training_batches_document
+    FOREIGN KEY (document_id) REFERENCES documents (document_id)
+    ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='销售训练资料上传批次表';
 
 CREATE TABLE IF NOT EXISTS training_plans (
@@ -407,6 +467,7 @@ def main() -> None:
     """生成 MySQL 初始化 SQL 文件。"""
 
     sql = DDL_SQL.rstrip() + "\n\n" + render_dictionary_seed_sql().rstrip() + "\n"
+    validate_mysql_comments(sql)
     OUTPUT_PATH.write_text(sql, encoding="utf-8")
     print(f"已生成：{OUTPUT_PATH}")
 

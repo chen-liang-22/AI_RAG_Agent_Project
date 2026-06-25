@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS exam_questions (
   source_filename VARCHAR(255) NULL COMMENT '来源文件名',
   source_page INT NULL COMMENT '来源页码',
   section_path VARCHAR(1024) NULL COMMENT '来源章节路径',
-  question_type VARCHAR(32) NOT NULL COMMENT '题型，例如 single_choice、multi_choice、judge、short_answer',
+  question_type VARCHAR(32) NOT NULL COMMENT '题型，例如 single_choice、multiple_choice、true_false、short_answer、fill_blank',
   prompt LONGTEXT NOT NULL COMMENT '题干',
   options_json JSON NULL COMMENT '选择题选项',
   correct_answer_json JSON NULL COMMENT '正确答案',
