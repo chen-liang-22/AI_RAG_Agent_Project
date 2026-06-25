@@ -1,4 +1,5 @@
 import os
+import uuid
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -8,6 +9,10 @@ import api.routers.exam as exam_router
 from api.main import app
 from rag.knowledge_store import KnowledgeStore
 from utils.path_tool import get_abs_path
+
+
+def _unique_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
 def test_openapi_exposes_core_routes():
@@ -352,7 +357,7 @@ def test_exam_question_generation_and_grading_use_model_polishing(monkeypatch):
 def test_exam_question_rows_can_generate_first_question_before_remaining(monkeypatch, tmp_path):
     store = KnowledgeStore()
     session = store.create_exam_session(
-        session_id="exam_fast_start",
+        session_id=_unique_id("exam_fast_start"),
         user_id="user_exam",
         title="快速开始测评",
         collection_name="agent",
@@ -425,7 +430,7 @@ def test_exam_question_rows_can_generate_first_question_before_remaining(monkeyp
 def test_exam_first_question_fast_mode_skips_model(monkeypatch, tmp_path):
     store = KnowledgeStore()
     session = store.create_exam_session(
-        session_id="exam_fast_rule_start",
+        session_id=_unique_id("exam_fast_rule_start"),
         user_id="user_exam",
         title="快速规则首题",
         collection_name="agent",
@@ -473,7 +478,7 @@ def test_exam_first_question_fast_mode_skips_model(monkeypatch, tmp_path):
 def test_choice_answer_value_is_normalized_to_label(tmp_path):
     store = KnowledgeStore()
     session = store.create_exam_session(
-        session_id="exam_choice_label",
+        session_id=_unique_id("exam_choice_label"),
         user_id="user_exam",
         title="选择题测评",
         collection_name="agent",
@@ -601,7 +606,7 @@ def test_exam_start_request_requires_title():
 def test_multiple_choice_distribution_breaks_repeated_all_select(monkeypatch, tmp_path):
     store = KnowledgeStore()
     session = store.create_exam_session(
-        session_id="exam_multi_distribution",
+        session_id=_unique_id("exam_multi_distribution"),
         user_id="user_exam",
         title="多选分布测评",
         collection_name="agent",

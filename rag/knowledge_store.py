@@ -1109,6 +1109,7 @@ class KnowledgeStore:
             question.analysis_json = json.dumps(analysis, ensure_ascii=False)
             question.status = "answered"
             question.answered_at = now
+            session.flush()
 
             answered_count = int(
                 session.scalar(
