@@ -349,8 +349,16 @@ class VectorStoreService:
         """按 document_id 删除 Qdrant 中属于某个文件的所有向量。"""
 
         client = QdrantClient(**get_qdrant_client_options())
+        normalized_collection_name = normalize_qdrant_collection_name(collection_name)
+        if not client.collection_exists(normalized_collection_name):
+            logger.info(
+                "[Qdrant] collection 不存在，跳过文件向量删除 collection=%s document_id=%s",
+                normalized_collection_name,
+                document_id,
+            )
+            return
         client.delete(
-            collection_name=normalize_qdrant_collection_name(collection_name),
+            collection_name=normalized_collection_name,
             points_selector=models.FilterSelector(
                 filter=models.Filter(
                     must=[

@@ -18,6 +18,7 @@ from api.schemas import (
 )
 from api.services.common_services import _document_to_response, _get_knowledge_store, build_document_dictionary_snapshot
 from api.services.indexing_services import _index_document, _sync_data_files_to_documents
+from api.services.upload_cleanup_services import delete_upload_path
 from api.services.upload_services import (
     _get_preview_file,
     _move_upload_file,
@@ -380,9 +381,7 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
     这里的“删除”是知识库层面的删除：
     - Qdrant 中该 document_id 的 points 会被删除。
     - MySQL documents 中该文件会标记为 deleted。
-
-    原始上传文件暂时保留在 uploads/ 目录中，方便排查和审计。
-    如果后续希望物理删除原始文件，可以在这个接口里追加文件删除逻辑。
+    - uploads/{document_id} 下的原始文件会被物理删除。
     """
 
     logger.info(f"[知识库] 删除文件 文档编号={document_id}")
@@ -397,6 +396,7 @@ def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
 
         VectorStoreService.delete_document_vectors(document_id, collection_name=document.get("collection_name"))
         store.mark_document_deleted(document_id)
+        delete_upload_path(document.get("file_path"), document_id=document_id)
     except Exception as exc:
         logger.error(f"[知识库] 删除文件失败 文档编号={document_id} 错误={exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"知识库文件删除失败：{exc}") from exc

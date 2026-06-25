@@ -204,3 +204,24 @@ def test_retrieve_one_query_skips_metadata_filter_when_disabled(monkeypatch):
 
     assert calls == [None]
     assert len(documents) == 1
+
+
+def test_delete_document_vectors_skips_missing_collection(monkeypatch):
+    """Qdrant collection 已不存在时，删除文件向量不应该阻断数据库记录删除。"""
+
+    class FakeQdrantClient:
+        def __init__(self, **kwargs):
+            self.options = kwargs
+            self.delete_called = False
+
+        def collection_exists(self, collection_name):
+            return False
+
+        def delete(self, **kwargs):
+            self.delete_called = True
+            raise AssertionError("collection 不存在时不应该调用 Qdrant delete")
+
+    monkeypatch.setattr("infrastructure.vector_store_service.QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr("infrastructure.vector_store_service.get_qdrant_client_options", lambda: {})
+
+    VectorStoreService.delete_document_vectors("doc_missing", collection_name="doProblems")

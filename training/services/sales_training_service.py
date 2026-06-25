@@ -13,6 +13,7 @@ from fastapi import HTTPException, UploadFile
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from api.services.upload_cleanup_services import delete_upload_path
 from infrastructure.vector_store_service import VectorStoreService
 from model.factory import get_chat_model
 from rag.file_processors import FileProcessorFactory
@@ -389,12 +390,13 @@ class SalesTrainingService:
 
         删除动作包含两层：
         1. Qdrant 正式库和临时库中按 batch_id 删除本批次向量点；
-        2. 业务数据库批次状态改成 deleted，原文件暂时保留。
+        2. 业务数据库批次状态改成 deleted，并同步物理删除 uploads 原文件。
         """
 
         batch = self._get_active_batch(batch_id)
+        file_info = self._batch_file_info(batch)
         try:
-            # ??????????????? fake ????????????? collection ???
+            # 正式库和临时库都按 batch_id 删除，兼容待审核、已发布两种状态。
             self.vector_service.delete_by_metadata("batch_id", batch_id)
             self.staging_vector_service.delete_by_metadata("batch_id", batch_id)
             deleted = self.repository.mark_batch_deleted(batch_id)
@@ -404,6 +406,7 @@ class SalesTrainingService:
             document_id = str(batch.get("document_id") or "").strip()
             if document_id:
                 self.knowledge_store.mark_document_deleted(document_id)
+            delete_upload_path(file_info.get("file_path"), document_id=document_id or None)
         except HTTPException:
             raise
         except Exception as exc:
