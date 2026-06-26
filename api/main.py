@@ -1,42 +1,38 @@
 """FastAPI 应用入口。
 
-这里只负责创建应用、执行启动预热，并挂载各业务路由：
-- health：健康检查；
-- chat：智能客服聊天；
-- knowledge：知识库文件管理；
-- dictionaries：字典配置；
-- exam：对话式考试。
+V2 重构后，这里只负责创建应用、启动预热和挂载路由。
+业务流程放到 `app_v2` 的应用服务层，避免入口文件继续变成大杂烩。
 """
 
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from api.routers import auth, chat, dictionaries, exam, health, internal_jobs, knowledge
+from api.routers import internal_jobs
 from api.warmup import run_startup_warmup
-from training.api.router import router as training_router
+from app_v2.api.router import router as v2_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """服务启动时执行预热，关闭时交还 FastAPI 默认生命周期。"""
+    """应用生命周期钩子。
+
+    FastAPI 启动时只执行必要预热；不要在这里偷偷修改表结构。
+    """
 
     run_startup_warmup()
     yield
 
 
 app = FastAPI(
-    title="知习台 API",
-    description="知习台后端服务，提供知识库问答、资料管理、销售陪练和掌握度测评能力。",
-    version="1.0.0",
+    title="知识台 V2 API",
+    description="AI RAG Agent V2 分层架构接口，只暴露新的 /api/v2 协议。",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-app.include_router(health.router)
-app.include_router(auth.router)
-app.include_router(chat.router)
-app.include_router(knowledge.router)
-app.include_router(dictionaries.router)
-app.include_router(exam.router)
-app.include_router(training_router)
+# V2 业务接口统一挂载到 /api/v2，前端也只调用这套协议。
+app.include_router(v2_router)
+
+# 内部定时任务暂时保留原路径，避免现有 xxl-job 配置立刻失效。
 app.include_router(internal_jobs.router)

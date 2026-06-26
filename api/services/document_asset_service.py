@@ -12,6 +12,7 @@ from fastapi import HTTPException
 
 from infrastructure.file_storage_service import FileStorageService, get_file_storage_service
 from infrastructure.vector_store_service import VectorStoreService
+from app_v2.infrastructure.repositories.document_repository import DocumentRepository
 from rag.knowledge_store import KnowledgeStore
 from training.repository import TrainingRepository
 from utils.knowledge_asset_constants import TRAINING_COLLECTION_NAMES
@@ -39,12 +40,14 @@ class DocumentAssetService:
             self,
             *,
             knowledge_store: KnowledgeStore | None = None,
+            document_repository: DocumentRepository | None = None,
             training_repository: TrainingRepository | None = None,
             file_storage: FileStorageService | None = None,
             vector_service_factory: Callable[[str], VectorStoreService] | None = None,
             delete_document_vectors: Callable[[str, str | None], None] | None = None,
     ):
         self.knowledge_store = knowledge_store or KnowledgeStore()
+        self.document_repository = document_repository or DocumentRepository(store=self.knowledge_store)
         self.training_repository = training_repository or TrainingRepository()
         self.file_storage = file_storage or get_file_storage_service()
         self.vector_service_factory = vector_service_factory or (
@@ -55,7 +58,7 @@ class DocumentAssetService:
     def delete_document_asset(self, document_id: str) -> DocumentAssetDeleteResult:
         """按 document_id 全链路硬删除文件资产。"""
 
-        document = self.knowledge_store.get_document(document_id)
+        document = self.document_repository.get_document(document_id)
         if document is None:
             raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
@@ -79,7 +82,7 @@ class DocumentAssetService:
                 object_name=document.get("object_name"),
             )
             deleted_training_batches = self.training_repository.delete_batches_by_document_id(document_id)
-            deleted_document = self.knowledge_store.delete_document(document_id)
+            deleted_document = self.document_repository.delete_document(document_id)
         except HTTPException:
             raise
         except Exception as exc:

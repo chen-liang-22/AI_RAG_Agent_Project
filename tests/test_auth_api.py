@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 from fastapi.testclient import TestClient
 
-import api.routers.auth as auth_router
+import app_v2.api.routes.auth as auth_router
 from api.main import app
 from api.services.auth_services import (
     AuthService,
@@ -89,10 +89,10 @@ def test_openapi_exposes_auth_routes():
 
     assert response.status_code == 200
     paths = response.json()["paths"]
-    assert "/auth/login" in paths
-    assert "/auth/refresh" in paths
-    assert "/auth/me" in paths
-    assert "/auth/logout" in paths
+    assert "/api/v2/auth/login" in paths
+    assert "/api/v2/auth/refresh" in paths
+    assert "/api/v2/auth/me" in paths
+    assert "/api/v2/auth/logout" in paths
 
 
 class FakeAuthRepository:
@@ -168,7 +168,7 @@ def test_login_refresh_and_logout_manage_refresh_cookie(monkeypatch):
     monkeypatch.setattr(auth_router, "_auth_service", service)
     client = TestClient(app)
 
-    login_response = client.post("/auth/login", json={"username": "admin", "password": "1234qwer"})
+    login_response = client.post("/api/v2/auth/login", json={"username": "admin", "password": "1234qwer"})
 
     assert login_response.status_code == 200
     login_data = login_response.json()
@@ -177,16 +177,16 @@ def test_login_refresh_and_logout_manage_refresh_cookie(monkeypatch):
     assert service.refresh_cookie_name in client.cookies
     assert len(fake_redis.values) == 1
 
-    refresh_response = client.post("/auth/refresh")
+    refresh_response = client.post("/api/v2/auth/refresh")
 
     assert refresh_response.status_code == 200
     assert refresh_response.json()["access_token"].count(".") == 2
 
     logout_response = client.post(
-        "/auth/logout",
+        "/api/v2/auth/logout",
         headers={"Authorization": f"Bearer {login_data['access_token']}"},
     )
 
     assert logout_response.status_code == 200
     assert fake_redis.values == {}
-    assert client.post("/auth/refresh").status_code == 401
+    assert client.post("/api/v2/auth/refresh").status_code == 401

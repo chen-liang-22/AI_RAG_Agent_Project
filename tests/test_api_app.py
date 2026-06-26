@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 import api.routers.knowledge as knowledge_router
+import app_v2.application.knowledge_service as v2_knowledge_service
 import api.routers.exam as exam_router
 from api.main import app
 from rag.knowledge_store import KnowledgeStore
@@ -22,45 +23,48 @@ def test_openapi_exposes_core_routes():
 
     assert response.status_code == 200
     paths = response.json()["paths"]
-    assert "/health" in paths
-    assert "/auth/login" in paths
-    assert "/auth/me" in paths
-    assert "/auth/logout" in paths
-    assert "/chat" in paths
-    assert "/chat/stream" in paths
-    assert "/conversations" in paths
-    assert "/conversations/{conversation_id}" in paths
-    assert "/debug/retrieve" in paths
-    assert "/knowledge/upload/preview" in paths
-    assert "/knowledge/upload/recommend" in paths
-    assert "/knowledge/upload/confirm" in paths
-    assert "/knowledge/files" in paths
-    assert "/knowledge/files/{document_id}" in paths
-    assert "/knowledge/files/{document_id}/preview" in paths
-    assert "/knowledge/files/reindex-all" in paths
-    assert "/knowledge/files/{document_id}/reindex" in paths
-    assert "/knowledge/reload" in paths
-    assert "/dictionaries" in paths
-    assert "/dictionaries/items" in paths
-    assert "/exam/sections" in paths
-    assert "/exam/sessions" in paths
-    assert "/exam/sessions/{session_id}/answer" in paths
-    assert "/exam/sessions/{session_id}" in paths
-    assert "/training/knowledge/upload" in paths
-    assert "/training/knowledge/batches" in paths
-    assert "/training/knowledge/batches/{batch_id}/preview" in paths
-    assert "/training/knowledge/batches/{batch_id}" in paths
-    assert "/training/knowledge/batches/{batch_id}/publish" in paths
-    assert "/training/knowledge/batches/{batch_id}/rollback" in paths
-    assert "/training/knowledge/batches/{batch_id}/reparse" in paths
-    assert "/training/knowledge/batches/{batch_id}/versions" in paths
-    assert "/training/knowledge/batches/{batch_id}/chunks" in paths
-    assert "/training/profile-dictionaries" in paths
-    assert "/training/profiles/generate" in paths
-    assert "/training/sessions" in paths
-    assert "/training/sessions/{session_id}" in paths
-    assert "/training/sessions/{session_id}/turns" in paths
-    assert "/training/sessions/{session_id}/final-score" in paths
+    assert "/api/v2/health" in paths
+    assert "/api/v2/auth/login" in paths
+    assert "/api/v2/auth/me" in paths
+    assert "/api/v2/auth/logout" in paths
+    assert "/api/v2/chat" in paths
+    assert "/api/v2/chat/stream" in paths
+    assert "/api/v2/conversations" in paths
+    assert "/api/v2/conversations/{conversation_id}" in paths
+    assert "/api/v2/debug/retrieve" in paths
+    assert "/api/v2/knowledge/upload/preview" in paths
+    assert "/api/v2/knowledge/upload/recommend" in paths
+    assert "/api/v2/knowledge/upload/confirm" in paths
+    assert "/api/v2/knowledge/files" in paths
+    assert "/api/v2/knowledge/files/{document_id}" in paths
+    assert "/api/v2/knowledge/files/{document_id}/preview" in paths
+    assert "/api/v2/knowledge/files/reindex-all" in paths
+    assert "/api/v2/knowledge/files/{document_id}/reindex" in paths
+    assert "/api/v2/knowledge/reload" in paths
+    assert "/api/v2/dictionaries" in paths
+    assert "/api/v2/dictionaries/items" in paths
+    assert "/api/v2/exam/sections" in paths
+    assert "/api/v2/exam/sessions" in paths
+    assert "/api/v2/exam/sessions/{session_id}/answer" in paths
+    assert "/api/v2/exam/sessions/{session_id}" in paths
+    assert "/api/v2/training/knowledge/upload" in paths
+    assert "/api/v2/training/knowledge/batches" in paths
+    assert "/api/v2/training/knowledge/batches/{batch_id}/preview" in paths
+    assert "/api/v2/training/knowledge/batches/{batch_id}" in paths
+    assert "/api/v2/training/knowledge/batches/{batch_id}/publish" in paths
+    assert "/api/v2/training/knowledge/batches/{batch_id}/rollback" in paths
+    assert "/api/v2/training/knowledge/batches/{batch_id}/reparse" in paths
+    assert "/api/v2/training/knowledge/batches/{batch_id}/versions" in paths
+    assert "/api/v2/training/knowledge/batches/{batch_id}/chunks" in paths
+    assert "/api/v2/training/profile-dictionaries" in paths
+    assert "/api/v2/training/plans" in paths
+    assert "/api/v2/training/plans/{plan_id}" in paths
+    assert "delete" in paths["/api/v2/training/plans/{plan_id}"]
+    assert "/api/v2/training/profiles/generate" in paths
+    assert "/api/v2/training/sessions" in paths
+    assert "/api/v2/training/sessions/{session_id}" in paths
+    assert "/api/v2/training/sessions/{session_id}/turns" in paths
+    assert "/api/v2/training/sessions/{session_id}/final-score" in paths
     assert "/internal/jobs/minio/cleanup-preview-uploads" in paths
     assert "/exam/generate" not in paths
     assert "/exam/grade" not in paths
@@ -69,7 +73,7 @@ def test_openapi_exposes_core_routes():
 def test_dictionaries_return_document_structure_items():
     client = TestClient(app)
 
-    response = client.get("/dictionaries?dictionary_code=document_structure")
+    response = client.get("/api/v2/dictionaries?dictionary_code=document_structure")
 
     assert response.status_code == 200
     data = response.json()
@@ -80,7 +84,7 @@ def test_dictionaries_return_document_structure_items():
 def test_training_profile_dictionaries_follow_current_portrait_spec():
     client = TestClient(app)
 
-    response = client.get("/training/profile-dictionaries")
+    response = client.get("/api/v2/training/profile-dictionaries")
 
     assert response.status_code == 200
     data = response.json()
@@ -142,6 +146,13 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
     filename = next(name for name in os.listdir(data_path) if name.endswith(".txt"))
 
     class FakeKnowledgeStore:
+        def list_dictionary_items(self, *, dictionary_code=None):
+            if dictionary_code == "document_structure":
+                return [{"item_code": "text", "enabled": 1}]
+            if dictionary_code == "split_strategy":
+                return [{"item_code": "recursive", "enabled": 1}]
+            return []
+
         def get_document(self, document_id: str):
             assert document_id == "doc_test"
             return {
@@ -166,6 +177,15 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
                 "error_message": None,
             }
 
+    class FakeDocumentRepository:
+        """测试用 V2 文档仓储，模拟 documents 表按编号查询。"""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_document(self, document_id: str):
+            return FakeKnowledgeStore().get_document(document_id)
+
     class FakeFileStorage:
         """测试用文件存储服务，把 MinIO 下载动作映射到 data 目录样例文件。"""
 
@@ -179,10 +199,11 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
 
             return TempFileContext()
 
-    monkeypatch.setattr(knowledge_router, "_get_knowledge_store", lambda: FakeKnowledgeStore())
-    monkeypatch.setattr(knowledge_router, "get_file_storage_service", lambda: FakeFileStorage())
+    monkeypatch.setattr(v2_knowledge_service, "_get_knowledge_store", lambda: FakeKnowledgeStore())
+    monkeypatch.setattr(v2_knowledge_service, "DocumentRepository", FakeDocumentRepository)
+    monkeypatch.setattr(v2_knowledge_service, "FileStorageAdapter", lambda: FakeFileStorage())
 
-    response = client.get("/knowledge/files/doc_test/preview?max_chars=1000")
+    response = client.get("/api/v2/knowledge/files/doc_test/preview?max_chars=1000")
 
     assert response.status_code == 200
     data = response.json()
@@ -232,9 +253,19 @@ def test_knowledge_files_excludes_training_collections_by_default(monkeypatch):
                 }
             ]
 
-    monkeypatch.setattr(knowledge_router, "_get_knowledge_store", lambda: FakeKnowledgeStore())
+    class FakeDocumentRepository:
+        """测试用 V2 文档仓储，模拟 documents 表默认排除训练资料。"""
 
-    response = client.get("/knowledge/files")
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def list_documents(self, *, include_training=False):
+            return FakeKnowledgeStore().list_documents(include_training=include_training)
+
+    monkeypatch.setattr(v2_knowledge_service, "_get_knowledge_store", lambda: FakeKnowledgeStore())
+    monkeypatch.setattr(v2_knowledge_service, "DocumentRepository", FakeDocumentRepository)
+
+    response = client.get("/api/v2/knowledge/files")
 
     assert response.status_code == 200
     assert [item["document_id"] for item in response.json()] == ["doc_general"]
@@ -252,9 +283,9 @@ def test_delete_knowledge_file_uses_document_asset_service(monkeypatch):
             deleted_document_ids.append(document_id)
             return FakeDeleteResult()
 
-    monkeypatch.setattr(knowledge_router, "DocumentAssetService", lambda: FakeAssetService())
+    monkeypatch.setattr(v2_knowledge_service, "DocumentAssetService", lambda **kwargs: FakeAssetService())
 
-    response = client.delete("/knowledge/files/doc_general")
+    response = client.delete("/api/v2/knowledge/files/doc_general")
 
     assert response.status_code == 200
     assert response.json()["document_id"] == "doc_general"
@@ -278,7 +309,7 @@ def test_exam_sections_only_expose_first_level_directory(monkeypatch):
 
     monkeypatch.setattr(exam_router, "_scroll_candidate_questions", fake_scroll_candidate_questions)
 
-    response = client.get("/exam/sections?collection_name=doProblems&document_id=doc_java")
+    response = client.get("/api/v2/exam/sections?collection_name=doProblems&document_id=doc_java")
 
     assert response.status_code == 200
     assert response.json()["sections"] == [

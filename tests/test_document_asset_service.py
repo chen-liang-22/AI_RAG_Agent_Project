@@ -128,6 +128,7 @@ def test_document_asset_service_deletes_document_training_batches_vectors_and_mi
 
     service = DocumentAssetService(
         knowledge_store=knowledge_store,
+        document_repository=knowledge_store,
         training_repository=training_repository,
         file_storage=storage,
         vector_service_factory=lambda collection_name: {
@@ -152,4 +153,46 @@ def test_document_asset_service_deletes_document_training_batches_vectors_and_mi
     assert staging_vector.deleted_metadata == [("batch_id", "batch_1")]
     assert storage.deleted_objects == [("pub", "documents/doc_training/training.txt")]
     assert knowledge_store.deleted_document_ids == ["doc_training"]
+    assert training_repository.deleted_document_ids == ["doc_training"]
+
+class ExplodingKnowledgeStoreForAssetDelete:
+    """删除服务如果继续访问旧 KnowledgeStore，本替身会让测试失败。"""
+
+    def get_document(self, document_id):
+        raise AssertionError("文档资产删除不应该继续通过旧 KnowledgeStore 查询 documents")
+
+    def delete_document(self, document_id):
+        raise AssertionError("文档资产删除不应该继续通过旧 KnowledgeStore 删除 documents")
+
+
+class FakeDocumentRepositoryForAssetDelete(FakeKnowledgeStore):
+    """测试用 V2 文档仓储，复用 FakeKnowledgeStore 的 documents 行为。"""
+
+
+def test_document_asset_service_deletes_document_through_document_repository():
+    from api.services.document_asset_service import DocumentAssetService
+
+    document_repository = FakeDocumentRepositoryForAssetDelete()
+    training_repository = FakeTrainingRepository()
+    storage = FakeFileStorage()
+    published_vector = FakeVectorService("sales_training_cases")
+    staging_vector = FakeVectorService("sales_training_cases_staging")
+    FakeVectorService.document_vector_deletes = []
+
+    service = DocumentAssetService(
+        knowledge_store=ExplodingKnowledgeStoreForAssetDelete(),
+        document_repository=document_repository,
+        training_repository=training_repository,
+        file_storage=storage,
+        vector_service_factory=lambda collection_name: {
+            "sales_training_cases": published_vector,
+            "sales_training_cases_staging": staging_vector,
+        }[collection_name],
+        delete_document_vectors=FakeVectorService.delete_document_vectors,
+    )
+
+    result = service.delete_document_asset("doc_training")
+
+    assert result.deleted_document is True
+    assert document_repository.deleted_document_ids == ["doc_training"]
     assert training_repository.deleted_document_ids == ["doc_training"]

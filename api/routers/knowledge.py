@@ -373,9 +373,9 @@ def preview_indexed_knowledge_file(
 
 @router.delete("/knowledge/files/{document_id}", response_model=KnowledgeDeleteResponse)
 def delete_knowledge_file(document_id: str) -> KnowledgeDeleteResponse:
-    """? document_id ?????????????"""
+    """按 document_id 删除知识库文件资产。"""
 
-    logger.info("[???] ???? ????=%s", document_id)
+    logger.info("[知识库] 删除文件资产 文档编号=%s", document_id)
     result = DocumentAssetService().delete_document_asset(document_id)
     return KnowledgeDeleteResponse(status="deleted", document_id=result.document_id)
 

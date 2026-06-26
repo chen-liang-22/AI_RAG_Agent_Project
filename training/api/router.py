@@ -15,6 +15,7 @@ from training.schemas import (
     ScenarioPolishResponse,
     SupplementQuestionGenerateResponse,
     TrainingPlanCreateRequest,
+    TrainingPlanDeleteResponse,
     TrainingPlanDetailResponse,
     TrainingPlanListResponse,
     TrainingPlanUpdateRequest,
@@ -232,6 +233,13 @@ def get_training_plan(plan_id: str) -> TrainingPlanDetailResponse:
     """查看训练方案每一步详情。"""
 
     return _service().get_plan_detail(plan_id)
+
+
+@router.delete("/plans/{plan_id}", response_model=TrainingPlanDeleteResponse)
+def delete_training_plan(plan_id: str) -> TrainingPlanDeleteResponse:
+    """删除训练方案。"""
+
+    return _service().delete_plan(plan_id)
 
 
 @router.put("/plans/{plan_id}", response_model=TrainingPlanDetailResponse)

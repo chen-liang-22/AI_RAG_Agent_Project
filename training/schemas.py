@@ -304,6 +304,13 @@ class TrainingPlanListResponse(BaseModel):
     page_size: int
 
 
+class TrainingPlanDeleteResponse(BaseModel):
+    """训练方案删除响应。"""
+
+    status: str
+    plan_id: str
+
+
 class TrainingPlanDetailResponse(BaseModel):
     """训练方案详情响应。"""
 

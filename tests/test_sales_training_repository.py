@@ -34,6 +34,46 @@ def test_training_repository_allows_duplicate_plan_names(tmp_path):
     assert {plan["plan_name"] for plan in plans} == {"海外 BD 异议处理"}
 
 
+def test_sales_training_service_deletes_existing_plan():
+    """删除训练方案后，服务层应返回 deleted，并把删除动作交给仓储层执行。"""
+
+    class FakeRepository:
+        def __init__(self):
+            self.deleted_plan_id = None
+            self.plan = {
+                "plan_id": "plan_delete_test",
+                "plan_name": "待删除训练",
+                "trainee_id": "trainee-1",
+                "trainee_name": "销售学员",
+                "profile_type": "overseas_bd",
+                "role_status": "pending",
+                "goal_status": "pending",
+                "score_status": "pending",
+                "created_at": "2026-06-26 10:00:00",
+                "updated_at": "2026-06-26 10:00:00",
+            }
+
+        def get_plan(self, plan_id: str):
+            return self.plan if self.plan and self.plan["plan_id"] == plan_id else None
+
+        def delete_plan(self, plan_id: str) -> bool:
+            self.deleted_plan_id = plan_id
+            if self.plan and self.plan["plan_id"] == plan_id:
+                self.plan = None
+                return True
+            return False
+
+    repository = FakeRepository()
+    service = SalesTrainingService(repository=repository)
+
+    result = service.delete_plan("plan_delete_test")
+
+    assert result.status == "deleted"
+    assert result.plan_id == "plan_delete_test"
+    assert repository.deleted_plan_id == "plan_delete_test"
+    assert repository.get_plan("plan_delete_test") is None
+
+
 def test_training_repository_persists_history_and_score(tmp_path):
     """训练仓储应能保存会话、开场白、学员轮次和评分，供前端复盘使用。"""
 

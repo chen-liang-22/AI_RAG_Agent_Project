@@ -35,6 +35,7 @@ from training.schemas import (
     SupplementQuestionGenerateResponse,
     SupplementQuestionOption,
     TrainingPlanCreateRequest,
+    TrainingPlanDeleteResponse,
     TrainingPlanDetailResponse,
     TrainingPlanListResponse,
     TrainingPlanSummaryResponse,
@@ -669,6 +670,20 @@ class SalesTrainingService:
         """查询训练方案完整详情。"""
 
         return self._plan_detail_response(self._require_plan(plan_id))
+
+    def delete_plan(self, plan_id: str) -> TrainingPlanDeleteResponse:
+        """删除训练方案。
+
+        训练方案是销售陪练配置入口。删除它只会让方案从列表和详情里消失，
+        不清理训练资料、向量库、MinIO 文件，也不删除历史训练会话依赖的角色和阶段配置。
+        """
+
+        plan = self._require_plan(plan_id)
+        deleted = self.repository.delete_plan(plan_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="训练方案不存在")
+        logger.info("[销售训练] 训练方案已删除 方案编号=%s 名称=%s", plan_id, plan.get("plan_name"))
+        return TrainingPlanDeleteResponse(status="deleted", plan_id=plan_id)
 
     def update_plan(self, plan_id: str, request: TrainingPlanUpdateRequest) -> TrainingPlanDetailResponse:
         """修改训练方案。

@@ -450,6 +450,20 @@ class TrainingRepository:
         with orm_session_context() as session:
             return session.get(TrainingPlanEntity, plan_id)
 
+    def delete_plan(self, plan_id: str) -> bool:
+        """物理删除训练方案记录。
+
+        这里只删除 training_plans 本身，不删除历史会话、AI 角色或阶段配置。
+        这些数据可能仍被训练复盘引用，误删会导致历史记录无法打开。
+        """
+
+        with orm_session_context() as session:
+            plan = session.get(TrainingPlanEntity, plan_id)
+            if plan is None:
+                return False
+            session.delete(plan)
+            return True
+
     def update_plan(self, plan_id: str, **values: Any) -> TrainingPlanEntity | None:
         """更新训练方案基础信息和状态。"""
 
