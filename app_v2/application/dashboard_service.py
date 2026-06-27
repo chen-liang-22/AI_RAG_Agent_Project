@@ -31,6 +31,11 @@ class DashboardApplicationService:
     _health_cache_seconds = 10
 
     def __init__(self):
+        """初始化首页驾驶舱依赖的仓储。
+
+        首页只做聚合查询，所以这里组合字典、文件、聊天和训练仓储，不直接写业务数据。
+        """
+
         self.dictionary_repository = DictionaryRepository()
         self.document_repository = DocumentRepository()
         self.conversation_repository = ConversationRepository()

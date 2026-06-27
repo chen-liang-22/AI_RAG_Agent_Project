@@ -17,6 +17,11 @@ class DictionaryApplicationService:
     """
 
     def __init__(self, repository: DictionaryRepository | None = None):
+        """初始化字典应用服务。
+
+        repository 可注入，默认走 V2 字典仓储，便于后续加缓存或替换存储实现。
+        """
+
         self.repository = repository or DictionaryRepository()
 
     def list_groups(self, dictionary_code: str | None = None) -> list[DictionaryGroupResponse]:

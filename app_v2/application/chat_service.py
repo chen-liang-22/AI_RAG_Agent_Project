@@ -47,6 +47,12 @@ class ChatApplicationService:
             conversation_repository: ConversationRepository | None = None,
             dictionary_repository: DictionaryRepository | None = None,
     ):
+        """初始化聊天外观服务。
+
+        conversation_repository 负责聊天记录持久化，dictionary_repository 负责把前端传入的模型模式、
+        会话状态等字典编码归一化。store 只保留给历史测试兼容。
+        """
+
         # store 参数保留给旧测试占位；真实状态码归一化走 V2 字典仓储。
         self.store = store
         self.conversation_repository = conversation_repository or ConversationRepository()

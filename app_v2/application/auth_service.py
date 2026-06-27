@@ -257,6 +257,11 @@ class RefreshSessionStore:
     """Refresh 会话存储，使用 Redis TTL 管理登录续签状态。"""
 
     def __init__(self, redis_client: RedisClient | None = None):
+        """初始化 refresh 会话存储。
+
+        redis_client 支持测试注入；生产代码默认使用项目统一 Redis 客户端。
+        """
+
         self.redis_client = redis_client or get_redis_client()
 
     def save_session(
@@ -351,6 +356,12 @@ class AuthService:
             repository: AuthRepository | None = None,
             refresh_store: RefreshSessionStore | None = None,
     ):
+        """初始化认证外观服务。
+
+        repository 管用户表，refresh_store 管 refresh_token 会话，
+        两者都允许注入，方便单元测试替换真实数据库或 Redis。
+        """
+
         self.repository = repository or AuthRepository()
         self.refresh_store = refresh_store or RefreshSessionStore()
 

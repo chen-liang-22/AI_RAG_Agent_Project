@@ -45,26 +45,38 @@ router = APIRouter(prefix="/training", tags=["V2 销售训练"])
 
 
 def _materials() -> TrainingMaterialApplicationService:
+    """创建训练资料应用服务，避免路由函数直接依赖核心编排类。"""
+
     return TrainingMaterialApplicationService()
 
 
 def _profiles() -> TrainingProfileApplicationService:
+    """创建训练画像应用服务，负责字典画像、角色生成和场景润色。"""
+
     return TrainingProfileApplicationService()
 
 
 def _goals() -> TrainingGoalApplicationService:
+    """创建训练目标应用服务，负责开放式训练目标和评分规则生成。"""
+
     return TrainingGoalApplicationService()
 
 
 def _plans() -> TrainingPlanApplicationService:
+    """创建训练方案应用服务，负责方案保存、查询、修改和删除。"""
+
     return TrainingPlanApplicationService()
 
 
 def _sessions() -> TrainingSessionApplicationService:
+    """创建训练会话应用服务，负责开始训练和提交学员回复。"""
+
     return TrainingSessionApplicationService()
 
 
 def _scoring() -> TrainingScoringApplicationService:
+    """创建训练评分应用服务，负责生成训练结束后的评分报告。"""
+
     return TrainingScoringApplicationService()
 
 
