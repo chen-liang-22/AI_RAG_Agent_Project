@@ -1,3 +1,9 @@
+"""销售训练接口 DTO。
+
+本文件只定义请求和响应模型，不写业务逻辑。
+字段名是前后端 API 协议，除非同步修改前端和接口文档，否则不要随意改名。
+"""
+
 from pydantic import BaseModel, Field
 
 # 这里的类都是 Pydantic 模型，作用类似 Java 里的 DTO / VO：
