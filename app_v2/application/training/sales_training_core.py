@@ -141,6 +141,12 @@ class V2SalesTrainingCoreService:
             knowledge_store=None,
             document_repository: DocumentRepository | None = None,
     ):
+        """初始化销售训练核心服务。
+
+        这里组合训练仓储、文件台账、正式向量库和临时向量库。
+        knowledge_store 只保留给旧测试兼容，真实文件台账统一走 DocumentRepository。
+        """
+
         # repository 支持注入，主要是为了单元测试或局部替换仓储实现。
         self.repository = repository or TrainingRepository()
         # 文件台账复用知识库 documents 表，统一写入 MySQL。
@@ -1814,24 +1820,35 @@ class V2SalesTrainingCoreService:
         return max(5, min(100, round_limit))
 
     def _require_role_profile(self, profile_id: str) -> dict[str, Any]:
+        """查询 AI 角色画像，不存在时直接抛出 404。"""
+
         profile = self.repository.get_role_profile(profile_id)
         if not profile:
             raise HTTPException(status_code=404, detail="AI 陪练角色不存在")
         return profile
 
     def _require_goal_setting(self, setting_id: str) -> dict[str, Any]:
+        """查询训练目标设置，不存在时直接抛出 404。"""
+
         setting = self.repository.get_goal_setting(setting_id)
         if not setting:
             raise HTTPException(status_code=404, detail="训练设置不存在")
         return setting
 
     def _require_plan(self, plan_id: str) -> dict[str, Any]:
+        """查询训练方案，不存在时直接抛出 404。"""
+
         plan = self.repository.get_plan(plan_id)
         if not plan:
             raise HTTPException(status_code=404, detail="训练方案不存在")
         return plan
 
     def _require_session(self, session_id: str) -> dict[str, Any]:
+        """查询可继续对话的训练会话。
+
+        completed/deleted 等状态不能继续提交学员回复。
+        """
+
         session = self.repository.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="训练会话不存在")
@@ -2342,6 +2359,8 @@ class V2SalesTrainingCoreService:
 
     @staticmethod
     def _session_response(row: dict[str, Any], opening_message: str | None = None) -> TrainingSessionResponse:
+        """把数据库训练会话行转换成接口响应对象。"""
+
         return TrainingSessionResponse(
             session_id=row["session_id"],
             profile_id=row["profile_id"],
@@ -2631,6 +2650,8 @@ class V2SalesTrainingCoreService:
         )
 
     def _role_prompt(self, request: RoleGenerateRequest, evidence: list[dict[str, Any]]) -> str:
+        """构造 AI 客户角色生成提示词。"""
+
         return f"""
 请根据学员画像、客户画像字段、场景描述和训练知识，生成销售训练 AI 陪练角色。
 
@@ -2702,6 +2723,8 @@ JSON 字段建议：
 """
 
     def _scenario_polish_prompt(self, request: ScenarioPolishRequest) -> str:
+        """构造场景描述润色提示词。"""
+
         return f"""
 请根据客户画像字段、原始场景描述和补充细节，润色销售陪练的场景描述。
 
@@ -2732,6 +2755,8 @@ JSON 字段建议：
 """
 
     def _supplement_questions_prompt(self, request: RoleGenerateRequest, evidence: list[dict[str, Any]]) -> str:
+        """构造补充问答生成提示词。"""
+
         return f"""
 请根据客户画像、学员画像、场景描述和训练知识，生成“补充问答场景细节”的选择题。
 
@@ -2828,6 +2853,8 @@ JSON 格式：
         return questions[:5]
 
     def _goal_prompt(self, profile: dict[str, Any]) -> str:
+        """构造开放式训练目标和评分规则生成提示词。"""
+
         role_profile = self._load_json(profile.get("role_profile_json"), {})
         hidden_profile = self._load_json(profile.get("hidden_profile_json"), {})
         return f"""
@@ -2885,6 +2912,8 @@ AI 陪练角色：
 """
 
     def _opening_prompt(self, session: dict[str, Any]) -> str:
+        """构造 AI 客户开场白提示词。"""
+
         profile = self._require_role_profile(session["profile_id"])
         setting = self._require_goal_setting(session["setting_id"])
         role_profile = self._load_json(profile.get("role_profile_json"), {})
@@ -2910,6 +2939,8 @@ AI 陪练角色：
 """
 
     def _customer_prompt(self, session: dict[str, Any], trainee_message: str, evidence: list[dict[str, Any]]) -> str:
+        """构造每轮 AI 客户回复提示词。"""
+
         profile = self._require_role_profile(session["profile_id"])
         setting = self._require_goal_setting(session["setting_id"])
         role_profile = self._load_json(profile.get("role_profile_json"), {})
@@ -2951,6 +2982,8 @@ AI 陪练角色：
             turns: list[dict[str, Any]],
             evidence: list[dict[str, Any]],
     ) -> str:
+        """构造最终评分报告提示词。"""
+
         scoring_rules = self._load_json(setting.get("scoring_rules_json"), self._default_scoring_rules())
         return f"""
 请作为销售训练考官，对本次开放式训练评分，只输出 JSON。
@@ -2981,6 +3014,8 @@ evidence_refs、improvement_advice、reference_script、next_training_plan。
 
     @staticmethod
     def _conversation_text(turns: list[dict[str, Any]]) -> str:
+        """把训练对话轮次拼成评分和证据检索使用的纯文本。"""
+
         return "\n".join(f"{item['role']}：{item['content']}" for item in turns)
 
     @staticmethod
@@ -3081,6 +3116,11 @@ evidence_refs、improvement_advice、reference_script、next_training_plan。
         ]
 
     def _fallback_role(self, request: RoleGenerateRequest, evidence: list[dict[str, Any]]) -> dict:
+        """角色生成失败时的本地兜底结果。
+
+        兜底只使用用户选择的画像字段和已召回证据，不凭空扩展业务事实。
+        """
+
         selected_fields = request.selected_fields or {}
 
         def pick_field(*keys: str, default: str) -> str:
@@ -3166,6 +3206,8 @@ evidence_refs、improvement_advice、reference_script、next_training_plan。
 
     @staticmethod
     def _fallback_goal(profile: dict[str, Any]) -> dict:
+        """训练目标生成失败时的本地兜底结果。"""
+
         role_profile = V2SalesTrainingCoreService._load_json(profile.get("role_profile_json"), {})
         hidden_profile = V2SalesTrainingCoreService._load_json(profile.get("hidden_profile_json"), {})
         evidence = V2SalesTrainingCoreService._load_json(profile.get("retrieved_evidence_json"), [])
@@ -3200,11 +3242,15 @@ evidence_refs、improvement_advice、reference_script、next_training_plan。
 
     @staticmethod
     def _fallback_customer_reply(evidence: list[dict[str, Any]]) -> str:
+        """AI 客户回复失败时的兜底话术。"""
+
         if evidence:
             return "你说的方向我能理解，不过我更关心实际效果和投入风险。你能结合类似客户案例，具体说说为什么这个方案适合我吗？"
         return "我先听听你的思路，但我比较关注投入产出和落地风险，你别只讲概念。"
 
     def _fallback_opening_message(self, session: dict[str, Any]) -> str:
+        """AI 客户开场白失败时的兜底话术。"""
+
         profile = self._require_role_profile(session["profile_id"])
         role_profile = self._load_json(profile.get("role_profile_json"), {})
         position = role_profile.get("position") or "业务负责人"
@@ -3214,6 +3260,11 @@ evidence_refs、improvement_advice、reference_script、next_training_plan。
 
     @staticmethod
     def _fallback_score(turns: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> dict:
+        """评分模型失败时的兜底评分。
+
+        兜底分只用于保证流程闭环，真实评分仍应优先使用 LLM 按评分规则判断。
+        """
+
         trainee_turns = [item for item in turns if item["role"] == "trainee"]
         base_score = 72 + min(10, len(trainee_turns) * 2)
         return {
@@ -3232,6 +3283,8 @@ evidence_refs、improvement_advice、reference_script、next_training_plan。
 
     @staticmethod
     def _score_level(score: int) -> str:
+        """把最终得分转换成中文等级。"""
+
         if score > 90:
             return "优秀"
         if score > 80:

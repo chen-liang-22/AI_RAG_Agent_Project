@@ -1,0 +1,120 @@
+# 应用级配置。
+# 这里放和业务运行、RAG、模型、内置知识清单、ID 生成相关的配置。
+
+rag:
+  # 聊天模型调用方式。
+  # openai_compatible/openai：使用 OpenAI 兼容接口，例如 DashScope compatible-mode/v1。
+  # tongyi：使用 LangChain ChatTongyi 原生封装。
+  chat_provider: openai_compatible
+
+  # 默认聊天模型名称，用于 Query Planner、最终回答、销售训练生成等场景。
+  chat_model_name: deepseek-v4-flash
+
+  # 模型档位映射，前端传 low/medium/high 时会映射到这里的具体模型。
+  chat_model_low: qwen-turbo
+  chat_model_medium: qwen3.6-flash
+  chat_model_high: deepseek-v4-flash
+
+  # OpenAI 兼容接口地址，chat_provider=openai_compatible/openai 时使用。
+  openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+  # 文本向量模型。更换模型或维度后，需要重建 Qdrant collection。
+  embedding_model_name: text-embedding-v4
+
+  # 聊天路由模式。
+  # direct_rag：直接走知识库检索和最终回答，响应更短。
+  # agent/react_agent/legacy_agent：走 LangGraph/Agent 工具链，适合工具编排。
+  chat_route_mode: agent
+
+  # Query Planner 模式。
+  # adaptive：先原问题检索，召回弱时才调用 LLM 改写/拆分。
+  # llm：每次检索前都调用 LLM 改写/拆分。
+  # rule/rules/off/disabled：不调用 LLM，只使用原问题和显式多问号拆分。
+  query_planner_mode: adaptive
+
+  # Query Planner 可读取的最近历史消息条数。
+  query_planner_history_limit: 20
+
+  # Query Planner 中每条历史消息最多保留的字符数。
+  query_planner_history_chars: 300
+
+  # adaptive 模式下，首次召回 top1 分数低于该值时触发 Query Planner。
+  adaptive_retrieve_min_score: 0.72
+
+  # adaptive 模式下，首次召回资料数量少于该值时触发 Query Planner。
+  adaptive_retrieve_min_docs: 3
+
+  # adaptive 模式下，首次召回 top3 平均分低于该值时触发 Query Planner。
+  adaptive_retrieve_top3_avg_score: 0.68
+
+  # 召回极低时是否跳过 Query Planner，减少无关问题的等待时间。
+  adaptive_skip_planner_on_very_low_score: true
+  adaptive_skip_planner_max_score: 0.55
+  adaptive_skip_planner_top3_avg_score: 0.50
+
+  # FastAPI 启动预热配置。
+  startup_warmup_enabled: true
+  warmup_qdrant: true
+  warmup_embedding: true
+  warmup_chat_model: false
+  warmup_fail_fast: false
+
+  # 文档解析规则，集中管理编号、标题、问答前缀等格式约定。
+  document_parse_rules:
+    numbered_item_pattern: "^\\s*(\\d+)[.、]\\s*(.+)$"
+    heading_pattern: "^\\s*#{2,6}\\s*(.+)$"
+    number_prefix_pattern: "^\\s*(\\d+)[.、]\\s*"
+    number_prefix_only_pattern: "^\\s*\\d+\\s*[.、]\\s*$"
+    answer_prefix_pattern: "^(?:答案|答|A)[:：]\\s*"
+    invalid_answer_pattern: "^(?:问题|答案|答|Q|A)[:：]?$"
+    question_marks:
+      - "？"
+      - "?"
+
+agent:
+  # 外部业务数据 CSV 路径，Agent 工具查询模拟业务记录时使用。
+  external_data_path: data/external/records.csv
+
+id_generator:
+  # 是否启用雪花算法主键生成器。
+  enabled: true
+  # 雪花算法起始时间。固定后不要随意修改，否则会影响 ID 时间段。
+  epoch: "2026-01-01T00:00:00+08:00"
+  # 本机节点编号。生产多实例部署时每个实例必须不同。
+  worker_id: 0
+  # 允许的轻微时钟回拨毫秒数。
+  max_clock_backward_ms: 5
+
+knowledge_manifest:
+  # data/ 内置知识文件默认入库配置。
+  defaults:
+    collection_name: agent
+    document_type: text
+    split_strategy: recursive
+
+  # 指定文件的结构类型和切分策略。
+  files:
+    扫地机器人100问.pdf:
+      collection_name: agent
+      document_type: qa
+      split_strategy: numbered_qa
+    扫地机器人100问2.txt:
+      collection_name: agent
+      document_type: qa
+      split_strategy: numbered_qa
+    扫拖一体机器人100问.txt:
+      collection_name: agent
+      document_type: qa
+      split_strategy: numbered_qa
+    故障排除.txt:
+      collection_name: agent
+      document_type: numbered
+      split_strategy: numbered_segments
+    维护保养.txt:
+      collection_name: agent
+      document_type: numbered
+      split_strategy: numbered_segments
+    选购指南.txt:
+      collection_name: agent
+      document_type: numbered
+      split_strategy: numbered_segments

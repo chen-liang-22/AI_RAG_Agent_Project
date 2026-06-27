@@ -22,6 +22,11 @@ class KnowledgeAnswerService:
     """基于 RAG 上下文直接生成最终客服回答。"""
 
     def __init__(self):
+        """初始化知识直答服务。
+
+        知识直答只依赖 RAG 检索服务，最终回答由当前聊天模型生成。
+        """
+
         self.rag = RagSummarizeService()
 
     def answer(
@@ -171,6 +176,11 @@ class KnowledgeAnswerService:
             *,
             history: list[dict] | None = None,
     ) -> list[AnyMessage]:
+        """构造最终回答模型的消息列表。
+
+        会话历史只取最近若干条，避免长对话挤占参考资料上下文。
+        """
+
         return [
             SystemMessage(content=self._system_prompt()),
             *self._history_to_messages(history or []),
@@ -215,6 +225,8 @@ class KnowledgeAnswerService:
 
     @staticmethod
     def _system_prompt() -> str:
+        """返回知识直答模式的系统提示词。"""
+
         return (
             "你是扫地/扫拖机器人客服,叫阿良。"
             "优先根据参考资料回答。"
@@ -227,6 +239,8 @@ class KnowledgeAnswerService:
 
     @staticmethod
     def _user_message(query: str, context: str) -> str:
+        """把用户问题和 RAG 参考资料组装成 HumanMessage 内容。"""
+
         return (
             f"用户问题：{query}\n\n"
             f"参考资料：\n{context}\n\n"
@@ -235,8 +249,12 @@ class KnowledgeAnswerService:
 
     @staticmethod
     def _new_trace_id() -> str:
+        """生成一次聊天链路的追踪编号，方便串联检索和模型日志。"""
+
         return f"chat_{uuid.uuid4().hex[:12]}"
 
     @staticmethod
     def _elapsed_ms(start_time: float) -> float:
+        """把 perf_counter 起点转换成毫秒耗时。"""
+
         return (time.perf_counter() - start_time) * 1000

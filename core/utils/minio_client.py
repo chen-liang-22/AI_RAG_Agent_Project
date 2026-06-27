@@ -15,11 +15,8 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import quote
 
-import yaml
-
-from core.utils.config_handler import load_env_file
+from core.utils.config_handler import load_env_file, load_yaml_config, minio_conf
 from core.utils.logger_handler import logger
-from core.utils.path_tool import get_abs_path
 
 try:
     import minio
@@ -72,16 +69,12 @@ class MinioObjectSummary:
     size: int | None = None
 
 
-def load_minio_config(config_path: str = get_abs_path("config/minio.yml")) -> dict[str, Any]:
+def load_minio_config(config_path: str | None = None) -> dict[str, Any]:
     """读取 MinIO 配置，并允许环境变量覆盖关键连接参数。"""
 
     load_env_file()
     config = dict(DEFAULT_MINIO_CONFIG)
-    path = Path(config_path)
-    if path.exists():
-        raw_config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if isinstance(raw_config, dict):
-            config.update(raw_config)
+    config.update(load_yaml_config(config_path) if config_path else minio_conf)
 
     password_env = str(config.get("secret_key_env") or "MINIO_ROOT_PASSWORD")
     config.update({

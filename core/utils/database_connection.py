@@ -8,12 +8,11 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
-import yaml
 from sqlalchemy.exc import DatabaseError, IntegrityError
 
+from core.utils.config_handler import database_conf
 from core.utils.path_tool import get_abs_path
 
 
@@ -45,10 +44,7 @@ def load_database_config() -> dict[str, Any]:
     """读取 MySQL 配置，并允许环境变量覆盖关键连接信息。"""
 
     _load_env_file()
-    config_path = Path(get_abs_path("config/database.yml"))
-    config: dict[str, Any] = {}
-    if config_path.exists():
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    config = dict(database_conf)
 
     mysql_config = dict(config.get("mysql") or {})
     password_env = str(mysql_config.get("password_env") or "MYSQL_PASSWORD")

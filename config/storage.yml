@@ -1,0 +1,90 @@
+# 存储与中间件配置。
+# 这里集中管理 MySQL、Redis、MinIO、Qdrant 这些外部服务。
+
+database:
+  # 当前业务数据库统一使用 MySQL。
+  type: mysql
+
+  mysql:
+    host: "127.0.0.1"
+    port: 3306
+    database: "ai_rag_agent"
+    user: "root"
+    # 密码优先从环境变量 MYSQL_PASSWORD 读取，没有环境变量时使用 password。
+    password_env: "MYSQL_PASSWORD"
+    password: "1234qwer"
+    charset: "utf8mb4"
+    pool_size: 5
+    max_overflow: 10
+    pool_timeout_seconds: 5
+    pool_recycle_seconds: 1800
+
+redis:
+  # Redis 用于缓存、任务状态和轻量锁。
+  enabled: true
+  host: "127.0.0.1"
+  port: 6379
+  db: 0
+  password_env: "REDIS_PASSWORD"
+  password: "1234qwer"
+  socket_timeout_seconds: 2
+  socket_connect_timeout_seconds: 2
+  key_prefix: "ai_rag_agent"
+  default_ttl_seconds: 1800
+  lock_timeout_seconds: 30
+
+minio:
+  # MinIO 用于保存上传原文件和预览文件。
+  enabled: true
+  endpoint: 127.0.0.1:9000
+  access_key: admin
+  secret_key_env: MINIO_ROOT_PASSWORD
+  secret_key: 1234qwer
+  secure: false
+  bucket_name: pub
+  public_base_url: http://127.0.0.1:9000
+  auto_create_bucket: false
+  public_read: true
+
+qdrant:
+  # 默认知识库 collection 名称。
+  collection_name: agent
+
+  # Qdrant HTTP 地址。本地 Docker 默认是 http://localhost:6333。
+  url: http://localhost:6333
+
+  # prefer_grpc=true 时会使用 6334。
+  grpc_port: 6334
+  prefer_grpc: false
+
+  # 文本向量常用 COSINE。
+  distance: COSINE
+
+  # true 会删除并重建 collection，清空已有向量；默认不要开启。
+  force_recreate: false
+
+  # 旧版 retriever 默认 topK。
+  k: 3
+
+  # 多 query 检索参数。
+  per_query_top_k: 5
+  per_query_keep: 2
+  final_context_limit: 6
+  use_metadata_filter: false
+  parallel_query_workers: 4
+
+  # 内置知识库目录和允许入库的文件类型。
+  data_path: data
+  allow_knowledge_file_type: ["txt", "pdf", "docx"]
+
+  # 上传预览配置。
+  upload_preview:
+    ttl_seconds: 86400
+    max_file_size_bytes: 52428800
+    sample_text_chars: 5000
+    recommendation_sample_chars: 10000
+
+  # 普通文本切分配置。
+  chunk_size: 200
+  chunk_overlap: 20
+  separators: ["\n\n", "\n", ".", "!", "?", "。", "！", "？", " ", ""]

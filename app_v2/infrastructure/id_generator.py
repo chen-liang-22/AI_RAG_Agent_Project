@@ -14,10 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-import yaml
-
+from core.utils.config_handler import id_generator_conf, load_yaml_config
 from core.utils.logger_handler import logger
-from core.utils.path_tool import get_abs_path
 
 
 DEFAULT_EPOCH = "2026-01-01T00:00:00+08:00"
@@ -161,8 +159,7 @@ def reset_id_generator_for_test() -> None:
 def load_id_generator_config(config_path: str | None = None) -> IdGeneratorConfig:
     """读取雪花算法配置，并应用环境变量覆盖。"""
 
-    path = config_path or get_abs_path("config/id_generator.yml")
-    raw_config = _read_yaml(path)
+    raw_config = load_yaml_config(config_path) if config_path else dict(id_generator_conf)
     epoch = str(os.getenv("ID_GENERATOR_EPOCH") or raw_config.get("epoch") or DEFAULT_EPOCH)
     worker_id = _read_int("ID_GENERATOR_WORKER_ID", raw_config.get("worker_id"), DEFAULT_WORKER_ID)
     max_clock_backward_ms = _read_int(

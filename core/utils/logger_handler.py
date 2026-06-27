@@ -41,6 +41,11 @@ class ColorFormatter(logging.Formatter):
     RESET = "\033[0m"
 
     def __init__(self, fmt: str | None = None):
+        """初始化彩色日志格式化器。
+
+        plain_formatter 用于 NO_COLOR 场景，保证文件日志和禁色控制台不带 ANSI 转义字符。
+        """
+
         super().__init__(fmt or LOG_FORMAT)
         self.plain_formatter = logging.Formatter(LOG_FORMAT)
 

@@ -9,14 +9,10 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Iterator
 
-import yaml
-
-from core.utils.config_handler import load_env_file
+from core.utils.config_handler import load_env_file, load_yaml_config, redis_conf
 from core.utils.logger_handler import logger
-from core.utils.path_tool import get_abs_path
 
 try:
     import redis
@@ -45,16 +41,12 @@ DEFAULT_REDIS_CONFIG: dict[str, Any] = {
 _redis_client: "RedisClient | None" = None
 
 
-def load_redis_config(config_path: str = get_abs_path("config/redis.yml")) -> dict[str, Any]:
+def load_redis_config(config_path: str | None = None) -> dict[str, Any]:
     """读取 Redis 配置，并允许环境变量覆盖连接信息。"""
 
     load_env_file()
     config = dict(DEFAULT_REDIS_CONFIG)
-    path = Path(config_path)
-    if path.exists():
-        raw_config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if isinstance(raw_config, dict):
-            config.update(raw_config)
+    config.update(load_yaml_config(config_path) if config_path else redis_conf)
 
     password_env = str(config.get("password_env") or "REDIS_PASSWORD")
     config.update({

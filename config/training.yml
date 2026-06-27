@@ -1,0 +1,85 @@
+# 销售训练资料入库配置。
+# 这里放训练资料 collection、LMS 案例切分、质量评估和发布验证配置。
+
+# 销售训练向量库配置。
+# published：正式训练资料 collection，只有人工发布成功的数据参与训练检索。
+# staging：临时待审核 collection，上传和重新切分后的切片先写这里。
+collections:
+  published: "sales_training_cases"
+  staging: "sales_training_cases_staging"
+
+# LMS 场景案例资料切分配置。
+lms_case:
+  # 中文编号标题识别规则，例如“一、客户案例”“二. 客户案例”。
+  case_title_pattern: "^[一二三四五六七八九十]+[、.．]\\s*.+"
+
+  # 业务片段关键词配置，用于把案例正文归类到统一 case_part。
+  part_markers:
+    case_profile:
+      - "客户案例"
+      - "企业"
+      - "老板身份"
+      - "合作行业"
+      - "客户阶段"
+    task_requirement:
+      - "任务要求"
+    standard_answer:
+      - "匹配答案"
+      - "话术案例"
+      - "话术原文"
+      - "谈单话术"
+      - "参考答案"
+    hidden_psychology:
+      - "隐性心理"
+      - "底层顾虑"
+      - "底层需求"
+      - "客户底层心理"
+      - "核心显性卡点"
+      - "隐性痛点"
+    scoring_rubric:
+      - "命中点"
+      - "扣分点"
+      - "评分标准"
+      - "能力维度"
+
+  # 不同 case_part 的默认可见性。
+  # visible：角色生成、对话和评分都可以使用。
+  # hidden：只给 AI 客户扮演使用，不直接展示给学员。
+  # scoring_only：只给训练结束评分使用。
+  part_visibility:
+    case_profile: "visible"
+    task_requirement: "visible"
+    standard_answer: "visible"
+    hidden_psychology: "hidden"
+    scoring_rubric: "scoring_only"
+
+# 切片质量评估配置。
+quality:
+  pass_score: 80
+  review_score: 60
+  max_chunk_chars: 1800
+  max_single_part_ratio: 0.75
+  required_parts:
+    - "case_profile"
+    - "task_requirement"
+    - "standard_answer"
+  recommended_parts:
+    - "scoring_rubric"
+
+# LLM 兜底切分配置。
+# 规则切分质量低时才调用模型重新抽取结构化切片，避免每次上传都消耗模型。
+llm_fallback:
+  enabled: true
+  trigger_score_below: 60
+  # 留空表示使用 app.yml 中 rag.chat_model_name 对应的默认聊天模型。
+  model_mode: null
+  max_source_chars: 12000
+  max_cases: 20
+  max_chunks: 80
+
+# 发布后抽样检索验证配置。
+publish_validation:
+  enabled: true
+  sample_size: 3
+  search_k: 3
+  min_hit_ratio: 0.6

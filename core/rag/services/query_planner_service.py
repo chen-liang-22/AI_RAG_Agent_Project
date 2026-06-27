@@ -33,6 +33,11 @@ class QueryPlannerService:
     """
 
     def __init__(self, *, max_queries: int = 6):
+        """初始化查询规划器。
+
+        max_queries 限制一次用户问题最多拆成几个 search_query，避免多意图问题把向量检索放大过多。
+        """
+
         self.max_queries = max_queries
 
     def plan(
@@ -166,6 +171,8 @@ class QueryPlannerService:
             history: list[dict[str, Any]],
             trace_id: str | None = None,
     ) -> list[str]:
+        """调用 LLM 把复杂问题改写/拆分成向量检索问题。"""
+
         history_limit = int(rag_conf.get("query_planner_history_limit", 20) or 20)
         history_chars = int(rag_conf.get("query_planner_history_chars", 300) or 300)
         history_text = self._format_history(history, limit=history_limit, chars_per_message=history_chars)
@@ -206,12 +213,19 @@ class QueryPlannerService:
         return self._normalize_queries([str(item) for item in raw_queries], original_query=query)
 
     def _fallback_queries(self, query: str) -> list[str]:
+        """模型不可用时的兜底查询列表。
+
+        优先按用户显式分隔符切分；切不出来时只返回原问题。
+        """
+
         parts = self._split_explicit_questions(query)
         if len(parts) <= 1:
             parts = [query]
         return self._normalize_queries(parts, original_query=query)
 
     def _normalize_queries(self, queries: list[str], *, original_query: str) -> list[str]:
+        """清洗、去重并截断 search_query 列表。"""
+
         result: list[str] = []
         seen: set[str] = set()
         source_queries = [original_query, *queries] if len(queries) <= 1 else queries
@@ -232,11 +246,15 @@ class QueryPlannerService:
 
     @staticmethod
     def _clean_query(value: str) -> str:
+        """清理单个检索问题的空白和结尾标点，并限制最大长度。"""
+
         value = re.sub(r"\s+", " ", value).strip(" \t\r\n，。！？?；;、")
         return value[:160]
 
     @classmethod
     def _split_explicit_questions(cls, query: str) -> list[str]:
+        """按用户明确输入的问号、分号或换行切分多问题。"""
+
         return [
             cls._clean_query(part)
             for part in re.split(r"[？?；;\n\r]+", query)
@@ -245,6 +263,8 @@ class QueryPlannerService:
 
     @staticmethod
     def _log_split_questions(source: str, queries: list[str]) -> None:
+        """逐条打印拆分结果，方便在 PyCharm 日志里直接看到每个子问题。"""
+
         source_text = {
             "explicit": "显式切分",
             "llm": "模型拆分",
@@ -262,6 +282,8 @@ class QueryPlannerService:
 
     @staticmethod
     def _query_key(value: str) -> str:
+        """生成去重键，忽略空白和常见中文标点。"""
+
         return re.sub(r"[\s，。！？?；;、,.]+", "", value.lower())
 
     @staticmethod
@@ -279,6 +301,11 @@ class QueryPlannerService:
 
     @staticmethod
     def _parse_json_object(content: str) -> dict[str, Any]:
+        """从模型输出中提取 JSON 对象。
+
+        兼容模型把 JSON 包在 ```json 代码块里的情况。
+        """
+
         clean_content = content.strip()
         fenced_match = re.search(r"```(?:json)?\s*(\{.*?})\s*```", clean_content, flags=re.S)
         if fenced_match:
@@ -292,6 +319,8 @@ class QueryPlannerService:
 
     @staticmethod
     def _message_content_to_text(content) -> str:
+        """兼容不同模型 SDK 返回的字符串或结构化 content。"""
+
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -306,6 +335,8 @@ class QueryPlannerService:
 
     @staticmethod
     def _system_prompt() -> str:
+        """返回 Query Planner 的系统提示词。"""
+
         return (
             "你是 RAG 检索 query planner。"
             "你的任务是把用户问题拆成适合向量检索的 search_query。"
@@ -318,6 +349,8 @@ class QueryPlannerService:
 
     @staticmethod
     def _user_prompt(query: str, history_text: str) -> str:
+        """把历史会话和当前问题组装成 Query Planner 的用户提示词。"""
+
         return (
             f"最近会话历史：\n{history_text}\n\n"
             f"用户当前问题：\n{query}\n\n"
@@ -326,4 +359,6 @@ class QueryPlannerService:
 
     @staticmethod
     def _elapsed_ms(start_time: float) -> float:
+        """把 perf_counter 起点转换为毫秒耗时。"""
+
         return (time.perf_counter() - start_time) * 1000

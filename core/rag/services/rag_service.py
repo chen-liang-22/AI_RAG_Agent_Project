@@ -45,6 +45,11 @@ class RagSummarizeService(object):
     """RAG 检索服务类。"""
 
     def __init__(self):
+        """初始化 RAG 检索链路依赖。
+
+        向量库服务采用懒加载；Query Planner 和 reranker 是轻量对象，可以直接创建。
+        """
+
         self.vector_store: VectorStoreService | None = None  # Qdrant 向量库服务，懒加载，避免 Qdrant 不可用时整个 RAG 初始化失败
         self.vector_stores: dict[str, VectorStoreService] = {}  # 按 collection 缓存向量库服务，避免多知识库互相串用
         self.query_planner = QueryPlannerService()  # LLM Query Planner，负责把复杂问题拆成多个 search_query
@@ -157,6 +162,8 @@ class RagSummarizeService(object):
             trace_id: str | None = None,
             collection_name: str | None = None,
     ) -> tuple[list[str], list[tuple[str, list[Document]]]]:
+        """根据配置选择查询规划模式，并执行对应的向量召回。"""
+
         planner_mode = str(rag_conf.get("query_planner_mode") or "adaptive").strip().lower()
 
         if planner_mode == "adaptive":
@@ -192,6 +199,12 @@ class RagSummarizeService(object):
             trace_id: str | None = None,
             collection_name: str | None = None,
     ) -> tuple[list[str], list[tuple[str, list[Document]]]]:
+        """adaptive 查询规划流程。
+
+        先用原问题检索一次；如果召回质量足够，就不再调用 LLM。
+        只有质量不足但仍有改写价值时，才让 Query Planner 补充检索问题。
+        """
+
         first_queries = self.query_planner.plan_initial(query, trace_id=trace_id)
         if collection_name is None:
             first_groups = self.retrieve_for_queries(first_queries, analysis, trace_id=trace_id)
@@ -293,6 +306,12 @@ class RagSummarizeService(object):
             analysis: QueryAnalysis,
             quality: RetrievalQuality,
     ) -> bool:
+        """判断低质量召回时是否直接跳过 Query Planner。
+
+        当首轮分数极低时，通常说明知识库本身没有相关内容，
+        此时再调用模型改写问题只会增加耗时，未必能提升召回。
+        """
+
         if not bool(rag_conf.get("adaptive_skip_planner_on_very_low_score", True)):
             return False
 
@@ -403,6 +422,8 @@ class RagSummarizeService(object):
             trace_id: str | None = None,
             collection_name: str | None = None,
     ) -> tuple[str, list[Document]]:
+        """执行单个 search_query 的向量召回。"""
+
         per_query_top_k = int(qdrant_conf.get("per_query_top_k", 5) or 5)
         use_metadata_filter = bool(qdrant_conf.get("use_metadata_filter", False))
         documents: list[Document] = []
@@ -456,6 +477,8 @@ class RagSummarizeService(object):
             trace_id: str | None = None,
             collection_name: str | None = None,
     ) -> list[Document]:
+        """访问 Qdrant 查询文档，并把异常转换为空召回结果。"""
+
         try:
             retrieve_start_time = time.perf_counter()
             logger.info(
@@ -492,6 +515,11 @@ class RagSummarizeService(object):
 
     @staticmethod
     def _log_intent_analysis(query: str, analysis: QueryAnalysis) -> None:
+        """打印轻量分析结果。
+
+        当前主链路已经不做硬编码意图判断，这里只保留调试字段。
+        """
+
         logger.info(
             "[RAG轻量分析] 原问题=%s 意图=%s 关键词=%s 过滤条件=%s 子问题=%s",
             query,
@@ -524,6 +552,8 @@ class RagSummarizeService(object):
             search_query: str,
             query_index: int,
     ) -> list[Document]:
+        """给召回文档补充本次检索问题信息，便于后续精排和日志展示。"""
+
         annotated_documents: list[Document] = []
         for document in documents:
             metadata = dict(document.metadata)
@@ -534,6 +564,8 @@ class RagSummarizeService(object):
 
     @staticmethod
     def _summarize_documents_for_log(documents: list[Document], limit: int = 8) -> list[dict]:
+        """把召回文档压缩成日志摘要，避免完整正文刷屏。"""
+
         result: list[dict] = []
         for index, document in enumerate(documents[:limit], start=1):
             metadata = document.metadata
@@ -592,6 +624,8 @@ class RagSummarizeService(object):
 
     @staticmethod
     def _read_metadata_value(metadata_json: str | None, key: str):
+        """从 metadata JSON 字符串中读取指定字段，解析失败时返回 None。"""
+
         if not metadata_json:
             return None
 
@@ -664,4 +698,6 @@ class RagSummarizeService(object):
 
     @staticmethod
     def _elapsed_ms(start_time: float) -> float:
+        """把 perf_counter 起点转换成毫秒耗时。"""
+
         return (time.perf_counter() - start_time) * 1000
