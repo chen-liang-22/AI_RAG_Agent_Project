@@ -1,3 +1,9 @@
+"""文件处理器抽象层。
+
+文件处理器只负责“读文件 -> LangChain Document”。
+后续的切片、Embedding、Qdrant 写入都在 DocumentParser 和 VectorStoreService 中完成。
+"""
+
 from abc import ABC, abstractmethod
 from pathlib import Path
 

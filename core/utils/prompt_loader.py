@@ -1,9 +1,17 @@
+"""提示词文件加载工具。
+
+Agent 主提示词、RAG 工具提示词和报告提示词都通过 config/prompts.yml 定位。
+这里集中读取文件，避免各个工具分散拼路径。
+"""
+
 from core.utils.config_handler import prompts_conf
 from core.utils.path_tool import get_abs_path
 from core.utils.logger_handler import logger
 
 
 def load_system_prompts():
+    """读取 Agent 主系统提示词。"""
+
     try:
         system_prompt_path = get_abs_path(prompts_conf["main_prompt_path"])
     except KeyError as e:
@@ -18,6 +26,8 @@ def load_system_prompts():
 
 
 def load_rag_prompts():
+    """读取 RAG 工具提示词。"""
+
     try:
         rag_prompt_path = get_abs_path(prompts_conf["rag_summarize_prompt_path"])
     except KeyError as e:
@@ -32,6 +42,8 @@ def load_rag_prompts():
 
 
 def load_report_prompts():
+    """读取报告生成提示词。"""
+
     try:
         report_prompt_path = get_abs_path(prompts_conf["report_prompt_path"])
     except KeyError as e:

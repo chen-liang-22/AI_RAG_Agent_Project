@@ -1,3 +1,13 @@
+"""Qdrant 向量库基础设施服务。
+
+这个模块是“文件入库、RAG 检索、销售训练资料发布”共同依赖的向量库出口。
+业务层不直接操作 QdrantClient，而是通过这里完成：
+- 文档分片写入；
+- 相似度检索；
+- metadata 过滤；
+- 按 document_id / batch_id 删除或复制向量点。
+"""
+
 from typing import Any
 
 from langchain_core.documents import Document  # LangChain 的文档对象，包含 page_content 和 metadata
@@ -57,6 +67,7 @@ class VectorStoreService:
 
         recreate_collection = qdrant_conf.get("force_recreate", False) if force_recreate is None else force_recreate
         self.collection_name = normalize_qdrant_collection_name(collection_name)
+        logger.info("[Qdrant] 初始化向量库服务 Collection=%s 是否重建=%s", self.collection_name, recreate_collection)
 
         self.vector_store = QdrantVectorStore.construct_instance(
             embedding=embed_model,  # 文本转向量时使用的 embedding 模型
@@ -82,7 +93,9 @@ class VectorStoreService:
         它可以清理历史遗留的旧 points，尤其是没有 document_id 的旧数据。
         """
 
-        return cls(force_recreate=True, collection_name=collection_name)
+        normalized_collection_name = normalize_qdrant_collection_name(collection_name)
+        logger.info("[Qdrant] 重建Collection服务 Collection=%s", normalized_collection_name)
+        return cls(force_recreate=True, collection_name=normalized_collection_name)
 
     def get_retriever(self):
         """获取 LangChain retriever。
@@ -161,6 +174,13 @@ class VectorStoreService:
 
         search_filter = self.build_metadata_filter(filters)
         result_limit = k or qdrant_conf["k"]
+        logger.info(
+            "[Qdrant] 相似度检索开始 Collection=%s TopK=%s 是否有过滤=%s 问题=%s",
+            self.collection_name,
+            result_limit,
+            search_filter is not None,
+            query[:120],
+        )
         results = self.vector_store.similarity_search_with_score(
             query,
             k=result_limit,
@@ -173,6 +193,7 @@ class VectorStoreService:
             metadata["_vector_score"] = float(score)
             documents.append(Document(page_content=document.page_content, metadata=metadata))
 
+        logger.info("[Qdrant] 相似度检索完成 Collection=%s 命中数量=%s", self.collection_name, len(documents))
         return documents
 
     def list_documents_by_metadata(
@@ -358,6 +379,7 @@ class VectorStoreService:
                 document_id,
             )
             return
+        logger.info("[Qdrant] 按文档删除向量开始 Collection=%s 文档编号=%s", normalized_collection_name, document_id)
         client.delete(
             collection_name=normalized_collection_name,
             points_selector=models.FilterSelector(
@@ -372,6 +394,7 @@ class VectorStoreService:
             ),
             wait=True,
         )
+        logger.info("[Qdrant] 按文档删除向量完成 Collection=%s 文档编号=%s", normalized_collection_name, document_id)
 
     @staticmethod
     def delete_vectors_by_metadata(field_name: str, field_value: str, collection_name: str | None = None) -> None:
@@ -385,6 +408,12 @@ class VectorStoreService:
         if not client.collection_exists(normalized_collection_name):
             logger.info("[Qdrant] collection 不存在，跳过向量删除 collection=%s", normalized_collection_name)
             return
+        logger.info(
+            "[Qdrant] 按Metadata删除向量开始 Collection=%s 字段=%s 值=%s",
+            normalized_collection_name,
+            field_name,
+            field_value,
+        )
         client.delete(
             collection_name=normalized_collection_name,
             points_selector=models.FilterSelector(
@@ -398,6 +427,12 @@ class VectorStoreService:
                 )
             ),
             wait=True,
+        )
+        logger.info(
+            "[Qdrant] 按Metadata删除向量完成 Collection=%s 字段=%s 值=%s",
+            normalized_collection_name,
+            field_name,
+            field_value,
         )
 
     @staticmethod
@@ -420,6 +455,13 @@ class VectorStoreService:
             logger.info("[Qdrant] collection 不存在，返回空文档列表 collection=%s", normalized_collection_name)
             return []
 
+        logger.info(
+            "[Qdrant] 按Metadata滚动读取开始 Collection=%s 字段=%s 值=%s 上限=%s",
+            normalized_collection_name,
+            field_name,
+            field_value,
+            limit,
+        )
         documents: list[Document] = []
         next_page_offset = None
         safe_limit = max(1, limit)
@@ -451,6 +493,13 @@ class VectorStoreService:
             if next_page_offset is None:
                 break
 
+        logger.info(
+            "[Qdrant] 按Metadata滚动读取完成 Collection=%s 字段=%s 值=%s 文档数=%s",
+            normalized_collection_name,
+            field_name,
+            field_value,
+            len(documents),
+        )
         return documents
 
     @staticmethod
@@ -483,6 +532,15 @@ class VectorStoreService:
         next_page_offset = None
         safe_limit = max(1, limit)
         updates = metadata_updates or {}
+        logger.info(
+            "[Qdrant] 点复制/更新开始 源Collection=%s 目标Collection=%s 字段=%s 值=%s 上限=%s 更新字段=%s",
+            source_name,
+            target_name,
+            field_name,
+            field_value,
+            safe_limit,
+            sorted(updates.keys()),
+        )
         while copied_count < safe_limit:
             page_limit = min(256, safe_limit - copied_count)
             points, next_page_offset = client.scroll(
@@ -518,10 +576,20 @@ class VectorStoreService:
             if next_page_offset is None:
                 break
 
+        logger.info(
+            "[Qdrant] 点复制/更新完成 源Collection=%s 目标Collection=%s 字段=%s 值=%s 数量=%s",
+            source_name,
+            target_name,
+            field_name,
+            field_value,
+            copied_count,
+        )
         return copied_count
 
     @staticmethod
     def list_collections() -> list[str]:
+        """列出当前 Qdrant 中的 collection 名称。"""
+
         client = QdrantClient(**get_qdrant_client_options())
         return [collection.name for collection in client.get_collections().collections]
 
@@ -546,6 +614,15 @@ class VectorStoreService:
         if not object_name:
             raise ValueError(f"文件 {document_id} 缺少 MinIO 对象路径，请先完成历史文件迁移")
 
+        logger.info(
+            "[Qdrant] 文件索引开始 Collection=%s 文档编号=%s 文件名=%s 文档类型=%s 切分策略=%s 版本=%s",
+            self.collection_name,
+            document_id,
+            filename,
+            document_type or document.get("document_type") or "text",
+            split_strategy or document.get("split_strategy") or "recursive",
+            version,
+        )
         with get_file_storage_service().downloaded_temp_file(
                 bucket_name=document.get("bucket_name"),
                 object_name=object_name,
@@ -573,5 +650,11 @@ class VectorStoreService:
 
         self.delete_document_vectors(document_id, collection_name=self.collection_name)
         self.vector_store.add_documents(index_documents)
+        logger.info(
+            "[Qdrant] 文件索引完成 Collection=%s 文档编号=%s 分片数量=%s",
+            self.collection_name,
+            document_id,
+            len(index_documents),
+        )
 
         return len(index_documents)

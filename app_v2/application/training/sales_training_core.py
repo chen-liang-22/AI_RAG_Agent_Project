@@ -1,4 +1,16 @@
-﻿import json
+﻿"""销售训练核心应用服务。
+
+这个文件承载销售陪练一期的主业务编排：
+- 训练资料上传、切片、质量评估、发布到正式向量库；
+- 学员画像和客户画像合成 AI 客户角色；
+- 生成开放式训练目标、动态轮数和评分规则；
+- 训练会话对话、每轮检索案例证据、最终评分报告。
+
+这里使用外观模式把多个子系统收敛成一个稳定入口。
+文件较大是因为一期先保证流程闭环，后续可以继续按资料、角色、会话、评分拆小。
+"""
+
+import json
 import os
 import re
 import time
@@ -140,6 +152,11 @@ class V2SalesTrainingCoreService:
         self.vector_service = VectorStoreService(collection_name=self.training_collection_name)
         # 待人工审核的上传切片写入临时 collection，发布成功后再清理，避免关系型数据库保存正文切片。
         self.staging_vector_service = VectorStoreService(collection_name=self.staging_collection_name)
+        logger.info(
+            "[销售训练] 核心服务初始化完成 正式Collection=%s 临时Collection=%s",
+            self.training_collection_name,
+            self.staging_collection_name,
+        )
 
     def upload_knowledge(
             self,
@@ -265,6 +282,7 @@ class V2SalesTrainingCoreService:
         try:
             # 阶段 5：解析文件并生成预览切片；待审核正文只写入临时向量库。
             with self._download_batch_file(batch) as file_path:
+                logger.info("[销售训练] 训练知识解析开始 批次编号=%s 临时文件=%s", batch_id, file_path)
                 chunks = self._parse_training_chunks(
                     file_path=file_path,
                     batch_id=batch_id,
@@ -273,6 +291,7 @@ class V2SalesTrainingCoreService:
                 )
                 if not chunks:
                     raise ValueError("文件没有切出有效训练知识")
+                logger.info("[销售训练] 训练知识规则切片完成 批次编号=%s 切片数量=%s", batch_id, len(chunks))
 
                 # 阶段 6：计算切片质量报告；质量较低时才尝试 LLM 兜底切分。
                 chunks, quality_report = self._improve_training_chunks_if_needed(
@@ -284,6 +303,7 @@ class V2SalesTrainingCoreService:
                     model_mode=model_mode,
                 )
             # 阶段 7：把待审核切片写入临时向量库，前端预览也从临时库按 batch_id 读取。
+            logger.info("[销售训练] 训练知识写入临时向量库开始 批次编号=%s 临时Collection=%s", batch_id, self.staging_collection_name)
             point_count = self._write_staging_chunks(batch=batch, chunks=chunks, source_type=source_type)
             # 阶段 8：上传预览完成，等待人工确认发布。
             self.repository.update_batch_status(
@@ -446,6 +466,13 @@ class V2SalesTrainingCoreService:
         if not chunks:
             raise HTTPException(status_code=400, detail="临时向量库没有可发布的训练切片，请重新上传或重新切分")
 
+        logger.info(
+            "[销售训练] 训练资料发布开始 批次编号=%s 临时Collection=%s 正式Collection=%s 临时切片数=%s",
+            batch_id,
+            self.staging_collection_name,
+            self.training_collection_name,
+            len(chunks),
+        )
         self.repository.update_batch_status(batch_id, status="embedding")
         try:
             copied_count = self._publish_staging_vectors(batch=batch)
@@ -903,6 +930,12 @@ class V2SalesTrainingCoreService:
         # - visible：学员也能看到的显性案例；
         # - hidden：只给 AI 客户使用的底层顾虑/隐性心理。
         evidence = self._search_training_evidence(query, visibility=("visible", "hidden"), k=6)
+        logger.info(
+            "[销售训练][角色生成] 证据召回完成 方案编号=%s 证据数量=%s 命中切片=%s",
+            request.plan_id or "-",
+            len(evidence),
+            self._join_values(item.get("chunk_id") for item in evidence),
+        )
         prompt = self._role_prompt(request, evidence)
         result = self._invoke_json(
             prompt,
@@ -1026,6 +1059,14 @@ class V2SalesTrainingCoreService:
         if setting["profile_id"] != request.profile_id:
             raise HTTPException(status_code=400, detail="训练设置和陪练角色不匹配")
         response_mode = self._normalize_response_mode(request.response_mode)
+        logger.info(
+            "[销售训练] 创建训练会话开始 角色编号=%s 设置编号=%s 学员编号=%s 回复模式=%s 轮数上限=%s",
+            request.profile_id,
+            request.setting_id,
+            request.trainee_id,
+            response_mode,
+            setting["round_limit"],
+        )
         session = self.repository.create_session(
             profile_id=request.profile_id,
             setting_id=request.setting_id,
@@ -1232,6 +1273,12 @@ class V2SalesTrainingCoreService:
             len(conversation_text),
         )
         evidence = self._search_training_evidence(conversation_text, visibility=("visible", "scoring_only"), k=6)
+        logger.info(
+            "[销售训练][评分] 评分证据召回完成 会话编号=%s 证据数量=%s 命中切片=%s",
+            session_id,
+            len(evidence),
+            self._join_values(item.get("chunk_id") for item in evidence),
+        )
         result = self._invoke_json(
             self._score_prompt(profile, setting, turns, evidence),
             model_mode=model_mode,

@@ -1,3 +1,10 @@
+"""PDF 文件处理器。
+
+本模块负责读取 PDF 正文，并尽量读取 PDF 书签目录。
+书签目录会挂到首个 Document 的 metadata["_pdf_outline"]，
+后续 DocumentParser 可以用它做“目录问答”切片。
+"""
+
 from typing import Any
 
 from langchain_core.documents import Document

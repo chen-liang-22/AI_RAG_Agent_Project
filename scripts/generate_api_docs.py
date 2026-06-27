@@ -20,11 +20,11 @@ from fastapi.routing import APIRoute
 from api.main import app
 
 
-OUTPUT_PATH = PROJECT_ROOT / "docs" / "接口文档.md"
+OUTPUT_PATH = PROJECT_ROOT / "docs" / "初始化文件" / "接口文档.md"
 SCHEMA_SOURCE_FILES = [
     PROJECT_ROOT / "api" / "schemas.py",
     PROJECT_ROOT / "api" / "exam_schemas.py",
-    PROJECT_ROOT / "training" / "schemas.py",
+    PROJECT_ROOT / "app_v2" / "application" / "training_support" / "schemas.py",
 ]
 
 GROUP_TITLES = {

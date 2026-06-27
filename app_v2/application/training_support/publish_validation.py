@@ -1,3 +1,10 @@
+"""销售训练资料发布后验证。
+
+资料发布到正式 Qdrant collection 后，会随机抽样几个切片再检索一次。
+验证目标不是评估内容质量，而是确认“按 batch_id 能不能从正式向量库找回来”。
+如果这里失败，通常说明向量点复制、metadata 或过滤条件有问题。
+"""
+
 from typing import Any
 
 import yaml

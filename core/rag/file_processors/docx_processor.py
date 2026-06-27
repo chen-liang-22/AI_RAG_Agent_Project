@@ -1,3 +1,9 @@
+"""DOCX 文件处理器。
+
+DOCX 本质是 zip + XML。本模块用标准库解析 word/document.xml，
+把段落文本、标题级别和结构化段落信息挂到 Document.metadata 上。
+"""
+
 import re
 import zipfile
 from pathlib import Path

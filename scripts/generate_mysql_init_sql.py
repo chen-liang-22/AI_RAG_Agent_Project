@@ -19,7 +19,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from app_v2.infrastructure.repositories.default_dictionaries import DEFAULT_DICTIONARY_ITEMS
 
 
-OUTPUT_PATH = Path("docs/mysql初始化建表和基础数据.sql")
+OUTPUT_PATH = Path("docs/初始化文件/mysql初始化建表和基础数据.sql")
 
 FIELD_DEFINITION_PATTERN = re.compile(
     r"^`?[A-Za-z_][A-Za-z0-9_]*`?\s+"

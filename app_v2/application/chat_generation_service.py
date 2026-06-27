@@ -1,3 +1,12 @@
+"""聊天生成应用服务。
+
+这个模块负责智能客服聊天的生成链路：
+- 创建或读取 conversations 会话；
+- 根据配置决定走直连 RAG 还是旧 Agent 工具链；
+- 支持一次性回答和 SSE 流式回答；
+- 把用户问题和助手回答保存到聊天记录表。
+"""
+
 import json
 import threading
 import time

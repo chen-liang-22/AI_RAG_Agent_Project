@@ -1,3 +1,10 @@
+"""文档切分策略抽象层。
+
+DocumentParser 不直接写一堆 if/else 判断切分方式，
+而是把不同切分算法拆成策略类，通过 SplitStrategyFactory 选择。
+这就是策略模式：新增切分方式时新增策略类即可。
+"""
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 

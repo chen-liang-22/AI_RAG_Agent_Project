@@ -1,3 +1,13 @@
+"""知识库索引应用函数。
+
+这个模块承接 KnowledgeApplicationService 的入库动作：
+- 把 documents 表中文件解析成文本片段；
+- 调用向量库服务写入 Qdrant；
+- 回写 documents 表状态、chunk_count、结构类型和切分策略。
+
+函数名前面的下划线表示“模块内部函数”，目前为了兼容重构前调用方式暂时保留。
+"""
+
 import os
 
 import yaml
@@ -35,6 +45,15 @@ def _index_document(
         document_type or document.get("document_type"),
         final_split_strategy,
     )
+    logger.info(
+        "[知识库] 文件入库开始 文档编号=%s 文件名=%s Collection=%s 文档类型=%s 切分策略=%s 是否递增版本=%s",
+        document_id,
+        document.get("filename"),
+        final_collection_name,
+        final_document_type,
+        final_split_strategy,
+        increment_version,
+    )
     store.update_document_status(
         document_id,
         "indexing",
@@ -59,6 +78,12 @@ def _index_document(
             indexing_document,
             document_type=final_document_type,
             split_strategy=final_split_strategy,
+        )
+        logger.info(
+            "[知识库] 向量写入完成 文档编号=%s Collection=%s 分片数量=%s",
+            document_id,
+            final_collection_name,
+            chunk_count,
         )
         store.update_document_status(
             document_id,
@@ -87,6 +112,7 @@ def _index_document(
     if indexed_document is None:
         raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
+    logger.info("[知识库] 文件入库完成 文档编号=%s 状态=%s", document_id, indexed_document["status"])
     return indexed_document
 
 
@@ -130,6 +156,7 @@ def _sync_data_files_to_documents(store) -> list[dict]:
     file_paths = listdir_with_allowed_type(data_path, allowed_types)
     manifest = _load_data_manifest()
     documents: list[dict] = []
+    logger.info("[知识库] 内置 data 文件同步开始 路径=%s 文件数=%s", data_path, len(file_paths))
 
     for file_path in file_paths:
         filename = os.path.basename(file_path)
@@ -146,6 +173,12 @@ def _sync_data_files_to_documents(store) -> list[dict]:
             collection_name=manifest_entry["collection_name"],
         )
         if existing_document is not None:
+            logger.info(
+                "[知识库] 内置文件已存在，刷新入库配置 文件名=%s 文档编号=%s Collection=%s",
+                filename,
+                existing_document["document_id"],
+                manifest_entry["collection_name"],
+            )
             store.update_document_status(
                 existing_document["document_id"],
                 existing_document["status"],
@@ -182,5 +215,12 @@ def _sync_data_files_to_documents(store) -> list[dict]:
                 split_strategy=manifest_entry["split_strategy"],
             )
         )
+        logger.info(
+            "[知识库] 内置文件已同步到 MinIO 文件名=%s 文档编号=%s Collection=%s",
+            filename,
+            document_id,
+            manifest_entry["collection_name"],
+        )
 
+    logger.info("[知识库] 内置 data 文件同步完成 文件数=%s", len(documents))
     return documents

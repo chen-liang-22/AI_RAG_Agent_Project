@@ -1,3 +1,13 @@
+"""通用文档解析器。
+
+这个模块把 PDF/TXT/DOCX 读取后的 Document 转成两类结构：
+1. DocumentSegment：真正写入 Qdrant 的文本片段；
+2. QaItem：从问答资料中额外抽出的结构化问题和答案。
+
+它只负责“文档结构解析和切片编排”，不负责文件读取、Embedding、Qdrant 写入。
+具体切分算法通过 split_strategies 包里的策略类实现。
+"""
+
 import hashlib
 import json
 import re
@@ -10,6 +20,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from core.rag.llm_semantic_splitter import LlmSemanticSplitter
 from core.rag.split_strategies.base import SplitContext
 from core.rag.split_strategies.factory import SplitStrategyFactory
+from core.utils.config_handler import rag_conf
 from core.utils.logger_handler import logger
 
 
@@ -60,17 +71,134 @@ class _TitleMatch:
     method: str
 
 
+@dataclass(frozen=True)
+class DocumentParseRules:
+    """文档解析规则。
+
+    这些规则来自 `config/rag.yml` 的 document_parse_rules。
+    规则对象负责“编译和使用正则”，DocumentParser 只关心解析流程，避免把资料格式写死在业务代码里。
+    """
+
+    numbered_item_pattern: re.Pattern[str]
+    heading_pattern: re.Pattern[str]
+    number_prefix_pattern: re.Pattern[str]
+    number_prefix_only_pattern: re.Pattern[str]
+    answer_prefix_pattern: re.Pattern[str]
+    invalid_answer_pattern: re.Pattern[str]
+    question_marks: tuple[str, ...]
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any] | None) -> "DocumentParseRules":
+        """从配置创建规则对象。
+
+        这里故意不在 Python 里写默认正则。
+        原因：编号、标题、答案前缀属于“资料格式约定”，后续资料格式变化时应该改 YAML，
+        不应该改业务代码；配置缺失时直接报错，能尽早发现部署配置不完整。
+        """
+
+        if not isinstance(config, dict):
+            raise ValueError("document_parse_rules 配置缺失或格式错误，请在 config/rag.yml 中配置文档解析规则")
+
+        question_marks = config.get("question_marks")
+        if not isinstance(question_marks, list) or not question_marks:
+            raise ValueError("document_parse_rules.question_marks 必须配置为非空列表")
+
+        return cls(
+            numbered_item_pattern=cls._compile(
+                config.get("numbered_item_pattern"),
+                flags=re.MULTILINE,
+                name="numbered_item_pattern",
+            ),
+            heading_pattern=cls._compile(
+                config.get("heading_pattern"),
+                flags=re.MULTILINE,
+                name="heading_pattern",
+            ),
+            number_prefix_pattern=cls._compile(
+                config.get("number_prefix_pattern"),
+                name="number_prefix_pattern",
+            ),
+            number_prefix_only_pattern=cls._compile(
+                config.get("number_prefix_only_pattern"),
+                name="number_prefix_only_pattern",
+            ),
+            answer_prefix_pattern=cls._compile(
+                config.get("answer_prefix_pattern"),
+                flags=re.IGNORECASE,
+                name="answer_prefix_pattern",
+            ),
+            invalid_answer_pattern=cls._compile(
+                config.get("invalid_answer_pattern"),
+                flags=re.IGNORECASE,
+                name="invalid_answer_pattern",
+            ),
+            question_marks=tuple(str(mark) for mark in question_marks if str(mark)),
+        )
+
+    @staticmethod
+    def _compile(pattern: object, *, flags: int = 0, name: str) -> re.Pattern[str]:
+        """编译配置正则；配置缺失或写错时直接报中文错误，避免静默使用隐藏规则。"""
+
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError(f"document_parse_rules.{name} 必须配置为非空正则字符串")
+
+        raw_pattern = pattern.strip()
+        try:
+            return re.compile(raw_pattern, flags)
+        except re.error as exc:
+            raise ValueError(f"document_parse_rules.{name} 正则配置无效：{exc}") from exc
+
+    def remove_number_prefix(self, text: str) -> str:
+        """移除文本开头的编号前缀。"""
+
+        return self.number_prefix_pattern.sub("", text, count=1).strip()
+
+    def extract_number(self, text: str) -> int | None:
+        """从文本开头提取编号。"""
+
+        match = self.number_prefix_pattern.match(text)
+        return int(match.group(1)) if match else None
+
+    def remove_answer_prefix(self, text: str) -> str:
+        """移除答案行开头的“答：/A：/答案：”等前缀。"""
+
+        return self.answer_prefix_pattern.sub("", text, count=1).strip()
+
+    def is_invalid_answer(self, text: str) -> bool:
+        """判断清洗后的答案是否只是无效占位标签。"""
+
+        compact_text = re.sub(r"\s+", "", text or "")
+        if not compact_text:
+            return True
+        return self.invalid_answer_pattern.fullmatch(compact_text) is not None
+
+    def is_number_prefix_only(self, text: str) -> bool:
+        """判断一段文本是否只是编号前缀。"""
+
+        return self.number_prefix_only_pattern.fullmatch(text) is not None
+
+    def has_question_mark(self, text: str) -> bool:
+        """判断文本中是否包含配置的问题标点。"""
+
+        return any(mark in text for mark in self.question_marks)
+
+
 class DocumentParser:
     """通用文档解析器，只识别文档结构，不绑定具体业务分类。"""
 
-    numbered_item_pattern = re.compile(r"^\s*(\d+)[.、]\s*(.+)$", re.MULTILINE)
-    heading_pattern = re.compile(r"^\s*#{2,6}\s*(.+)$", re.MULTILINE)
+    default_rules = DocumentParseRules.from_config((rag_conf or {}).get("document_parse_rules"))
 
-    def __init__(self, splitter: RecursiveCharacterTextSplitter, semantic_splitter: object | None = None):
+    def __init__(
+            self,
+            splitter: RecursiveCharacterTextSplitter,
+            semantic_splitter: object | None = None,
+            parse_rules: DocumentParseRules | None = None,
+    ):
         """初始化文档解析器。"""
 
         self.splitter = splitter
         self.semantic_splitter = semantic_splitter or LlmSemanticSplitter()
+        self.parse_rules = parse_rules or self.default_rules
 
     def detect_document_type(
             self,
@@ -99,7 +227,14 @@ class DocumentParser:
 
         normalized_type = self._normalize_document_type(document_type, split_strategy)
         strategy = SplitStrategyFactory.get_strategy(split_strategy)
-        return strategy.split(
+        logger.info(
+            "[文档解析] 开始切片 文档编号=%s 文档类型=%s 切分策略=%s 原始页数=%s",
+            document_id,
+            normalized_type,
+            split_strategy,
+            len(documents),
+        )
+        segments, qa_items = strategy.split(
             SplitContext(
                 document_id=document_id,
                 documents=documents,
@@ -108,6 +243,15 @@ class DocumentParser:
                 parser=self,
             )
         )
+        logger.info(
+            "[文档解析] 切片完成 文档编号=%s 文档类型=%s 切分策略=%s 片段数=%s 问答数=%s",
+            document_id,
+            normalized_type,
+            split_strategy,
+            len(segments),
+            len(qa_items),
+        )
+        return segments, qa_items
 
     def build_segments_and_faqs(
             self,
@@ -133,6 +277,7 @@ class DocumentParser:
     ) -> tuple[list[DocumentSegment], list[QaItem]]:
         """把编号问答文档切成 QA segment。"""
 
+        logger.info("[文档解析] 编号问答切片开始 文档编号=%s 页数=%s", document_id, len(documents))
         segments: list[DocumentSegment] = []
         qa_items: list[QaItem] = []
 
@@ -175,8 +320,10 @@ class DocumentParser:
                 )
 
         if segments:
+            logger.info("[文档解析] 编号问答切片完成 文档编号=%s 片段数=%s", document_id, len(segments))
             return segments, qa_items
 
+        logger.warning("[文档解析] 编号问答未识别到有效条目，回退递归切分 文档编号=%s", document_id)
         return self._build_recursive_segments(document_id, documents, document_type="qa"), []
 
     def _build_outline_qa_segments(
@@ -188,11 +335,13 @@ class DocumentParser:
 
         outline = self._get_pdf_outline(documents)
         if not self.is_outline_qa(outline, sample_text=self._sample_document_text(documents)):
+            logger.info("[文档解析] PDF目录不是问答结构，跳过目录问答切片 文档编号=%s 目录项=%s", document_id, len(outline))
             return [], []
 
         full_text, page_offsets = self._join_documents_with_offsets(documents)
         outline_questions = self._outline_question_items(outline)
         if not full_text or not outline_questions:
+            logger.warning("[文档解析] PDF目录问答缺少正文或题目 文档编号=%s 目录题数=%s", document_id, len(outline_questions))
             return [], []
 
         located_questions = self._locate_outline_questions(outline_questions, full_text, page_offsets)
@@ -277,6 +426,7 @@ class DocumentParser:
                     )
                 )
 
+        logger.info("[文档解析] PDF目录问答切片完成 文档编号=%s 片段数=%s 问答数=%s", document_id, len(segments), len(qa_items))
         return segments, qa_items
 
     def _build_numbered_segments(
@@ -447,8 +597,8 @@ class DocumentParser:
 
         for line in text.splitlines():
             stripped = line.strip()
-            heading_match = self.heading_pattern.match(stripped)
-            numbered_match = self.numbered_item_pattern.match(stripped)
+            heading_match = self.parse_rules.heading_pattern.match(stripped)
+            numbered_match = self.parse_rules.numbered_item_pattern.match(stripped)
 
             if heading_match:
                 if current_lines:
@@ -476,7 +626,7 @@ class DocumentParser:
     def _parse_question_answer(self, block: str) -> tuple[str, str | None]:
         """从单个编号块里拆出问题和答案。"""
 
-        block_without_number = self.numbered_item_pattern.sub(r"\2", block, count=1).strip()
+        block_without_number = self.parse_rules.numbered_item_pattern.sub(r"\2", block, count=1).strip()
         block_without_number = self._clean_markdown(block_without_number)
         lines = [line.strip() for line in block_without_number.splitlines() if line.strip()]
 
@@ -487,7 +637,7 @@ class DocumentParser:
         answer_lines = []
         for line in lines[1:]:
             cleaned = line.removeprefix("-").strip()
-            cleaned = re.sub(r"^(答[:：]|A[:：])\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = self.parse_rules.remove_answer_prefix(cleaned)
             if cleaned:
                 answer_lines.append(cleaned)
 
@@ -762,7 +912,7 @@ class DocumentParser:
 
         line_start = full_text.rfind("\n", max(0, min_start), match_start) + 1
         prefix = full_text[line_start:match_start]
-        if re.fullmatch(r"\s*\d+\s*[.、]\s*", prefix):
+        if DocumentParser.default_rules.is_number_prefix_only(prefix):
             return line_start
         return match_start
 
@@ -774,9 +924,9 @@ class DocumentParser:
         if not clean_title:
             return False
 
-        if re.match(r"^\s*\d+[.、]\s*\S+", clean_title):
+        if cls.default_rules.number_prefix_pattern.match(clean_title):
             return True
-        if any(mark in clean_title for mark in ("？", "?")):
+        if cls.default_rules.has_question_mark(clean_title):
             return True
         return False
 
@@ -814,15 +964,14 @@ class DocumentParser:
     def _extract_question_no(title: str) -> int | None:
         """从标题开头提取题号。"""
 
-        match = re.match(r"^\s*(\d+)[.、]\s*", title)
-        return int(match.group(1)) if match else None
+        return DocumentParser.default_rules.extract_number(title)
 
     @staticmethod
     def _clean_question_title(title: str) -> str:
         """去掉题目前置编号，得到纯问题文本。"""
 
         clean_title = DocumentParser._clean_markdown(title)
-        return re.sub(r"^\s*\d+[.、]\s*", "", clean_title).strip()
+        return DocumentParser.default_rules.remove_number_prefix(clean_title)
 
     @staticmethod
     def _remove_leading_repeated_title(answer: str, raw_title: str) -> str:
@@ -866,16 +1015,13 @@ class DocumentParser:
         """清理目录问答答案开头常见的答案标签。"""
 
         clean_answer = answer.strip()
-        return re.sub(r"^(?:答案|答|A)[:：]\s*", "", clean_answer, count=1, flags=re.IGNORECASE).strip()
+        return DocumentParser.default_rules.remove_answer_prefix(clean_answer)
 
     @staticmethod
     def _is_invalid_outline_answer(answer: str) -> bool:
         """判断目录问答切出来的答案是否明显无效。"""
 
-        compact_answer = re.sub(r"\s+", "", answer or "")
-        if not compact_answer:
-            return True
-        return re.fullmatch(r"(?:问题|答案|答|Q|A)[:：]?", compact_answer, re.IGNORECASE) is not None
+        return DocumentParser.default_rules.is_invalid_answer(answer)
 
     def _split_outline_qa_content(self, question: str, answer: str | None, *, max_chars: int = 1500) -> list[str]:
         """把 outline QA 格式化成文本，超长答案按段落二次切片。"""

@@ -1,3 +1,9 @@
+"""RAG 查询分析数据结构。
+
+历史版本这里承担过规则意图识别。
+现在主链路已经取消硬编码关键词意图，只保留 QueryAnalysis 作为检索、精排、调试之间的传参对象。
+"""
+
 from dataclasses import dataclass, field
 
 

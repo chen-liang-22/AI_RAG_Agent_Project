@@ -1,3 +1,9 @@
+"""文档切分策略工厂。
+
+这里使用工厂方法模式，根据 split_strategy 编码返回对应切分策略。
+如果配置或前端传入未知策略，会回退到递归切分，保证上传流程不中断。
+"""
+
 from core.rag.split_strategies.base import BaseSplitStrategy
 from core.rag.split_strategies.llm_semantic_strategy import LlmSemanticSplitStrategy
 from core.rag.split_strategies.numbered_qa_strategy import NumberedQaSplitStrategy

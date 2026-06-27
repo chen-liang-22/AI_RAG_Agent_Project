@@ -1,3 +1,10 @@
+"""LLM 语义切片计划生成器。
+
+这个模块不会直接写入 Qdrant。
+它只让模型给出原文 start/end 范围，后端再按范围从原文截取，
+从而避免模型把资料内容改写后入库。
+"""
+
 import json
 import re
 from dataclasses import dataclass

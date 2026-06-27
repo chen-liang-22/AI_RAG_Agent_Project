@@ -1,3 +1,9 @@
+"""编号条目切分策略。
+
+适用于只有编号条目、但不一定是标准问答的资料。
+如果没有识别出编号条目，会自动回退到普通递归切分。
+"""
+
 from core.rag.split_strategies.base import BaseSplitStrategy, SplitContext
 
 

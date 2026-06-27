@@ -1,3 +1,9 @@
+"""文件处理器工厂。
+
+这里使用工厂方法模式，根据文件后缀选择 TXT/PDF/DOCX 处理器。
+调用方不需要关心具体文件格式，只调用 `FileProcessorFactory.load_documents()`。
+"""
+
 from pathlib import Path
 
 from core.rag.file_processors.base import BaseFileProcessor

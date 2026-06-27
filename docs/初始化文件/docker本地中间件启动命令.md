@@ -84,7 +84,7 @@ MYSQL_PASSWORD=1234qwer
 初始化业务表和基础数据：
 
 ```powershell
-docker exec -i mysql8 mysql -uroot -p1234qwer < docs/mysql初始化建表和基础数据.sql
+docker exec -i mysql8 mysql -uroot -p1234qwer < docs/初始化文件/mysql初始化建表和基础数据.sql
 ```
 
 进入 MySQL：

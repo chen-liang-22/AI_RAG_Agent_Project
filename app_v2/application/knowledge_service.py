@@ -147,9 +147,23 @@ class KnowledgeApplicationService:
         filename = _sanitize_upload_filename(preview_file.filename)
         file_type = _validate_file_type(filename)
         collection_name = normalize_qdrant_collection_name(request.collection_name)
+        logger.info(
+            "[V2知识资产] 上传确认开始 上传编号=%s 文件名=%s Collection=%s 文档类型=%s 切分策略=%s",
+            upload_id,
+            filename,
+            collection_name,
+            request.document_type,
+            request.split_strategy,
+        )
 
         duplicate_document = self.document_repository.find_active_document_by_md5(preview_file.file_md5, collection_name=collection_name)
         if duplicate_document is not None:
+            logger.info(
+                "[V2知识资产] 上传确认命中重复文件 上传编号=%s 已有文档编号=%s Collection=%s",
+                upload_id,
+                duplicate_document["document_id"],
+                collection_name,
+            )
             _delete_preview_file(upload_id)
             return KnowledgeUploadResponse(
                 status=self._dictionary_status("knowledge_result_status", "duplicate"),
@@ -180,6 +194,7 @@ class KnowledgeApplicationService:
             document_type=request.document_type,
             split_strategy=request.split_strategy,
         )
+        logger.info("[V2知识资产] 文档资产记录创建完成 文档编号=%s 文件名=%s", document_id, filename)
         indexed_document = _index_document(
             self.document_repository,
             document,
@@ -262,6 +277,7 @@ class KnowledgeApplicationService:
                 collection_name = normalize_qdrant_collection_name(document.get("collection_name"))
                 if collection_name not in vector_adapters:
                     vector_adapters[collection_name] = VectorStoreAdapter.recreate_collection(collection_name)
+                logger.info("[V2知识资产] 全量重建单文件开始 文档编号=%s 文件名=%s Collection=%s", document_id, filename, collection_name)
                 indexed_document = _index_document(
                     self.document_repository,
                     document,
@@ -270,6 +286,12 @@ class KnowledgeApplicationService:
                     collection_name=collection_name,
                 )
                 succeeded += 1
+                logger.info(
+                    "[V2知识资产] 全量重建单文件完成 文档编号=%s 文件名=%s 分片数量=%s",
+                    document_id,
+                    filename,
+                    indexed_document["chunk_count"],
+                )
                 results.append(KnowledgeReindexResult(
                     document_id=document_id,
                     filename=filename,
@@ -279,6 +301,7 @@ class KnowledgeApplicationService:
             except Exception as exc:
                 failed += 1
                 message = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                logger.error("[V2知识资产] 全量重建单文件失败 文档编号=%s 文件名=%s 错误=%s", document_id, filename, message, exc_info=True)
                 results.append(KnowledgeReindexResult(
                     document_id=document_id,
                     filename=filename,
@@ -287,6 +310,7 @@ class KnowledgeApplicationService:
                 ))
 
         status = self._dictionary_status("knowledge_result_status", "ok" if failed == 0 else "partial_failed")
+        logger.info("[V2知识资产] 全量重建索引完成 总数=%s 成功=%s 失败=%s", len(documents), succeeded, failed)
         return KnowledgeBulkReindexResponse(total=len(documents), succeeded=succeeded, failed=failed, results=results, status=status)
 
     def reload_from_data_dir(self) -> dict:

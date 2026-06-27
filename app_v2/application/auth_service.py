@@ -1,3 +1,15 @@
+"""认证应用服务。
+
+这个模块负责本系统登录态闭环：
+- 用户名密码校验；
+- PBKDF2 密码哈希；
+- JWT access_token 签发和校验；
+- Redis refresh_token 会话保存、续签和退出；
+- 本地开发默认管理员初始化。
+
+后端不会保存 refresh_token 明文，只保存它的 SHA256 哈希。
+"""
+
 from __future__ import annotations
 
 import base64

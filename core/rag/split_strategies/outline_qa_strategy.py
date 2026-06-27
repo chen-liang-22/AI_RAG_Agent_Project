@@ -1,3 +1,9 @@
+"""PDF 目录问答切分策略。
+
+适用于 PDF 书签目录里“一级章节 -> 二级问题”的资料。
+优先使用 PDF outline 定位正文，失败后回退到编号问答切分。
+"""
+
 from core.rag.split_strategies.base import BaseSplitStrategy, SplitContext
 
 

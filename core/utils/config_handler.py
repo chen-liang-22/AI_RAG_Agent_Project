@@ -1,6 +1,8 @@
 """
-yaml
-k: v
+配置文件加载工具。
+
+本模块在进程启动时读取 .env、config/rag.yml、config/qdrant.yml、config/agent.yml。
+业务代码通过 rag_conf / qdrant_conf / agent_conf 读取配置，避免各处重复打开 YAML。
 """
 import os
 
@@ -40,17 +42,23 @@ def load_env_file(env_path: str = get_abs_path(".env"), encoding: str = "utf-8")
                 os.environ[key] = value
 
 
-def load_rag_config(config_path: str=get_abs_path("config/rag.yml"), encoding: str="utf-8"):
+def load_rag_config(config_path: str = get_abs_path("config/rag.yml"), encoding: str = "utf-8"):
+    """读取 RAG 和模型相关配置。"""
+
     with open(config_path, "r", encoding=encoding) as f:
         return yaml.load(f, Loader=yaml.FullLoader)
 
 
-def load_qdrant_config(config_path: str=get_abs_path("config/qdrant.yml"), encoding: str="utf-8"):
+def load_qdrant_config(config_path: str = get_abs_path("config/qdrant.yml"), encoding: str = "utf-8"):
+    """读取 Qdrant 向量库配置。"""
+
     with open(config_path, "r", encoding=encoding) as f:
         return yaml.load(f, Loader=yaml.FullLoader)
 
 
-def load_agent_config(config_path: str=get_abs_path("config/agent.yml"), encoding: str="utf-8"):
+def load_agent_config(config_path: str = get_abs_path("config/agent.yml"), encoding: str = "utf-8"):
+    """读取 Agent 工具链配置。"""
+
     with open(config_path, "r", encoding=encoding) as f:
         return yaml.load(f, Loader=yaml.FullLoader)
 

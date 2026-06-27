@@ -1,3 +1,9 @@
+"""销售训练资料 LLM 兜底切分。
+
+规则切分是主路径，LLM 切分只在质量评分过低或用户手动重切时兜底。
+这样可以减少 token 消耗，同时避免模型输出不稳定直接影响每一次上传。
+"""
+
 import json
 import re
 from typing import Any

@@ -1,3 +1,9 @@
+"""RAG 规则精排器。
+
+向量召回负责“先找一批可能相关的资料”，精排器负责“从候选中挑更适合进入上下文的资料”。
+当前实现不额外调用模型，只用向量分、关键词命中、metadata 和去重规则做轻量排序。
+"""
+
 from langchain_core.documents import Document
 
 from core.rag.query_pipeline import QueryAnalysis

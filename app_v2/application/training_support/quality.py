@@ -1,3 +1,14 @@
+"""销售训练资料切片质量评估。
+
+这个模块不调用 LLM，只用通用指标检查切片是否健康：
+- 是否切出案例；
+- 是否包含必要片段；
+- 是否过长或过短；
+- 是否内容过度集中。
+
+它的作用是决定资料能否发布，以及是否需要触发 LLM 兜底切分。
+"""
+
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any

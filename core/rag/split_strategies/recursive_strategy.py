@@ -1,3 +1,8 @@
+"""递归文本切分策略。
+
+适用于普通说明文、未结构化资料，以及所有规则切分失败后的兜底场景。
+"""
+
 from core.rag.split_strategies.base import BaseSplitStrategy, SplitContext
 
 

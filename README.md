@@ -129,38 +129,30 @@ http://localhost:8080
 
 ## MySQL Schema
 
-运行时默认业务数据库是 MySQL，连接配置在：
+运行时默认数据库是 MySQL，连接配置在：
 
 ```text
 config/database.yml
 ```
 
-MySQL 初始化建表和基础字典数据在：
+新环境初始化文件统一放在：
 
 ```text
-docs/mysql初始化建表和基础数据.sql
+docs/初始化文件
 ```
 
-当前 MySQL 业务数据导入脚本在：
-
-```text
-docs/mysql纯业务数据导入.sql
-```
-
-推荐执行顺序：
+MySQL 初始化只需要执行这一份 SQL：
 
 ```powershell
-mysql -u root -p < docs/mysql初始化建表和基础数据.sql
-mysql -u root -p < docs/mysql纯业务数据导入.sql
+mysql -u root -p < docs/初始化文件/mysql初始化建表和基础数据.sql
 ```
 
-这两个脚本都不包含 Qdrant 向量数据。业务数据导入脚本会先清空目标业务表，再导入 MySQL 业务数据。
-项目运行时业务数据以 MySQL 为准。
+这份 SQL 只负责创建表、索引、外键和系统默认字典，不包含 Qdrant 向量数据。知识库和销售训练资料需要通过系统上传，由项目写入 MinIO、MySQL 和 Qdrant。
 
 重新生成 SQL：
 
 ```powershell
-.\.venv312\Scripts\python.exe scripts\generate_mysql_init_sql.py
+.\.venv\Scripts\python.exe scripts\generate_mysql_init_sql.py
 ```
 
 ## Vue Frontend

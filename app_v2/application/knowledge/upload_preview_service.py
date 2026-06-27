@@ -1,3 +1,15 @@
+"""知识库上传预览服务。
+
+这个模块负责“确认入库前”的临时流程：
+1. 校验上传文件名和类型；
+2. 把文件保存到 MinIO previews 前缀；
+3. 把临时对象元数据写入 Redis；
+4. 抽样文件内容，让模型推荐文档类型和切分策略；
+5. 用户确认后把临时对象复制为正式 documents 对象。
+
+注意：这里不直接写 documents 表，也不写 Qdrant；正式入库由 knowledge_service + indexing_service 完成。
+"""
+
 import json
 import os
 import re
@@ -48,6 +60,7 @@ def _save_preview_file(file: UploadFile, filename: str, upload_id: str) -> Store
     """把上传文件保存到 MinIO 预览对象。"""
 
     storage_service = get_file_storage_service()
+    logger.info("[知识库] 上传预览文件保存开始 上传编号=%s 文件名=%s", upload_id, filename)
     stored_file = storage_service.save_upload_file(
         file=file,
         filename=filename,
@@ -75,9 +88,12 @@ def _save_preview_file(file: UploadFile, filename: str, upload_id: str) -> Store
         logger.error("[知识库] Redis 预览上传元数据写入失败 上传编号=%s 错误=%s", upload_id, exc, exc_info=True)
         raise HTTPException(status_code=503, detail="预览上传状态保存失败，请稍后重试") from exc
     logger.info(
-        "[知识库] 上传预览文件已保存到 MinIO 上传编号=%s 对象名=%s",
+        "[知识库] 上传预览文件保存完成 上传编号=%s 桶名=%s 对象名=%s 文件大小=%s MD5=%s",
         upload_id,
+        stored_file.bucket_name,
         stored_file.object_name,
+        stored_file.file_size,
+        stored_file.file_md5,
     )
     return stored_file
 
@@ -93,6 +109,7 @@ def _get_preview_file(upload_id: str) -> StoredFileInfo:
     stored_file = metadata.to_stored_file_info()
     if not stored_file.object_name.startswith(PREVIEW_OBJECT_PREFIX):
         raise HTTPException(status_code=400, detail="临时上传对象路径非法")
+    logger.info("[知识库] 读取预览上传对象 上传编号=%s 对象名=%s", clean_upload_id, stored_file.object_name)
     return stored_file
 
 
@@ -105,6 +122,7 @@ def _delete_preview_file(upload_id: str) -> None:
     metadata = store.get(clean_upload_id)
     store.delete(clean_upload_id)
     if metadata is None:
+        logger.info("[知识库] 删除预览上传对象跳过 原因=元数据不存在 上传编号=%s", clean_upload_id)
         return
 
     stored_file = metadata.to_stored_file_info()
@@ -116,6 +134,7 @@ def _delete_preview_file(upload_id: str) -> None:
             bucket_name=stored_file.bucket_name,
             object_name=stored_file.object_name,
         )
+        logger.info("[知识库] 删除预览上传对象完成 上传编号=%s 对象名=%s", upload_id, stored_file.object_name)
     except Exception as exc:
         logger.warning("[知识库] 删除 MinIO 临时预览对象失败 上传编号=%s 错误=%s", upload_id, exc)
     return
@@ -126,12 +145,24 @@ def _promote_preview_file(upload_id: str, document_id: str) -> StoredFileInfo:
     """把 MinIO 预览对象复制为正式知识库对象，并删除临时对象。"""
 
     stored_file = _get_preview_file(upload_id)
+    logger.info(
+        "[知识库] 预览对象转正式对象开始 上传编号=%s 文档编号=%s 源对象=%s",
+        upload_id,
+        document_id,
+        stored_file.object_name,
+    )
     final_file = get_file_storage_service().copy_object(
         source=stored_file,
         prefix="documents",
         owner_id=document_id,
     )
     _delete_preview_file(upload_id)
+    logger.info(
+        "[知识库] 预览对象转正式对象完成 上传编号=%s 文档编号=%s 正式对象=%s",
+        upload_id,
+        document_id,
+        final_file.object_name,
+    )
     return final_file
 
 
