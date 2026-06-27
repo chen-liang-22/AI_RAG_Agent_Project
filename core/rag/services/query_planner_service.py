@@ -1,3 +1,10 @@
+"""RAG 查询规划服务。
+
+Query Planner 的职责是把用户问题拆成适合向量检索的 search_query 列表。
+它不会生成最终答案，只影响 Qdrant 检索问题。
+失败时会回退原问题，保证聊天链路继续执行。
+"""
+
 import json
 import re
 import time
