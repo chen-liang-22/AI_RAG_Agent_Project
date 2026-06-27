@@ -399,6 +399,8 @@ def _normalize_choice_answer(answer: str | list[str], options: list[str]) -> str
     }
 
     def normalize_one(value: object) -> str:
+        """把单个模型答案文本转换成选项编号。"""
+
         clean_value = str(value or "").strip()
         if clean_value in label_by_option:
             return label_by_option[clean_value]
@@ -501,6 +503,8 @@ def _normalize_answer_value_for_question(question: dict[str, Any], answer: str |
     }
 
     def normalize_one(value: object) -> str:
+        """把单个前端答案文本转换成选项编号。"""
+
         clean_value = str(value or "").strip()
         if clean_value in display_to_label:
             return display_to_label[clean_value]
