@@ -19,6 +19,11 @@ class TrainingSessionApplicationService:
     """训练会话外观服务。"""
 
     def __init__(self, core_service=None):
+        """初始化训练会话服务。
+
+        会话支持一次性和流式两种回复模式，具体业务仍交给核心服务。
+        """
+
         self._core_service = core_service
         self.service = None
 

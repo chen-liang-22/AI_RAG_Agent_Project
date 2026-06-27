@@ -158,6 +158,11 @@ class PreviewUploadStore:
     """上传预览 Redis 存储外观。"""
 
     def __init__(self, *, redis_client: RedisClient | None = None, ttl_seconds: int | None = None):
+        """初始化预览上传状态存储。
+
+        upload_id 到 MinIO 临时对象的映射放在 Redis，ttl_seconds 到期后可自动失效。
+        """
+
         self.redis_client = redis_client or get_redis_client()
         self.ttl_seconds = ttl_seconds or load_upload_preview_config().ttl_seconds
 

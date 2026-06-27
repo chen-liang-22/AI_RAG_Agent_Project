@@ -34,6 +34,11 @@ class PreviewUploadCleanupService:
             ttl_seconds: int | None = None,
             now_provider: Callable[[], datetime] | None = None,
     ):
+        """初始化预览临时文件清理服务。
+
+        ttl_seconds 控制临时对象保留多久，now_provider 支持测试里固定当前时间。
+        """
+
         self.file_storage_service = file_storage_service or get_file_storage_service()
         self.ttl_seconds = ttl_seconds or load_upload_preview_config().ttl_seconds
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))

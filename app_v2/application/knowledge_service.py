@@ -61,6 +61,12 @@ class KnowledgeApplicationService:
         document_repository: DocumentRepository | None = None,
         dictionary_repository: DictionaryRepository | None = None,
     ):
+        """初始化知识库应用服务。
+
+        这里把 MinIO、Qdrant、documents 表和字典仓储组合起来。
+        file_storage/vector_adapter_factory 支持注入，是为了测试和以后替换具体基础设施。
+        """
+
         self.file_storage = file_storage or FileStorageAdapter()
         self.vector_adapter_factory = vector_adapter_factory or (lambda collection_name=None: VectorStoreAdapter(collection_name))
         # 文档查询和写入走 V2 仓储；store 参数只为旧测试注入保留，不再作为默认依赖。

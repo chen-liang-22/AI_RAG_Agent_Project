@@ -10,6 +10,11 @@ class TrainingPlanApplicationService:
     """训练方案外观服务。"""
 
     def __init__(self, core_service=None):
+        """初始化训练方案服务。
+
+        训练方案本身是销售陪练的主线对象，这里只做代理，不直接访问数据库。
+        """
+
         self._core_service = core_service
         self.service = None
 

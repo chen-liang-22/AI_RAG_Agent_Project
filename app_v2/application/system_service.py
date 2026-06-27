@@ -35,6 +35,11 @@ class SystemApplicationService:
     _VALID_MENU_TYPES = {"directory", "page"}
 
     def __init__(self, repository: SystemRepository | None = None, id_generator=None):
+        """初始化系统菜单服务。
+
+        repository 负责菜单和角色菜单关系，id_generator 可注入，方便测试固定主键。
+        """
+
         self.repository = repository or SystemRepository()
         self.id_generator = id_generator or self._default_id_generator
 

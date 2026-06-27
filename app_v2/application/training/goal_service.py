@@ -10,6 +10,11 @@ class TrainingGoalApplicationService:
     """训练目标外观服务。"""
 
     def __init__(self, core_service=None):
+        """初始化训练目标服务。
+
+        core_service 支持注入；默认延迟创建核心服务，避免路由导入时立即初始化模型和向量库。
+        """
+
         self._core_service = core_service
         self.service = None
 

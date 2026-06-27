@@ -10,6 +10,11 @@ class TrainingScoringApplicationService:
     """训练评分外观服务。"""
 
     def __init__(self, core_service=None):
+        """初始化训练评分服务。
+
+        评分依赖完整训练会话和训练目标，所以这里只转发到核心服务统一处理。
+        """
+
         self._core_service = core_service
         self.service = None
 

@@ -70,6 +70,11 @@ class TrainingRepository:
     """
 
     def __init__(self):
+        """初始化训练仓储并确保增量字段存在。
+
+        这里会做轻量级兼容 DDL，保证旧库升级后也能运行新版训练资料流程。
+        """
+
         # 表结构主来源仍是 docs/mysql初始化建表和基础数据.sql。
         # 这里仅补齐轻量兼容字段，避免旧库没执行迁移 SQL 时一启动就因为 document_id 字段缺失失败。
         self.ensure_training_batch_document_columns()

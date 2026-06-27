@@ -18,6 +18,11 @@ class FileStorageAdapter:
     """
 
     def __init__(self, storage_service: FileStorageService | None = None):
+        """初始化文件存储适配器。
+
+        默认包装统一的 MinIO 文件服务；测试时可传入假的 storage_service。
+        """
+
         self.storage_service = storage_service or get_file_storage_service()
 
     def save_upload_file(self, *, file: UploadFile, filename: str, prefix: str, owner_id: str) -> StoredFileInfo:

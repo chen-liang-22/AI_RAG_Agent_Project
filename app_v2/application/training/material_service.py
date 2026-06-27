@@ -25,6 +25,11 @@ class TrainingMaterialApplicationService:
     """
 
     def __init__(self, core_service=None):
+        """初始化训练资料服务。
+
+        core_service 支持注入；默认延迟创建，避免页面只查资料列表时提前加载重依赖。
+        """
+
         self._core_service = core_service
         self.service = None
 

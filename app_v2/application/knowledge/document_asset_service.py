@@ -45,6 +45,12 @@ class DocumentAssetService:
             vector_service_factory: Callable[[str], VectorStoreService] | None = None,
             delete_document_vectors: Callable[[str, str | None], None] | None = None,
     ):
+        """初始化文件资产删除外观服务。
+
+        删除文件会同时影响 documents 表、训练资料批次、MinIO 对象和 Qdrant 向量点，
+        所以这里把相关依赖集中注入，避免删除流程散落在多个路由里。
+        """
+
         self.knowledge_store = knowledge_store
         self.document_repository = document_repository or DocumentRepository(store=knowledge_store)
         self.training_repository = training_repository or TrainingRepository()

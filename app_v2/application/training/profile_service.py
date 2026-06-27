@@ -30,6 +30,12 @@ class TrainingProfileApplicationService:
     """训练画像外观服务。"""
 
     def __init__(self, service=None, store=None, dictionary_repository: DictionaryRepository | None = None, core_service=None):
+        """初始化训练画像服务。
+
+        dictionary_repository 用来读取客户画像和学员画像字典；
+        core_service/service 兼容历史调用方，最终都会落到同一个核心服务。
+        """
+
         self._core_service = core_service or service
         self.service = None
         # store 是旧构造参数，保留在函数签名里只为兼容历史调用方。
