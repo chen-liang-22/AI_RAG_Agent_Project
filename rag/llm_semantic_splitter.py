@@ -6,7 +6,6 @@ from typing import Any
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from model.factory import get_chat_model, get_chat_model_name_for_mode
 from utils.logger_handler import logger
 
 
@@ -39,6 +38,8 @@ class LlmSemanticSplitter:
         full_text = self.join_documents(documents)
         if not full_text.strip():
             return []
+
+        from model.factory import get_chat_model, get_chat_model_name_for_mode
 
         model_name = get_chat_model_name_for_mode(self.model_mode)
         logger.info("[文档解析] LLM语义切片开始 模型名称=%s 文本字符数=%s", model_name, len(full_text))

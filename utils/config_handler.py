@@ -55,6 +55,15 @@ def load_agent_config(config_path: str=get_abs_path("config/agent.yml"), encodin
         return yaml.load(f, Loader=yaml.FullLoader)
 
 
+def load_prompts_config(config_path: str=get_abs_path("config/prompts.yml"), encoding: str="utf-8"):
+    """读取可选提示词配置；缺失时返回空配置，避免基础服务启动被提示词文件阻断。"""
+
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r", encoding=encoding) as f:
+        return yaml.load(f, Loader=yaml.FullLoader) or {}
+
+
 load_env_file()
 rag_conf = load_rag_config()
 qdrant_conf = load_qdrant_config()
