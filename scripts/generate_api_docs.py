@@ -1,7 +1,7 @@
 """生成当前项目接口文档。
 
 脚本直接读取 FastAPI OpenAPI 元数据，并补充 schema 源码中的中文字段注释。
-这样后续新增路由或 DTO 后，可以重新运行脚本刷新 docs/接口文档.md。
+这样后续新增路由或 DTO 后，可以重新运行脚本刷新
 """
 
 from __future__ import annotations

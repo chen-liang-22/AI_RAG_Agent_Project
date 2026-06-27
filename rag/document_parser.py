@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from rag.llm_semantic_splitter import LlmSemanticSplitter
 from rag.split_strategies.base import SplitContext
 from rag.split_strategies.factory import SplitStrategyFactory
 from utils.logger_handler import logger
@@ -62,31 +63,14 @@ class _TitleMatch:
 class DocumentParser:
     """通用文档解析器，只识别文档结构，不绑定具体业务分类。"""
 
-    numbered_question_pattern = re.compile(r"^\s*(\d+)[.、]\s*(?:\*\*)?.*?[？?].*$", re.MULTILINE)
     numbered_item_pattern = re.compile(r"^\s*(\d+)[.、]\s*(.+)$", re.MULTILINE)
     heading_pattern = re.compile(r"^\s*#{2,6}\s*(.+)$", re.MULTILINE)
-    qa_mark_pattern = re.compile(r"(问[:：]|答[:：]|Q[:：]|A[:：])", re.IGNORECASE)
-    outline_question_keywords = (
-        "什么",
-        "为什么",
-        "怎么",
-        "如何",
-        "是否",
-        "能不能",
-        "有哪些",
-        "区别",
-        "比较",
-        "说说",
-        "介绍",
-        "原理",
-        "步骤",
-        "作用",
-    )
 
-    def __init__(self, splitter: RecursiveCharacterTextSplitter):
+    def __init__(self, splitter: RecursiveCharacterTextSplitter, semantic_splitter: object | None = None):
         """初始化文档解析器。"""
 
         self.splitter = splitter
+        self.semantic_splitter = semantic_splitter or LlmSemanticSplitter()
 
     def detect_document_type(
             self,
@@ -96,54 +80,11 @@ class DocumentParser:
     ) -> DocumentTypeDetection:
         """用轻量规则给出默认结构建议，模型推荐由上传推荐接口单独完成。"""
 
-        lower_filename = filename.lower()
-        text = sample_text or ""
-        reasons: list[str] = []
-
-        if self.is_outline_qa(outline or [], sample_text=text):
-            return DocumentTypeDetection(
-                document_type="qa",
-                split_strategy="outline_qa",
-                confidence=0.9,
-                reasons=["检测到 PDF 书签呈现“章节 -> 问题”的问答结构"],
-            )
-
-        numbered_questions = self.numbered_question_pattern.findall(text)
-        numbered_items = self.numbered_item_pattern.findall(text)
-        qa_marks = self.qa_mark_pattern.findall(text)
-
-        qa_score = 0.0
-        if any(word in lower_filename for word in ["问答", "常见问题", "faq", "100问"]):
-            qa_score += 0.4
-            reasons.append("文件名包含 FAQ、问答或 100问 等结构提示")
-        if len(numbered_questions) >= 5:
-            qa_score += 0.35
-            reasons.append(f"检测到 {len(numbered_questions)} 个编号问题")
-        if len(qa_marks) >= 4:
-            qa_score += 0.2
-            reasons.append("检测到多个 Q/A 或问/答标记")
-
-        if qa_score >= 0.7:
-            return DocumentTypeDetection(
-                document_type="qa",
-                split_strategy="numbered_qa",
-                confidence=round(min(qa_score, 0.98), 2),
-                reasons=reasons,
-            )
-
-        if len(numbered_items) >= 3:
-            return DocumentTypeDetection(
-                document_type="numbered",
-                split_strategy="numbered_segments",
-                confidence=0.72,
-                reasons=[f"检测到 {len(numbered_items)} 个编号条目"],
-            )
-
         return DocumentTypeDetection(
             document_type="text",
             split_strategy="recursive",
-            confidence=round(min(qa_score, 0.5), 2),
-            reasons=reasons or ["未检测到稳定结构，按普通文本递归切分"],
+            confidence=0.5,
+            reasons=["未使用模型推荐时默认按普通文本递归切分"],
         )
 
     def build_segments_and_qas(
@@ -408,6 +349,93 @@ class DocumentParser:
             )
 
         return segments
+
+    def _build_llm_semantic_segments(
+            self,
+            document_id: str,
+            documents: list[Document],
+            *,
+            document_type: str,
+    ) -> tuple[list[DocumentSegment], list[QaItem]]:
+        """按 LLM 返回的原文 span 生成语义切片。"""
+
+        full_text = LlmSemanticSplitter.join_documents(documents)
+        try:
+            plans = self.semantic_splitter.split(documents)
+        except Exception as exc:
+            logger.warning("[文档解析] LLM语义切片失败，回退递归切分 文档编号=%s 错误=%s", document_id, exc)
+            return self._build_recursive_segments(document_id, documents, document_type=document_type), []
+
+        segments: list[DocumentSegment] = []
+        qa_items: list[QaItem] = []
+        used_ranges: list[tuple[int, int]] = []
+
+        for plan in plans:
+            raw_start = self._plan_value(plan, "start")
+            raw_end = self._plan_value(plan, "end")
+            try:
+                start = int(raw_start)
+                end = int(raw_end)
+            except (TypeError, ValueError):
+                continue
+            if not self._is_valid_semantic_range(start, end, len(full_text), used_ranges):
+                continue
+
+            content = full_text[start:end].strip()
+            if not content:
+                continue
+
+            segment_index = len(segments)
+            segment_id = f"{document_id}_seg_{segment_index:04d}"
+            content_type = str(self._plan_value(plan, "content_type") or "segment").strip().lower()
+            question = str(self._plan_value(plan, "question") or "").strip()
+            category = str(self._plan_value(plan, "category") or "").strip() or None
+            semantic_title = str(self._plan_value(plan, "title") or "").strip() or None
+            metadata = {
+                "document_type": document_type,
+                "split_strategy": "llm_semantic",
+                "semantic_title": semantic_title,
+                "semantic_reason": str(self._plan_value(plan, "reason") or "").strip() or None,
+                "source_start": start,
+                "source_end": end,
+                "structure_source": "llm_semantic",
+            }
+            segments.append(
+                DocumentSegment(
+                    segment_id=segment_id,
+                    segment_index=segment_index,
+                    content=content,
+                    content_hash=self._hash_text(content),
+                    page_no=None,
+                    heading_path=category,
+                    metadata=metadata,
+                )
+            )
+
+            if content_type == "qa":
+                qa_items.append(
+                    QaItem(
+                        qa_id=f"{document_id}_qa_{segment_index:04d}",
+                        segment_id=segment_id,
+                        question_no=None,
+                        question=question or semantic_title or content[:80],
+                        answer=content,
+                        category=category,
+                        tags=["qa", "llm_semantic"],
+                        metadata={
+                            "source_start": start,
+                            "source_end": end,
+                            "structure_source": "llm_semantic",
+                        },
+                    )
+                )
+            used_ranges.append((start, end))
+
+        if not segments:
+            logger.warning("[文档解析] LLM语义切片无有效范围，回退递归切分 文档编号=%s", document_id)
+            return self._build_recursive_segments(document_id, documents, document_type=document_type), []
+
+        return segments, qa_items
 
     def _split_numbered_blocks(self, text: str) -> list[tuple[str | None, int | None, str]]:
         """按 Markdown 标题和编号行切出连续条目。"""
@@ -750,7 +778,37 @@ class DocumentParser:
             return True
         if any(mark in clean_title for mark in ("？", "?")):
             return True
-        return any(keyword in clean_title for keyword in cls.outline_question_keywords)
+        return False
+
+    @staticmethod
+    def _plan_value(plan: object, key: str) -> object:
+        """兼容 dataclass 和 dict 形式的 LLM 切片计划。"""
+
+        if isinstance(plan, dict):
+            return plan.get(key)
+        return getattr(plan, key, None)
+
+    @staticmethod
+    def _is_valid_semantic_range(
+            start: int,
+            end: int,
+            full_text_length: int,
+            used_ranges: list[tuple[int, int]],
+    ) -> bool:
+        """校验 LLM 返回的原文范围。"""
+
+        if start < 0 or end <= start or end > full_text_length:
+            return False
+        for used_start, used_end in used_ranges:
+            overlap_start = max(start, used_start)
+            overlap_end = min(end, used_end)
+            if overlap_end <= overlap_start:
+                continue
+            overlap_size = overlap_end - overlap_start
+            current_size = end - start
+            if overlap_size / current_size > 0.8:
+                return False
+        return True
 
     @staticmethod
     def _extract_question_no(title: str) -> int | None:
