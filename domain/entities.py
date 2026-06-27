@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, Integer, String, Text
+from sqlalchemy import BigInteger, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -182,6 +182,56 @@ class SystemUserEntity(BaseOrmModel, DictMixin):
     last_login_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="最后登录时间")
     created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
     updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
+
+
+class SystemRoleEntity(BaseOrmModel, DictMixin):
+    """system_roles 表实体，记录系统角色。"""
+
+    __tablename__ = "system_roles"
+
+    role_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, comment="角色唯一编号，雪花算法生成")
+    role_code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, comment="角色编码")
+    role_name: Mapped[str] = mapped_column(String(128), nullable=False, comment="角色名称")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", comment="角色状态")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="排序号")
+    built_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="是否内置角色")
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="角色说明")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
+
+
+class SystemMenuEntity(BaseOrmModel, DictMixin):
+    """system_menus 表实体，记录左侧菜单和页面入口。"""
+
+    __tablename__ = "system_menus"
+
+    menu_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, comment="菜单唯一编号，雪花算法生成")
+    parent_menu_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="父级菜单编号")
+    menu_code: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, comment="菜单编码")
+    menu_name: Mapped[str] = mapped_column(String(128), nullable=False, comment="菜单展示名称")
+    menu_type: Mapped[str] = mapped_column(String(32), nullable=False, comment="菜单类型")
+    page_key: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="前端页面键")
+    route_path: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="路由路径")
+    component_key: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="组件键")
+    icon: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="菜单图标")
+    permission_code: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="权限编码")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="排序号")
+    visible: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="是否展示")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", comment="菜单状态")
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="扩展配置 JSON")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
+
+
+class SystemRoleMenuEntity(BaseOrmModel, DictMixin):
+    """system_role_menus 表实体，记录角色可见菜单。"""
+
+    __tablename__ = "system_role_menus"
+
+    role_menu_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, comment="角色菜单关系编号，雪花算法生成")
+    role_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="角色编号")
+    menu_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="菜单编号")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
 
 
 class ExamSessionEntity(BaseOrmModel, DictMixin):
@@ -420,5 +470,5 @@ TrainingRepositoryRow = (
 )
 """销售训练仓储可能返回的 ORM 实体联合类型。"""
 
-EntityRow = KnowledgeStoreRow | TrainingRepositoryRow | SystemUserEntity
+EntityRow = KnowledgeStoreRow | TrainingRepositoryRow | SystemUserEntity | SystemRoleEntity | SystemMenuEntity | SystemRoleMenuEntity
 """项目关系型 ORM 实体联合类型。"""

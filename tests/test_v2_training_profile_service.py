@@ -65,13 +65,9 @@ class FakeProfileDictionaryRepository:
         return []
 
 
-def test_training_profile_dictionaries_use_v2_dictionary_repository(monkeypatch):
-    """画像字典查询应该走 V2 字典仓储，不再直接读取旧 KnowledgeStore。"""
+def test_training_profile_dictionaries_use_v2_dictionary_repository():
+    """画像字典查询应该走 V2 字典仓储，不再直接读取旧存储。"""
 
-    def fail_if_old_store_is_used():
-        raise AssertionError("销售训练画像字典不应该继续创建旧 KnowledgeStore")
-
-    monkeypatch.setattr(profile_service_module, "get_knowledge_store", fail_if_old_store_is_used, raising=False)
     repository = FakeProfileDictionaryRepository()
 
     service = TrainingProfileApplicationService(

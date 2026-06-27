@@ -8,8 +8,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from api.routers import internal_jobs
 from api.warmup import run_startup_warmup
+from app_v2.api.routes import internal_jobs
 from app_v2.api.router import router as v2_router
 
 
@@ -34,5 +34,5 @@ app = FastAPI(
 # V2 业务接口统一挂载到 /api/v2，前端也只调用这套协议。
 app.include_router(v2_router)
 
-# 内部定时任务暂时保留原路径，避免现有 xxl-job 配置立刻失效。
+# 内部定时任务保留原 URL，但实现已经迁入 V2 路由模块。
 app.include_router(internal_jobs.router)

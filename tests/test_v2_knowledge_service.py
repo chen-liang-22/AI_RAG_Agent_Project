@@ -3,11 +3,11 @@
 from app_v2.application.knowledge_service import KnowledgeApplicationService
 
 
-class ExplodingKnowledgeStore:
-    """如果 V2 知识服务继续调用旧 KnowledgeStore，测试应该立刻失败。"""
+class ExplodingLegacyStore:
+    """如果 V2 知识服务继续调用旧 store，测试应该立刻失败。"""
 
     def list_dictionary_items(self, *, dictionary_code=None):
-        raise AssertionError("KnowledgeApplicationService 文件列表字典快照不应该继续走 KnowledgeStore")
+        raise AssertionError("KnowledgeApplicationService 文件列表字典快照不应该继续走旧 store")
 
     def normalize_dictionary_code(self, dictionary_code: str, item_code: str | None = None):
         return item_code or "default"
@@ -87,17 +87,10 @@ class FakeDictionaryRepository:
 def test_knowledge_service_reads_documents_through_repository(monkeypatch):
     """知识资产应用服务的列表和详情读取应该走 V2 仓储。"""
 
-    import api.services.common_services as common_services
-
-    monkeypatch.setattr(
-        common_services,
-        "_get_knowledge_store",
-        lambda: (_ for _ in ()).throw(AssertionError("文档响应不应该自己创建旧 KnowledgeStore")),
-    )
     repository = FakeDocumentRepository()
     dictionary_repository = FakeDictionaryRepository()
     service = KnowledgeApplicationService(
-        store=ExplodingKnowledgeStore(),
+        store=ExplodingLegacyStore(),
         document_repository=repository,
         dictionary_repository=dictionary_repository,
     )
@@ -138,7 +131,7 @@ def test_knowledge_service_reindex_all_reads_documents_through_repository(monkey
     monkeypatch.setattr(knowledge_service_module, "_index_document", fake_index_document)
 
     service = KnowledgeApplicationService(
-        store=ExplodingKnowledgeStore(),
+        store=ExplodingLegacyStore(),
         document_repository=repository,
     )
 
@@ -207,7 +200,7 @@ def test_knowledge_service_confirm_upload_creates_and_indexes_through_repository
     monkeypatch.setattr(knowledge_service_module, "_index_document", fake_index_document)
 
     service = KnowledgeApplicationService(
-        store=ExplodingKnowledgeStore(),
+        store=ExplodingLegacyStore(),
         document_repository=repository,
     )
     request = KnowledgeUploadConfirmRequest(

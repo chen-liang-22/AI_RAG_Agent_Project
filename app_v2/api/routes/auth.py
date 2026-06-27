@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from api.auth_schemas import CurrentUserResponse, LoginRequest, LoginResponse, LogoutResponse, RefreshResponse
-from api.services.auth_services import AuthService
+from app_v2.application.auth_service import AuthService
 from domain.entities import SystemUserEntity
 from utils.logger_handler import logger
 

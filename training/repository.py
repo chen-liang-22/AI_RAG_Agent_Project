@@ -337,8 +337,8 @@ class TrainingRepository:
             self._batch_select_statement()
             .where(TrainingKnowledgeBatchEntity.status != "deleted")
             .order_by(
-                TrainingKnowledgeBatchEntity.updated_at.desc(),
                 TrainingKnowledgeBatchEntity.created_at.desc(),
+                TrainingKnowledgeBatchEntity.updated_at.desc(),
             )
             .limit(page_size)
             .offset(offset)

@@ -5,7 +5,7 @@ from fastapi import UploadFile
 
 from training.quality import TrainingIngestQualityEvaluator
 from training.repository import TrainingRepository
-from training.services.sales_training_service import SalesTrainingService
+from app_v2.application.training.sales_training_core import V2SalesTrainingCoreService
 from training.strategies.knowledge_ingest_strategy import TrainingChunk
 
 
@@ -118,7 +118,7 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
     """上传阶段只写临时向量库，确认发布后才进入正式向量库。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     unique_marker = uuid.uuid4().hex
     content = "\n".join([
@@ -152,7 +152,7 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
     assert batch["document_id"] == upload_result.document_id
     assert batch["file_path"] is None
     assert batch["file_md5"] is None
-    document = service.knowledge_store.get_document(upload_result.document_id)
+    document = service.document_repository.get_document(upload_result.document_id)
     assert document is not None
     assert document["filename"] == f"case-{unique_marker}.txt"
     assert document["collection_name"] == "sales_training_cases"
@@ -174,7 +174,7 @@ def test_training_delete_uses_document_asset_service(monkeypatch):
     """删除训练资料时应复用统一文件资产服务，避免清理逻辑分散。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     deleted_document_ids = []
 
     class FakeAssetService:
@@ -189,7 +189,7 @@ def test_training_delete_uses_document_asset_service(monkeypatch):
             })()
 
     monkeypatch.setattr(
-        "training.services.sales_training_service.DocumentAssetService",
+        "app_v2.application.training.sales_training_core.DocumentAssetService",
         lambda: FakeAssetService(),
     )
     monkeypatch.setattr(
@@ -213,7 +213,7 @@ def test_training_delete_legacy_batch_without_document_id(monkeypatch):
     """删除历史批次时，即使没有 document_id，也应按 batch_id 清理训练资料。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     fake_vector_service.documents.append(
         type("Document", (), {"metadata": {"batch_id": "batch_legacy"}})()
@@ -247,7 +247,7 @@ def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeyp
     """规则切分质量低时，应采用质量更高的 LLM 兜底切片。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     captured_model_modes = []
 
@@ -290,7 +290,7 @@ def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeyp
                 ),
             ]
 
-    monkeypatch.setattr("training.services.sales_training_service.TrainingLlmFallbackSplitter", FakeFallbackSplitter)
+    monkeypatch.setattr("app_v2.application.training.sales_training_core.TrainingLlmFallbackSplitter", FakeFallbackSplitter)
     upload_file = UploadFile(filename="weak.txt", file=BytesIO("这是一段没有结构的普通资料。".encode("utf-8")))
 
     upload_result = service.upload_knowledge(
@@ -312,7 +312,7 @@ def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
     """人工重新切分时，应主动采用 LLM 兜底结果并回到待确认状态。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     captured_model_modes = []
 
@@ -360,7 +360,7 @@ def test_training_manual_reparse_uses_llm_fallback(tmp_path, monkeypatch):
                 ),
             ]
 
-    monkeypatch.setattr("training.services.sales_training_service.TrainingLlmFallbackSplitter", FakeFallbackSplitter)
+    monkeypatch.setattr("app_v2.application.training.sales_training_core.TrainingLlmFallbackSplitter", FakeFallbackSplitter)
     content = "\n".join([
         "一、客户案例",
         "企业：规则切分版本",
@@ -395,7 +395,7 @@ def test_training_preview_uses_saved_chunks(tmp_path):
     """预览接口应展示已保存切片，避免重新解析导致预览和发布不一致。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     attach_fake_vector_services(service)
     content = "\n".join([
         "一、客户案例",
@@ -419,7 +419,7 @@ def test_training_duplicate_upload_uses_document_md5(tmp_path):
     """重复上传应通过 documents 文件台账中的 MD5 复用已发布批次。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     attach_fake_vector_services(service)
     content = "\n".join([
         "一、客户案例",
@@ -453,7 +453,7 @@ def test_training_publish_writes_validation_report(tmp_path):
     """发布完成后，应把抽样检索验证结果写回质量报告。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     attach_fake_vector_services(service)
     content = "\n".join([
         "一、客户案例",
@@ -479,7 +479,7 @@ def test_training_delete_batch_removes_document_asset_chain(tmp_path):
     """删除训练批次时，应同步硬删除 documents 文件台账和训练批次记录。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     content = "\n".join([
         "一、客户案例",
@@ -499,7 +499,7 @@ def test_training_delete_batch_removes_document_asset_chain(tmp_path):
 
     delete_result = service.delete_batch(upload_result.batch_id)
     batch = repository.get_batch(upload_result.batch_id)
-    document = service.knowledge_store.get_document(upload_result.document_id)
+    document = service.document_repository.get_document(upload_result.document_id)
 
     assert delete_result.status == "deleted"
     assert batch is None
@@ -510,7 +510,7 @@ def test_training_publish_archives_previous_version_and_rollback(tmp_path):
     """同名资料发布新版本后旧版本应归档，并支持回滚为当前版本。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
     unique_suffix = uuid.uuid4().hex
     filename = f"version_{unique_suffix}.txt"
@@ -571,7 +571,7 @@ def test_training_list_batch_versions_returns_version_chain(tmp_path):
     """版本链接口应返回同一版本组内的全部未删除版本。"""
 
     repository = TrainingRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
     attach_fake_vector_services(service)
     unique_suffix = uuid.uuid4().hex
     filename = f"chain_{unique_suffix}.txt"

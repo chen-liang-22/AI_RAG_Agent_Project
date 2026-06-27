@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-import api.routers.internal_jobs as internal_jobs
+import app_v2.api.routes.internal_jobs as internal_jobs
 from api.main import app
 
 

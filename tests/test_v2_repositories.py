@@ -5,7 +5,7 @@ from app_v2.shared.pagination import escape_like_keyword, normalize_page
 
 
 class FakeStore:
-    """测试用字典数据源，模拟旧 KnowledgeStore 的字典方法。"""
+    """测试用字典数据源，模拟旧字典方法。"""
 
     def __init__(self):
         self.list_calls: list[str | None] = []
@@ -246,7 +246,7 @@ def _seed_conversation_rows(factory):
 
 
 def test_conversation_repository_uses_orm_for_list_detail_and_delete(monkeypatch):
-    """V2 会话仓储应该直接使用 ORM，不再委托旧 KnowledgeStore。"""
+    """V2 会话仓储应该直接使用 ORM，不再委托旧存储。"""
 
     factory = _build_sqlite_session_factory()
     _seed_conversation_rows(factory)
@@ -278,16 +278,16 @@ def test_conversation_repository_uses_orm_for_list_detail_and_delete(monkeypatch
     assert deleted_messages == []
 
 class ExplodingDocumentStore:
-    """如果 V2 文档仓储仍然调用旧 KnowledgeStore，本替身会让测试立刻失败。"""
+    """如果 V2 文档仓储仍然调用旧存储，本替身会让测试立刻失败。"""
 
     def list_documents(self, *args, **kwargs):
-        raise AssertionError("V2 文档仓储不应该继续委托旧 KnowledgeStore 查询列表")
+        raise AssertionError("V2 文档仓储不应该继续委托旧存储查询列表")
 
     def get_document(self, *args, **kwargs):
-        raise AssertionError("V2 文档仓储不应该继续委托旧 KnowledgeStore 查询详情")
+        raise AssertionError("V2 文档仓储不应该继续委托旧存储查询详情")
 
     def find_active_document_by_md5(self, *args, **kwargs):
-        raise AssertionError("V2 文档仓储不应该继续委托旧 KnowledgeStore 做去重查询")
+        raise AssertionError("V2 文档仓储不应该继续委托旧存储做去重查询")
 
 
 def _seed_document_rows(factory):
@@ -363,7 +363,7 @@ def _seed_document_rows(factory):
 
 
 def test_document_repository_uses_orm_for_list_detail_and_duplicate_lookup(monkeypatch):
-    """V2 文档仓储应该直接查询 documents 表，避免继续把读路径压在旧 KnowledgeStore 上。"""
+    """V2 文档仓储应该直接查询 documents 表，避免继续把读路径压在旧存储上。"""
 
     factory = _build_sqlite_session_factory()
     _seed_document_rows(factory)
@@ -443,19 +443,19 @@ def test_document_repository_uses_orm_for_create_update_and_delete(monkeypatch):
     assert missing_after_delete is None
 
 class ExplodingDictionaryStore:
-    """如果 V2 字典仓储仍然调用旧 KnowledgeStore，本替身会让测试失败。"""
+    """如果 V2 字典仓储仍然调用旧存储，本替身会让测试失败。"""
 
     def list_dictionary_items(self, *args, **kwargs):
-        raise AssertionError("V2 字典仓储不应该继续委托旧 KnowledgeStore 查询字典")
+        raise AssertionError("V2 字典仓储不应该继续委托旧存储查询字典")
 
     def upsert_dictionary_item(self, *args, **kwargs):
-        raise AssertionError("V2 字典仓储不应该继续委托旧 KnowledgeStore 保存字典")
+        raise AssertionError("V2 字典仓储不应该继续委托旧存储保存字典")
 
     def delete_dictionary_item(self, *args, **kwargs):
-        raise AssertionError("V2 字典仓储不应该继续委托旧 KnowledgeStore 删除字典")
+        raise AssertionError("V2 字典仓储不应该继续委托旧存储删除字典")
 
     def normalize_dictionary_code(self, *args, **kwargs):
-        raise AssertionError("V2 字典仓储不应该继续委托旧 KnowledgeStore 归一化字典编码")
+        raise AssertionError("V2 字典仓储不应该继续委托旧存储归一化字典编码")
 
 
 def _seed_dictionary_rows(factory):

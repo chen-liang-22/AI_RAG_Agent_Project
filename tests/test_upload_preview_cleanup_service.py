@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from api.services.upload_preview_cleanup_service import PreviewUploadCleanupService
+from app_v2.application.knowledge.upload_preview_cleanup_service import PreviewUploadCleanupService
 
 
 class FakeFileStorage:

@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 import app_v2.api.routes.auth as auth_router
 from api.main import app
-from api.services.auth_services import (
+from app_v2.application.auth_service import (
     AuthService,
     RefreshSession,
     RefreshSessionStore,

@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import select
 
 from domain.entities import DictionaryItemEntity
+from app_v2.infrastructure.repositories.default_dictionaries import DEFAULT_DICTIONARY_ITEMS, DEPRECATED_DICTIONARY_CODES
 from infrastructure.orm_session import orm_session_context
 from training.repository import utc_now
 from utils.redis_client import RedisClient, get_redis_client
@@ -26,6 +27,69 @@ class DictionaryRepository:
         # store 参数只保留给旧测试和过渡调用占位，真实数据访问已经改为 ORM。
         self.store = store
         self.redis_client = redis_client or get_redis_client()
+
+    def seed_default_items(self) -> None:
+        """初始化系统默认字典项，已有字典项只更新展示信息。"""
+
+        with orm_session_context() as session:
+            deprecated_items = session.scalars(
+                select(DictionaryItemEntity).where(
+                    DictionaryItemEntity.dictionary_code.in_(DEPRECATED_DICTIONARY_CODES)
+                )
+            ).all()
+            for item in deprecated_items:
+                session.delete(item)
+
+            now = utc_now()
+            for dictionary in DEFAULT_DICTIONARY_ITEMS:
+                dictionary_code = dictionary["dictionary_code"]
+                dictionary_name = dictionary["dictionary_name"]
+                item_id_by_code: dict[str, str] = {}
+                for item in dictionary["items"]:
+                    item_code, item_name, parent_code, sort_order, description = item[:5]
+                    metadata = item[5] if len(item) > 5 else None
+                    metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+                    existing = session.scalars(
+                        select(DictionaryItemEntity).where(
+                            DictionaryItemEntity.dictionary_code == dictionary_code,
+                            DictionaryItemEntity.item_code == item_code,
+                        )
+                    ).first()
+                    parent_item_id = item_id_by_code.get(parent_code or "")
+                    item_level = 1 if parent_item_id is None else 2
+                    if existing is None:
+                        dictionary_item_id = self._new_dictionary_item_id(dictionary_code, str(item_code))
+                        session.add(DictionaryItemEntity(
+                            dictionary_item_id=dictionary_item_id,
+                            dictionary_code=dictionary_code,
+                            dictionary_name=dictionary_name,
+                            item_code=item_code,
+                            item_name=item_name,
+                            parent_item_id=parent_item_id,
+                            item_level=item_level,
+                            sort_order=int(sort_order),
+                            enabled=1,
+                            description=description,
+                            metadata_json=metadata_json,
+                            created_at=now,
+                            updated_at=now,
+                        ))
+                    else:
+                        dictionary_item_id = existing.dictionary_item_id
+                        existing.dictionary_name = dictionary_name
+                        existing.item_name = item_name
+                        existing.parent_item_id = parent_item_id
+                        existing.item_level = item_level
+                        existing.sort_order = int(sort_order)
+                        existing.enabled = 1
+                        existing.description = description
+                        existing.metadata_json = metadata_json
+                        existing.updated_at = now
+                    item_id_by_code[str(item_code)] = dictionary_item_id
+
+        self.clear_cache()
+        for dictionary in DEFAULT_DICTIONARY_ITEMS:
+            self.clear_cache(str(dictionary["dictionary_code"]))
 
     def list_items(self, dictionary_code: str | None = None) -> list[dict[str, Any]]:
         """查询字典项列表，支持按字典编码过滤并使用 Redis 缓存。"""

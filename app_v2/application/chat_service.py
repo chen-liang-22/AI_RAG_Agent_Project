@@ -22,7 +22,7 @@ from api.schemas import (
     ConversationSummaryResponse,
     DebugRetrieveRequest,
 )
-from api.services.chat_services import (
+from app_v2.application.chat_generation_service import (
     _get_agent,
     _get_knowledge_answer_service,
     _prepare_chat_conversation,
@@ -32,7 +32,7 @@ from api.services.chat_services import (
     _stream_direct_rag,
 )
 from app_v2.infrastructure.repositories.conversation_repository import ConversationRepository
-from api.services.common_services import _get_knowledge_store
+from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from model.factory import get_chat_model_name_for_mode, normalize_chat_model_mode
 from utils.logger_handler import logger
 from utils.qdrant_options import normalize_qdrant_collection_name
@@ -41,10 +41,16 @@ from utils.qdrant_options import normalize_qdrant_collection_name
 class ChatApplicationService:
     """聊天外观服务。"""
 
-    def __init__(self, store=None, conversation_repository: ConversationRepository | None = None):
-        # 生成回答相关的旧流程暂时还需要 KnowledgeStore；聊天记录查询已经下沉到 V2 repository。
-        self.store = store or _get_knowledge_store()
+    def __init__(
+            self,
+            store=None,
+            conversation_repository: ConversationRepository | None = None,
+            dictionary_repository: DictionaryRepository | None = None,
+    ):
+        # store 参数保留给旧测试占位；真实状态码归一化走 V2 字典仓储。
+        self.store = store
         self.conversation_repository = conversation_repository or ConversationRepository()
+        self.dictionary_repository = dictionary_repository or DictionaryRepository()
 
     def list_conversations(self, *, page: int, page_size: int, user_id: str | None = None, keyword: str | None = None) -> ConversationListResponse:
         """分页查询聊天记录列表。"""
@@ -224,7 +230,12 @@ class ChatApplicationService:
     def _conversation_status(self, item_code: str) -> str:
         """从字典读取会话状态码。"""
 
-        return self.store.normalize_dictionary_code("conversation_status", item_code)
+        if self.store is not None and hasattr(self.store, "normalize_dictionary_code"):
+            return self.store.normalize_dictionary_code("conversation_status", item_code)
+        try:
+            return self.dictionary_repository.normalize_code("conversation_status", item_code)
+        except ValueError:
+            return item_code
 
     @classmethod
     def _conversation_summary(cls, row: dict) -> ConversationSummaryResponse:

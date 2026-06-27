@@ -25,7 +25,7 @@ class ExplodingStore:
     """如果首页概览继续用旧 store 构建字典快照，测试应该失败。"""
 
     def list_dictionary_items(self, *args, **kwargs):
-        raise AssertionError("首页知识库概览不应该继续通过旧 KnowledgeStore 查询字典")
+        raise AssertionError("首页知识库概览不应该继续通过旧存储查询字典")
 
 
 class FakeDocumentRepository:
@@ -97,16 +97,8 @@ class DashboardServiceForTest(DashboardApplicationService):
         )
 
 
-def test_dashboard_overview_uses_v2_dictionary_repository_for_documents(monkeypatch):
+def test_dashboard_overview_uses_v2_dictionary_repository_for_documents():
     """首页知识库概览的文档响应应该使用 V2 字典仓储快照。"""
-
-    import api.services.common_services as common_services
-
-    monkeypatch.setattr(
-        common_services,
-        "_get_knowledge_store",
-        lambda: (_ for _ in ()).throw(AssertionError("首页文档响应不应该自己创建旧 KnowledgeStore")),
-    )
 
     service = DashboardServiceForTest()
     overview = service.overview()

@@ -7,14 +7,14 @@ from typing import Any
 from qdrant_client import QdrantClient
 
 from api.schemas import ConversationSummaryResponse, HealthResponse
-from api.services.common_services import DictionaryCodeSnapshot, _document_to_response
 from app_v2.domain.constants import HOME_PAGE_SIZE
 from app_v2.domain.schemas import DashboardOverviewResponse
 from app_v2.infrastructure.repositories.conversation_repository import ConversationRepository
 from app_v2.infrastructure.repositories.document_repository import DocumentRepository
 from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from app_v2.infrastructure.repositories.training_repository import V2TrainingRepository
-from training.services.sales_training_service import SalesTrainingService
+from app_v2.application.training.sales_training_core import V2SalesTrainingCoreService
+from app_v2.shared.document_response import DictionaryCodeSnapshot, document_to_response
 from utils.logger_handler import logger
 from utils.qdrant_options import get_qdrant_client_options, get_qdrant_collection_name
 from utils.redis_client import get_redis_client
@@ -82,7 +82,7 @@ class DashboardApplicationService:
         health = self.health()
         dictionary_snapshot = self._document_dictionary_snapshot()
         documents = self.document_repository.list_documents(include_training=True)
-        knowledge_files = [_document_to_response(row, dictionary_snapshot) for row in documents[:HOME_PAGE_SIZE]]
+        knowledge_files = [document_to_response(row, dictionary_snapshot) for row in documents[:HOME_PAGE_SIZE]]
 
         conversations, conversation_total = self.conversation_repository.list_conversations(page=1, page_size=HOME_PAGE_SIZE)
         recent_conversations = [self._conversation_summary(row) for row in conversations]
@@ -90,14 +90,13 @@ class DashboardApplicationService:
         batches, batch_total = self.training_repository.list_batches(page=1, page_size=HOME_PAGE_SIZE)
         plans, plan_total = self.training_repository.list_plans(page=1, page_size=HOME_PAGE_SIZE)
         sessions, session_total = self.training_repository.list_sessions(page=1, page_size=HOME_PAGE_SIZE)
-        training_service = SalesTrainingService(repository=self.training_repository)
 
         response = DashboardOverviewResponse(
             health=health,
             knowledge_files=knowledge_files,
-            training_batches=[training_service._batch_response(row) for row in batches],
-            training_plans=[training_service._plan_summary(row) for row in plans],
-            training_sessions=[training_service._session_summary(row) for row in sessions],
+            training_batches=[V2SalesTrainingCoreService._batch_response(row) for row in batches],
+            training_plans=[V2SalesTrainingCoreService._plan_summary(row) for row in plans],
+            training_sessions=[V2SalesTrainingCoreService._session_summary(row) for row in sessions],
             recent_conversations=recent_conversations,
             metrics={
                 "document_total": len(documents),

@@ -135,6 +135,13 @@ class ExamHistoryListResponse(BaseModel):
     page_size: int  # 每页数量
 
 
+class ExamSessionDeleteResponse(BaseModel):
+    """考试会话删除响应。"""
+
+    status: str  # 删除结果状态
+    session_id: str  # 被删除的考试会话编号
+
+
 class ExamQuestionRecord(BaseModel):
     """考试详情中的单题记录。"""
 

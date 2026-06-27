@@ -1,16 +1,26 @@
+import uuid
+
 from training.repository import TrainingRepository
 from training.schemas import TrainingPlanCreateRequest, TrainingPlanUpdateRequest
-from training.services.sales_training_service import SalesTrainingService
+from app_v2.application.training.sales_training_core import V2SalesTrainingCoreService
+
+
+def _unique_id(prefix: str) -> str:
+    """生成测试专用唯一编号，避免本地数据库历史数据影响断言。"""
+
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
 def test_training_repository_allows_duplicate_plan_names(tmp_path):
     """训练名称允许重复，训练记录通过 plan_id 区分。"""
 
     repository = TrainingRepository()
+    trainee_id = _unique_id("trainee")
+    plan_name = f"海外 BD 异议处理 {_unique_id('plan')}"
     base_payload = {
-        "plan_name": "海外 BD 异议处理",
+        "plan_name": plan_name,
         "trainee": {
-            "trainee_id": "trainee-1",
+            "trainee_id": trainee_id,
             "trainee_name": "销售学员",
             "position_role": "overseas_bd",
             "experience_level": "junior",
@@ -27,11 +37,11 @@ def test_training_repository_allows_duplicate_plan_names(tmp_path):
 
     first_plan = repository.create_plan(**base_payload)
     second_plan = repository.create_plan(**base_payload)
-    plans, total = repository.list_plans(page=1, page_size=10, keyword="海外 BD")
+    plans, total = repository.list_plans(page=1, page_size=10, keyword=plan_name)
 
     assert first_plan["plan_id"] != second_plan["plan_id"]
     assert total == 2
-    assert {plan["plan_name"] for plan in plans} == {"海外 BD 异议处理"}
+    assert {plan["plan_name"] for plan in plans} == {plan_name}
 
 
 def test_sales_training_service_deletes_existing_plan():
@@ -64,7 +74,7 @@ def test_sales_training_service_deletes_existing_plan():
             return False
 
     repository = FakeRepository()
-    service = SalesTrainingService(repository=repository)
+    service = V2SalesTrainingCoreService(repository=repository)
 
     result = service.delete_plan("plan_delete_test")
 
@@ -78,8 +88,9 @@ def test_training_repository_persists_history_and_score(tmp_path):
     """训练仓储应能保存会话、开场白、学员轮次和评分，供前端复盘使用。"""
 
     repository = TrainingRepository()
+    trainee_id = _unique_id("trainee")
     role = repository.save_role_profile(
-        trainee_id="trainee-1",
+        trainee_id=trainee_id,
         profile_type="overseas_bd",
         visible_profile={"role": "采购负责人"},
         hidden_profile={"real_concerns": ["风险"]},
@@ -93,7 +104,7 @@ def test_training_repository_persists_history_and_score(tmp_path):
     )
     setting = repository.save_goal_setting(
         profile_id=role["profile_id"],
-        trainee_id="trainee-1",
+        trainee_id=trainee_id,
         training_mode="open",
         training_purpose="需求挖掘",
         round_limit=6,
@@ -111,7 +122,7 @@ def test_training_repository_persists_history_and_score(tmp_path):
     session = repository.create_session(
         profile_id=role["profile_id"],
         setting_id=setting["setting_id"],
-        trainee_id="trainee-1",
+        trainee_id=trainee_id,
         training_mode="open",
         response_mode="stream",
         round_limit=6,
@@ -153,7 +164,7 @@ def test_training_repository_persists_history_and_score(tmp_path):
         report={"hit_points": ["能主动提问"]},
     )
 
-    sessions, total = repository.list_sessions(page=1, page_size=10, trainee_id="trainee-1")
+    sessions, total = repository.list_sessions(page=1, page_size=10, trainee_id=trainee_id)
     turns = repository.list_turns(session["session_id"])
     latest_score = repository.get_latest_score_by_session(session["session_id"])
 
@@ -167,7 +178,7 @@ def test_training_repository_persists_history_and_score(tmp_path):
 def test_training_plan_snapshot_is_independent_and_only_real_changes_mark_stale(tmp_path):
     """训练方案允许同名独立保存；只有画像或场景真实变化时才标记后续内容需重新生成。"""
 
-    service = SalesTrainingService(repository=TrainingRepository())
+    service = V2SalesTrainingCoreService(repository=TrainingRepository())
     base_trainee = {
         "trainee_id": "trainee-1",
         "trainee_name": "张三",

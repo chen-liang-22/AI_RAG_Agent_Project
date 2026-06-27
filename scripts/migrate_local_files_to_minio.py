@@ -31,7 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from domain.entities import DocumentEntity, TrainingKnowledgeBatchEntity
 from infrastructure.file_storage_service import get_file_storage_service
 from infrastructure.orm_session import orm_session_context
-from rag.knowledge_store import KnowledgeStore
+from app_v2.infrastructure.repositories.document_repository import DocumentRepository
 from training.repository import TrainingRepository
 from utils.logger_handler import logger
 
@@ -147,7 +147,7 @@ def ensure_storage_columns() -> None:
     """
 
     with orm_session_context() as session:
-        KnowledgeStore.ensure_document_storage_columns(session)
+        DocumentRepository.ensure_storage_columns(session)
     TrainingRepository.ensure_training_batch_document_columns()
 
 

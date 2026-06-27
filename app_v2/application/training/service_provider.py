@@ -2,21 +2,14 @@
 
 from functools import lru_cache
 
-from rag.knowledge_store import KnowledgeStore
-from training.services.sales_training_service import SalesTrainingService
+from app_v2.application.training.sales_training_core import V2SalesTrainingCoreService
 
 
 @lru_cache(maxsize=1)
-def get_sales_training_service() -> SalesTrainingService:
-    """获取销售训练旧服务单例。
+def get_training_core_service() -> V2SalesTrainingCoreService:
+    """获取 V2 销售训练核心服务单例。
 
-    这是过渡期外观：V2 模块先依赖这个提供器，后续再把旧大服务逐步拆成真正的小服务。
+    这是拆分期的核心实现入口。各 V2 小服务先延迟访问它，避免构造阶段继续创建旧大类。
     """
 
-    return SalesTrainingService()
-
-
-def get_knowledge_store() -> KnowledgeStore:
-    """创建知识库元数据存储实例，用于读取系统字典。"""
-
-    return KnowledgeStore()
+    return V2SalesTrainingCoreService()

@@ -21,7 +21,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.documents import Document
 
-from rag.knowledge_store import KnowledgeStore
 from rag.services.query_planner_service import QueryPlannerService
 from rag.query_pipeline import QueryAnalysis
 from rag.reranker import RuleBasedReranker
@@ -48,7 +47,6 @@ class RagSummarizeService(object):
     def __init__(self):
         self.vector_store: VectorStoreService | None = None  # Qdrant 向量库服务，懒加载，避免 Qdrant 不可用时整个 RAG 初始化失败
         self.vector_stores: dict[str, VectorStoreService] = {}  # 按 collection 缓存向量库服务，避免多知识库互相串用
-        self.knowledge_store = KnowledgeStore()  # MySQL 业务元数据仓库，用于文档、会话和系统字典管理
         self.query_planner = QueryPlannerService()  # LLM Query Planner，负责把复杂问题拆成多个 search_query
         self.reranker = RuleBasedReranker()  # 规则版精排器
 

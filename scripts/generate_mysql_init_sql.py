@@ -1,7 +1,7 @@
 """生成 MySQL 初始化 SQL。
 
 这个脚本只生成建表和系统默认字典数据，便于统一维护 MySQL 初始化脚本。
-字典种子直接复用 rag.knowledge_store.DEFAULT_DICTIONARY_ITEMS，避免手写 SQL 和代码口径不一致。
+字典种子直接复用 V2 默认字典配置，避免手写 SQL 和代码口径不一致。
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from rag.knowledge_store import DEFAULT_DICTIONARY_ITEMS
+from app_v2.infrastructure.repositories.default_dictionaries import DEFAULT_DICTIONARY_ITEMS
 
 
 OUTPUT_PATH = Path("docs/mysql初始化建表和基础数据.sql")

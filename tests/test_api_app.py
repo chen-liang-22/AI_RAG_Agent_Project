@@ -4,11 +4,10 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-import api.routers.knowledge as knowledge_router
 import app_v2.application.knowledge_service as v2_knowledge_service
-import api.routers.exam as exam_router
+import app_v2.application.exam_service as exam_router
+from app_v2.infrastructure.repositories.exam_repository import ExamRepository
 from api.main import app
-from rag.knowledge_store import KnowledgeStore
 from utils.path_tool import get_abs_path
 
 
@@ -145,13 +144,21 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
     data_path = get_abs_path("data")
     filename = next(name for name in os.listdir(data_path) if name.endswith(".txt"))
 
-    class FakeKnowledgeStore:
-        def list_dictionary_items(self, *, dictionary_code=None):
+    class FakeDictionaryRepository:
+        """测试用 V2 字典仓储，提供文档响应归一化所需字典项。"""
+
+        def list_items(self, dictionary_code=None):
             if dictionary_code == "document_structure":
                 return [{"item_code": "text", "enabled": 1}]
             if dictionary_code == "split_strategy":
                 return [{"item_code": "recursive", "enabled": 1}]
             return []
+
+    class FakeDocumentRepository:
+        """测试用 V2 文档仓储，模拟 documents 表按编号查询。"""
+
+        def __init__(self, *args, **kwargs):
+            pass
 
         def get_document(self, document_id: str):
             assert document_id == "doc_test"
@@ -177,15 +184,6 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
                 "error_message": None,
             }
 
-    class FakeDocumentRepository:
-        """测试用 V2 文档仓储，模拟 documents 表按编号查询。"""
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def get_document(self, document_id: str):
-            return FakeKnowledgeStore().get_document(document_id)
-
     class FakeFileStorage:
         """测试用文件存储服务，把 MinIO 下载动作映射到 data 目录样例文件。"""
 
@@ -199,8 +197,8 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
 
             return TempFileContext()
 
-    monkeypatch.setattr(v2_knowledge_service, "_get_knowledge_store", lambda: FakeKnowledgeStore())
     monkeypatch.setattr(v2_knowledge_service, "DocumentRepository", FakeDocumentRepository)
+    monkeypatch.setattr(v2_knowledge_service, "DictionaryRepository", FakeDictionaryRepository)
     monkeypatch.setattr(v2_knowledge_service, "FileStorageAdapter", lambda: FakeFileStorage())
 
     response = client.get("/api/v2/knowledge/files/doc_test/preview?max_chars=1000")
@@ -216,16 +214,21 @@ def test_preview_knowledge_file_reads_text_from_registered_document(monkeypatch)
 def test_knowledge_files_excludes_training_collections_by_default(monkeypatch):
     client = TestClient(app)
 
-    class FakeKnowledgeStore:
-        def normalize_dictionary_code(self, dictionary_code, item_code):
-            return item_code
+    class FakeDictionaryRepository:
+        """测试用 V2 字典仓储，提供文档响应归一化所需字典项。"""
 
-        def list_dictionary_items(self, *, dictionary_code=None):
+        def list_items(self, dictionary_code=None):
             if dictionary_code == "document_structure":
                 return [{"item_code": "text", "enabled": 1}]
             if dictionary_code == "split_strategy":
                 return [{"item_code": "recursive", "enabled": 1}]
             return []
+
+    class FakeDocumentRepository:
+        """测试用 V2 文档仓储，模拟 documents 表默认排除训练资料。"""
+
+        def __init__(self, *args, **kwargs):
+            pass
 
         def list_documents(self, *, include_training=False):
             assert include_training is False
@@ -253,17 +256,8 @@ def test_knowledge_files_excludes_training_collections_by_default(monkeypatch):
                 }
             ]
 
-    class FakeDocumentRepository:
-        """测试用 V2 文档仓储，模拟 documents 表默认排除训练资料。"""
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def list_documents(self, *, include_training=False):
-            return FakeKnowledgeStore().list_documents(include_training=include_training)
-
-    monkeypatch.setattr(v2_knowledge_service, "_get_knowledge_store", lambda: FakeKnowledgeStore())
     monkeypatch.setattr(v2_knowledge_service, "DocumentRepository", FakeDocumentRepository)
+    monkeypatch.setattr(v2_knowledge_service, "DictionaryRepository", FakeDictionaryRepository)
 
     response = client.get("/api/v2/knowledge/files")
 
@@ -386,7 +380,7 @@ def test_exam_question_generation_and_grading_use_model_polishing(monkeypatch):
 
 
 def test_exam_question_rows_can_generate_first_question_before_remaining(monkeypatch, tmp_path):
-    store = KnowledgeStore()
+    store = ExamRepository()
     session = store.create_exam_session(
         session_id=_unique_id("exam_fast_start"),
         user_id="user_exam",
@@ -459,7 +453,7 @@ def test_exam_question_rows_can_generate_first_question_before_remaining(monkeyp
 
 
 def test_exam_first_question_fast_mode_skips_model(monkeypatch, tmp_path):
-    store = KnowledgeStore()
+    store = ExamRepository()
     session = store.create_exam_session(
         session_id=_unique_id("exam_fast_rule_start"),
         user_id="user_exam",
@@ -507,7 +501,7 @@ def test_exam_first_question_fast_mode_skips_model(monkeypatch, tmp_path):
 
 
 def test_choice_answer_value_is_normalized_to_label(tmp_path):
-    store = KnowledgeStore()
+    store = ExamRepository()
     session = store.create_exam_session(
         session_id=_unique_id("exam_choice_label"),
         user_id="user_exam",
@@ -635,7 +629,7 @@ def test_exam_start_request_requires_title():
 
 
 def test_multiple_choice_distribution_breaks_repeated_all_select(monkeypatch, tmp_path):
-    store = KnowledgeStore()
+    store = ExamRepository()
     session = store.create_exam_session(
         session_id=_unique_id("exam_multi_distribution"),
         user_id="user_exam",

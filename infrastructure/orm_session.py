@@ -25,6 +25,7 @@ from utils.database_connection import load_database_config
 _engine_cache: dict[tuple[Any, ...], Engine] = {}
 _session_factory_cache: dict[tuple[Any, ...], sessionmaker[Session]] = {}
 _engine_lock = Lock()
+_session_factory_override: sessionmaker[Session] | None = None
 
 
 def _mysql_engine_signature(config: dict[str, Any]) -> tuple[Any, ...]:
@@ -71,12 +72,36 @@ def _create_mysql_engine(config: dict[str, Any]) -> Engine:
     )
 
 
+def _is_truthy_env(name: str) -> bool:
+    """判断环境变量是否表示开启状态。"""
+
+    import os
+
+    return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _guard_real_database_in_tests(config: dict[str, Any]) -> None:
+    """阻止 pytest 默认连接正式业务库。"""
+
+    if not _is_truthy_env("AI_RAG_TESTING"):
+        return
+    if _is_truthy_env("RUN_REAL_MYSQL_TESTS"):
+        return
+    database_name = str(config.get("database") or "").strip().lower()
+    if database_name == "ai_rag_agent":
+        raise RuntimeError(
+            "测试环境禁止连接正式 MySQL 数据库 ai_rag_agent；"
+            "请使用测试 SessionFactory 覆盖，或显式设置 RUN_REAL_MYSQL_TESTS=1"
+        )
+
+
 def get_orm_engine() -> Engine:
     """获取 MySQL ORM Engine。"""
 
     config = load_database_config()
     if config["type"] != "mysql":
         raise RuntimeError("ORM层只支持 MySQL，请把 config/database.yml 的 type 配置为 mysql")
+    _guard_real_database_in_tests(config["mysql"])
     signature = _mysql_engine_signature(config["mysql"])
 
     with _engine_lock:
@@ -90,6 +115,8 @@ def get_orm_engine() -> Engine:
 def get_session_factory() -> sessionmaker[Session]:
     """获取 Session 工厂，类似 MyBatis 的 SqlSessionFactory。"""
 
+    if _session_factory_override is not None:
+        return _session_factory_override
     engine = get_orm_engine()
     # Engine 已经按完整数据库配置缓存；这里直接用对象身份做 key，
     # 避免 SQLAlchemy URL 隐藏密码后导致不同数据源误共用 Session 工厂。
@@ -125,3 +152,19 @@ def reset_orm_engines() -> None:
             engine.dispose()
         _engine_cache.clear()
         _session_factory_cache.clear()
+
+
+def set_session_factory_override(factory: sessionmaker[Session]) -> None:
+    """设置测试专用 Session 工厂，避免单元测试连接真实 MySQL。"""
+
+    global _session_factory_override
+    with _engine_lock:
+        _session_factory_override = factory
+
+
+def clear_session_factory_override() -> None:
+    """清理测试专用 Session 工厂覆盖。"""
+
+    global _session_factory_override
+    with _engine_lock:
+        _session_factory_override = None

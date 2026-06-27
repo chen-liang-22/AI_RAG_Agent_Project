@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from api.services.upload_preview_state import (
+from app_v2.application.knowledge.upload_preview_state import (
     PreviewUploadMetadata,
     PreviewUploadStore,
     load_upload_preview_config,

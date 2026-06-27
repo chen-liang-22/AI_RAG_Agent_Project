@@ -21,11 +21,10 @@ from api.schemas import (
     KnowledgeUploadRecommendResponse,
     KnowledgeUploadResponse,
 )
-from api.services.common_services import DictionaryCodeSnapshot, _document_to_response, _get_knowledge_store
-from api.services.document_asset_service import DocumentAssetService
-from api.services.indexing_services import _index_document, _sync_data_files_to_documents
-from api.services.upload_preview_state import load_upload_preview_config
-from api.services.upload_services import (
+from app_v2.application.knowledge.upload_preview_state import load_upload_preview_config
+from app_v2.application.knowledge.document_asset_service import DocumentAssetService
+from app_v2.application.knowledge.indexing_service import _index_document, _sync_data_files_to_documents
+from app_v2.application.knowledge.upload_preview_service import (
     _delete_preview_file,
     _get_preview_file,
     _promote_preview_file,
@@ -38,6 +37,7 @@ from app_v2.infrastructure.adapters.file_storage_adapter import FileStorageAdapt
 from app_v2.infrastructure.adapters.vector_store_adapter import VectorStoreAdapter
 from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from app_v2.infrastructure.repositories.document_repository import DocumentRepository
+from app_v2.shared.document_response import DictionaryCodeSnapshot, document_to_response
 from infrastructure.id_generator import new_id
 from rag.file_processors import FileProcessorFactory
 from utils.file_handler import pdf_loader
@@ -60,11 +60,10 @@ class KnowledgeApplicationService:
         document_repository: DocumentRepository | None = None,
         dictionary_repository: DictionaryRepository | None = None,
     ):
-        self.store = store or _get_knowledge_store()
         self.file_storage = file_storage or FileStorageAdapter()
         self.vector_adapter_factory = vector_adapter_factory or (lambda collection_name=None: VectorStoreAdapter(collection_name))
-        # 文档查询走 V2 仓储，上传入库和索引写入暂时继续复用旧 store，便于分步骤迁移。
-        self.document_repository = document_repository or DocumentRepository(store=self.store)
+        # 文档查询和写入走 V2 仓储；store 参数只为旧测试注入保留，不再作为默认依赖。
+        self.document_repository = document_repository or DocumentRepository(store=store)
         # 文档列表响应需要用字典做编码归一化；这里改走 V2 字典仓储，逐步移除旧 KnowledgeStore。
         self.dictionary_repository = dictionary_repository or DictionaryRepository()
         self._cached_document_dictionary_snapshot: DictionaryCodeSnapshot | None = None
@@ -110,7 +109,7 @@ class KnowledgeApplicationService:
             file_size=stored_file.file_size,
             file_md5=stored_file.file_md5,
             duplicate=duplicate_document is not None,
-            duplicate_document=_document_to_response(duplicate_document, self._document_dictionary_snapshot()) if duplicate_document else None,
+            duplicate_document=document_to_response(duplicate_document, self._document_dictionary_snapshot()) if duplicate_document else None,
             detected_type=preview["document_type"],
             split_strategy=preview["split_strategy"],
             confidence=preview["confidence"],
@@ -146,7 +145,7 @@ class KnowledgeApplicationService:
             return KnowledgeUploadResponse(
                 status=self._dictionary_status("knowledge_result_status", "duplicate"),
                 message="相同内容的文件已经存在，本次没有重复入库。",
-                document=_document_to_response(duplicate_document, self._document_dictionary_snapshot()),
+                document=document_to_response(duplicate_document, self._document_dictionary_snapshot()),
             )
 
         document_id = new_id()
@@ -182,7 +181,7 @@ class KnowledgeApplicationService:
         return KnowledgeUploadResponse(
             status=self._dictionary_status("knowledge_result_status", "indexed"),
             message="文件已按确认配置写入知识库。",
-            document=_document_to_response(indexed_document, self._document_dictionary_snapshot()),
+            document=document_to_response(indexed_document, self._document_dictionary_snapshot()),
         )
 
     def list_files(self, *, include_training: bool = False) -> list[KnowledgeFileResponse]:
@@ -191,7 +190,7 @@ class KnowledgeApplicationService:
         logger.info("[V2知识资产] 查询文件列表 包含训练资料=%s", include_training)
         dictionary_snapshot = self._document_dictionary_snapshot()
         return [
-            _document_to_response(document, dictionary_snapshot)
+            document_to_response(document, dictionary_snapshot)
             for document in self.document_repository.list_documents(include_training=include_training)
         ]
 
@@ -200,7 +199,7 @@ class KnowledgeApplicationService:
 
         logger.info("[V2知识资产] 查询文件详情 文档编号=%s", document_id)
         document = self._active_document_or_404(document_id)
-        return _document_to_response(document, self._document_dictionary_snapshot())
+        return document_to_response(document, self._document_dictionary_snapshot())
 
     def preview_file(self, document_id: str, max_chars: int) -> KnowledgeFilePreviewResponse:
         """预览已入库文件的原始文本内容。"""
@@ -215,7 +214,7 @@ class KnowledgeApplicationService:
             logger.error("[V2知识资产] 预览文件失败 文档编号=%s 错误=%s", document_id, exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"文件预览失败：{exc}") from exc
         return KnowledgeFilePreviewResponse(
-            document=_document_to_response(document, self._document_dictionary_snapshot()),
+            document=document_to_response(document, self._document_dictionary_snapshot()),
             preview_type=preview["preview_type"],
             content=preview["content"],
             truncated=preview["truncated"],
@@ -226,7 +225,7 @@ class KnowledgeApplicationService:
         """按 document_id 删除文件资产。"""
 
         logger.info("[V2知识资产] 删除文件资产 文档编号=%s", document_id)
-        result = DocumentAssetService(knowledge_store=self.store).delete_document_asset(document_id)
+        result = DocumentAssetService(document_repository=self.document_repository).delete_document_asset(document_id)
         return KnowledgeDeleteResponse(status="deleted", document_id=result.document_id)
 
     def reindex_file(self, document_id: str) -> KnowledgeFileResponse:
@@ -235,7 +234,7 @@ class KnowledgeApplicationService:
         logger.info("[V2知识资产] 重建单个文件索引 文档编号=%s", document_id)
         document = self._active_document_or_404(document_id)
         indexed_document = _index_document(self.document_repository, document, increment_version=True)
-        return _document_to_response(indexed_document, self._document_dictionary_snapshot())
+        return document_to_response(indexed_document, self._document_dictionary_snapshot())
 
     def reindex_all(self) -> KnowledgeBulkReindexResponse:
         """重建所有文件索引。"""
@@ -286,7 +285,7 @@ class KnowledgeApplicationService:
 
         logger.info("[V2知识资产] 知识库重载请求")
         try:
-            _sync_data_files_to_documents(self.store)
+            _sync_data_files_to_documents(self.document_repository)
             response = self.reindex_all()
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Knowledge reload failed: {exc}") from exc
@@ -318,9 +317,12 @@ class KnowledgeApplicationService:
     def _dictionary_status(self, dictionary_code: str, item_code: str) -> str:
         """从字典表读取协议状态码。"""
 
-        if hasattr(self.store, "normalize_dictionary_code"):
-            return self.store.normalize_dictionary_code(dictionary_code, item_code)
-        return item_code
+        if not hasattr(self.dictionary_repository, "normalize_code"):
+            return item_code
+        try:
+            return self.dictionary_repository.normalize_code(dictionary_code, item_code)
+        except ValueError:
+            return item_code
 
     def _active_document_or_404(self, document_id: str) -> dict:
         """读取未删除的文件，不存在时抛 404。"""

@@ -144,13 +144,16 @@ def _run_step(name: str, callback, *, fail_fast: bool) -> None:
 def _warmup_services() -> None:
     """初始化知识直答服务和向量库服务对象。
 
-    `_get_knowledge_answer_service()` 内部会创建 `KnowledgeAnswerService` 单例。
+    `bootstrap_v2_metadata()` 会显式初始化默认字典和历史存储字段。
+    `_get_knowledge_answer_service()` 内部会创建 `KnowledgeAnswerService` 单例，
     `service.rag._get_vector_store()` 会继续初始化 `VectorStoreService`，提前完成 QdrantVectorStore 构造。
     """
 
     # 延迟导入可以避免模块加载时就触发模型和向量库初始化，只有真正预热时才执行。
-    from api.services.chat_services import _get_knowledge_answer_service
+    from app_v2.application.chat_generation_service import _get_knowledge_answer_service
+    from app_v2.infrastructure.repositories.bootstrap import bootstrap_v2_metadata
 
+    bootstrap_v2_metadata()
     service = _get_knowledge_answer_service()
     service.rag._get_vector_store()
 

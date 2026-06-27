@@ -3,7 +3,7 @@ from io import BytesIO
 import pytest
 from fastapi import HTTPException, UploadFile
 
-import api.services.upload_services as upload_services
+import app_v2.application.knowledge.upload_preview_service as upload_services
 from infrastructure.file_storage_service import StoredFileInfo
 
 
