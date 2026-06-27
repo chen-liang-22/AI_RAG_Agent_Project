@@ -1,4 +1,5 @@
 from rag.split_strategies.base import BaseSplitStrategy
+from rag.split_strategies.llm_semantic_strategy import LlmSemanticSplitStrategy
 from rag.split_strategies.numbered_qa_strategy import NumberedQaSplitStrategy
 from rag.split_strategies.numbered_segment_strategy import NumberedSegmentSplitStrategy
 from rag.split_strategies.outline_qa_strategy import OutlineQaSplitStrategy
@@ -16,6 +17,7 @@ class SplitStrategyFactory:
 
         if cls._strategies:
             return
+        cls.register(LlmSemanticSplitStrategy())
         cls.register(OutlineQaSplitStrategy())
         cls.register(NumberedQaSplitStrategy())
         cls.register(NumberedSegmentSplitStrategy())
