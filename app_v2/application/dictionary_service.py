@@ -84,6 +84,8 @@ class DictionaryApplicationService:
             children_by_parent.setdefault(item.get("parent_item_id"), []).append(item)
 
         def build_children(parent_item_id: str | None) -> list[DictionaryItemResponse]:
+            """递归组装某个父级下面的子字典项。"""
+
             children = []
             for child in children_by_parent.get(parent_item_id, []):
                 children.append(cls._item_to_response(child, build_children(child["dictionary_item_id"])))
