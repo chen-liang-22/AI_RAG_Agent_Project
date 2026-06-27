@@ -163,7 +163,7 @@ class KnowledgeFileResponse(BaseModel):
     chunk_count: int  # 当前版本写入 Qdrant 的知识单元数量
     collection_name: str = "agent"  # 文件写入的 Qdrant collection
     document_type: str = "text"  # 文档结构类型：qa/numbered/text
-    split_strategy: str = "recursive"  # 文件入库时使用的切分策略：numbered_qa/outline_qa/numbered_segments/recursive
+    split_strategy: str = "recursive"  # 文件入库时使用的切分策略：llm_semantic/numbered_qa/outline_qa/numbered_segments/recursive
     created_at: str  # 文件记录创建时间
     updated_at: str  # 文件记录最后更新时间
     error_message: str | None = None  # 入库失败时保存错误原因
@@ -227,7 +227,7 @@ class KnowledgeUploadRecommendResponse(BaseModel):
     """上传文件模型推荐响应体。"""
 
     document_type: str  # 模型推荐的文档类型
-    split_strategy: str  # 模型推荐的切分策略：numbered_qa/outline_qa/numbered_segments/recursive
+    split_strategy: str  # 模型推荐的切分策略：llm_semantic/numbered_qa/outline_qa/numbered_segments/recursive
     confidence: float  # 模型推荐置信度，范围 0 到 1
     reasons: list[str] = Field(default_factory=list)  # 模型推荐原因
     sample_chars: int  # 实际发送给模型的样本文本字符数
@@ -239,7 +239,7 @@ class KnowledgeUploadConfirmRequest(BaseModel):
 
     upload_id: str = Field(..., min_length=1)  # 预览阶段返回的 upload_id
     document_type: str = Field(..., min_length=1)  # 用户确认后的文档结构类型：qa/numbered/text
-    split_strategy: str = Field(..., min_length=1)  # 用户确认后的切分策略：numbered_qa/outline_qa/numbered_segments/recursive
+    split_strategy: str = Field(..., min_length=1)  # 用户确认后的切分策略：llm_semantic/numbered_qa/outline_qa/numbered_segments/recursive
     collection_name: str | None = None  # 用户选择或输入的 Qdrant collection；为空时使用默认 collection
 
 

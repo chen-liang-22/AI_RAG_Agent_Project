@@ -21,6 +21,7 @@ DEFAULT_DICTIONARY_ITEMS = [
             ("numbered_qa", "编号问答切分", None, 2, "把编号问答切成 QA 片段"),
             ("outline_qa", "目录问答切分", None, 3, "把 PDF 书签目录中的章节和问题切成 QA 片段"),
             ("numbered_segments", "编号条目切分", None, 4, "把编号条目切成普通片段"),
+            ("llm_semantic", "LLM 语义切分", None, 5, "由 LLM 判断语义边界，后端按原文范围截取入库", {"recommendation": True}),
         ],
     },
     {

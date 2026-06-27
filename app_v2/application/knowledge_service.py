@@ -28,6 +28,7 @@ from app_v2.application.knowledge.upload_preview_service import (
     _delete_preview_file,
     _get_preview_file,
     _promote_preview_file,
+    _recommend_upload_split_strategy_or_fallback,
     _recommend_upload_split_strategy,
     _sanitize_upload_filename,
     _save_preview_file,
@@ -97,6 +98,14 @@ class KnowledgeApplicationService:
                     file_path=file_path,
                     sample_limit=preview_config.sample_text_chars,
                 )
+            recommendation = _recommend_upload_split_strategy_or_fallback(upload_id)
+            preview.update({
+                "document_type": recommendation["document_type"],
+                "split_strategy": recommendation["split_strategy"],
+                "confidence": recommendation["confidence"],
+                "reasons": recommendation["reasons"],
+                "llm_used": bool(recommendation.get("model_name")),
+            })
         except Exception as exc:
             _delete_preview_file(upload_id)
             logger.error("[V2知识资产] 上传预览解析失败 文件名=%s 错误=%s", filename, exc, exc_info=True)

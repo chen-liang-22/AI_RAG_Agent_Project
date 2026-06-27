@@ -208,9 +208,16 @@ def _normalize_recommendation(value: dict) -> dict:
 
     dictionary_repository = DictionaryRepository()
     document_type_codes = set(dictionary_repository.list_enabled_codes("document_structure"))
-    split_strategy = normalize_split_strategy(value.get("split_strategy"))
+    split_strategy_codes = set(dictionary_repository.list_enabled_codes("split_strategy"))
+    raw_split_strategy = str(value.get("split_strategy") or "").strip().lower()
+    if raw_split_strategy in split_strategy_codes:
+        split_strategy = raw_split_strategy
+    else:
+        split_strategy = normalize_split_strategy("recursive")
     raw_document_type = str(value.get("document_type") or "").strip().lower()
-    if raw_document_type in document_type_codes:
+    if split_strategy == "llm_semantic":
+        document_type = normalize_document_structure_type("text", split_strategy)
+    elif raw_document_type in document_type_codes:
         document_type = normalize_document_structure_type(raw_document_type, split_strategy)
     else:
         document_type = normalize_document_structure_type(None, split_strategy)
@@ -228,6 +235,8 @@ def _normalize_recommendation(value: dict) -> dict:
         reasons = [str(reason).strip() for reason in raw_reasons if str(reason).strip()]
     else:
         reasons = []
+    if raw_split_strategy and raw_split_strategy not in split_strategy_codes:
+        reasons.insert(0, "模型返回了非支持切分策略，已回退到递归切分")
     if raw_document_type not in document_type_codes:
         reasons.insert(0, "模型返回了非支持结构类型，已按切分策略回退到合法文档类型")
 
@@ -310,11 +319,10 @@ def _recommend_upload_split_strategy(upload_id: str) -> dict:
                     f"document_type: {document_type_options}\n"
                     f"split_strategy: {split_strategy_options}\n\n"
                     "判断原则：\n"
-                    "- 编号问答型：document_type=qa，split_strategy=numbered_qa。\n"
-                    "- PDF目录问答型：document_type=qa，split_strategy=outline_qa。"
-                    "只有目录或样本清楚呈现“章节 -> 问题”时才使用，不要把普通目录 PDF 误判成这种策略。\n"
-                    "- 编号条目型：document_type=numbered，split_strategy=numbered_segments。\n"
-                    "- 普通文本型：document_type=text，split_strategy=recursive。\n\n"
+                    "- 默认优先推荐 document_type=text，split_strategy=llm_semantic，让模型后续按语义边界给出原文范围。\n"
+                    "- 只有用户明确需要传统固定规则、或模型语义切片不可用时，才推荐 numbered_qa、outline_qa、numbered_segments 或 recursive。\n"
+                    "- 不要因为文件名、编号、Q/A 标记就强行选择规则切分；语义结构复杂时仍优先 llm_semantic。\n"
+                    "- 普通文本、问答材料、编号材料都可以使用 llm_semantic。\n\n"
                     f"文件名：{filename}\n文件类型：{file_type}\n结构统计：{json.dumps(structure, ensure_ascii=False)}\n\n"
                     f"文档结构样本：\n{sample_text}\n\n"
                     "返回 JSON 格式："
@@ -335,3 +343,22 @@ def _recommend_upload_split_strategy(upload_id: str) -> dict:
         "sample_chars": len(sample_text),
         "model_name": selected_model_name,
     }
+
+
+def _recommend_upload_split_strategy_or_fallback(upload_id: str) -> dict:
+    """上传预览阶段尽力调用模型推荐，失败时回退到普通递归切分。"""
+
+    try:
+        return _recommend_upload_split_strategy(upload_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("[知识库] 模型推荐切分方式失败，预览回退递归切分 上传编号=%s 错误=%s", upload_id, exc)
+        return {
+            "document_type": "text",
+            "split_strategy": "recursive",
+            "confidence": 0.5,
+            "reasons": ["模型推荐失败，已回退到普通文本递归切分"],
+            "sample_chars": 0,
+            "model_name": "",
+        }

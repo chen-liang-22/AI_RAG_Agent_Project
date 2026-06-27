@@ -53,11 +53,16 @@ def normalize_document_structure_type(
     """从 V2 字典快照归一化文档结构类型。"""
 
     if dictionary_snapshot is None:
+        normalized_split_strategy = str(split_strategy or "").strip().lower()
+        if normalized_split_strategy == "llm_semantic":
+            return "text"
         return str(document_type or "text").strip().lower()
     enabled_codes = dictionary_snapshot.enabled_codes("document_structure")
     default_code = dictionary_snapshot.normalize("document_structure", None)
     value = str(document_type or "").strip().lower()
     normalized_split_strategy = normalize_split_strategy(split_strategy, dictionary_snapshot)
+    if normalized_split_strategy == "llm_semantic" and "text" in enabled_codes:
+        return "text"
     if normalized_split_strategy in {"numbered_qa", "outline_qa"} and "qa" in enabled_codes:
         return "qa"
     if normalized_split_strategy == "numbered_segments" and "numbered" in enabled_codes:
