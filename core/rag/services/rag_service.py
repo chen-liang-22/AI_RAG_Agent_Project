@@ -257,6 +257,8 @@ class RagSummarizeService(object):
 
     @staticmethod
     def evaluate_retrieval_quality(documents: list[Document]) -> RetrievalQuality:
+        """评估首轮召回是否足够好，用来决定 adaptive 模式是否需要调用 Query Planner。"""
+
         min_docs = int(rag_conf.get("adaptive_retrieve_min_docs", 3) or 3)
         min_score = float(rag_conf.get("adaptive_retrieve_min_score", 0.72) or 0.72)
         min_top3_avg = float(rag_conf.get("adaptive_retrieve_top3_avg_score", 0.68) or 0.68)

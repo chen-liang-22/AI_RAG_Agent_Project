@@ -1,3 +1,9 @@
+"""项目统一日志配置。
+
+日志统一输出中文业务描述，并同时写入控制台和 logs/ 下的文件。
+控制台使用颜色方便 PyCharm 查看，文件日志保持纯文本，便于搜索和归档。
+"""
+
 import os
 import sys
 from datetime import datetime
@@ -39,6 +45,8 @@ class ColorFormatter(logging.Formatter):
         self.plain_formatter = logging.Formatter(LOG_FORMAT)
 
     def format(self, record: logging.LogRecord) -> str:
+        """格式化单条日志记录；NO_COLOR 环境变量存在时关闭颜色。"""
+
         if os.getenv("NO_COLOR"):
             return self.plain_formatter.format(record)
 

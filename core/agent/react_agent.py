@@ -1,3 +1,9 @@
+"""旧版 LangGraph ReAct Agent。
+
+新版普通聊天默认走 direct_rag，不一定进入这个 Agent。
+保留它是为了兼容 chat_route_mode=agent、工具调用和报告生成等旧流程。
+"""
+
 from typing import Annotated, TypedDict  # TypedDict 定义 LangGraph 状态；Annotated 绑定消息合并规则
 
 from langchain_core.messages import (  # LangChain 标准消息类型
