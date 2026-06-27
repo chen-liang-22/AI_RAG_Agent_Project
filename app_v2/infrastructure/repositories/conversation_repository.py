@@ -23,6 +23,11 @@ class ConversationRepository:
     """
 
     def __init__(self, store: Any | None = None):
+        """初始化聊天仓储。
+
+        store 只为旧测试保留；真实查询统一通过 ORM Session 访问 conversations 表。
+        """
+
         # store 参数仅为旧测试和过渡调用保留，不再作为真实数据源。
         self.store = store
 

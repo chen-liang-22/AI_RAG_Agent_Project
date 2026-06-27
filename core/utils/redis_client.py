@@ -104,6 +104,11 @@ class RedisClient:
     """Redis 客户端包装，提供项目内常用的缓存、任务状态和锁能力。"""
 
     def __init__(self, config: dict[str, Any] | None = None):
+        """初始化 Redis 配置。
+
+        这里先只合并配置，不立即连接 Redis；真正使用时再懒加载连接。
+        """
+
         self.config = dict(DEFAULT_REDIS_CONFIG)
         self.config.update(config or {})
         self._client: Redis | None = None
@@ -262,6 +267,8 @@ class RedisClient:
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    """从环境变量读取布尔值，支持 1/true/yes/on。"""
+
     value = os.getenv(name)
     if value is None or value == "":
         return default
@@ -269,6 +276,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _env_int(name: str, default: int) -> int:
+    """从环境变量读取整数，未配置时返回默认值。"""
+
     value = os.getenv(name)
     if value is None or value == "":
         return default
@@ -276,6 +285,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
+    """从环境变量读取浮点数，未配置时返回默认值。"""
+
     value = os.getenv(name)
     if value is None or value == "":
         return default

@@ -21,6 +21,8 @@ def normalize_qdrant_collection_name(collection_name: str | None = None) -> str:
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    """从环境变量读取布尔值，未配置时返回默认值。"""
+
     value = os.getenv(name)
     if value is None or value == "":
         return default
@@ -28,6 +30,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _env_int(name: str, default: int | None) -> int | None:
+    """从环境变量读取整数值，未配置时返回默认值。"""
+
     value = os.getenv(name)
     if value is None or value == "":
         return default

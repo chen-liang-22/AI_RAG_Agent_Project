@@ -22,6 +22,11 @@ class DocumentRepository:
     """
 
     def __init__(self, store: Any | None = None):
+        """初始化文件资产仓储。
+
+        store 只做旧测试兼容；真实读写走 ORM，文件正文不落本地目录。
+        """
+
         self.store = store
 
     @staticmethod

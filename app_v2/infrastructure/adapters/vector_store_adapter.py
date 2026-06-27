@@ -12,6 +12,11 @@ class VectorStoreAdapter:
     """
 
     def __init__(self, collection_name: str | None = None, vector_service: VectorStoreService | None = None):
+        """初始化向量库适配器。
+
+        collection_name 指定要访问的 Qdrant collection；vector_service 可注入用于测试。
+        """
+
         self.vector_service = vector_service or VectorStoreService(collection_name=collection_name)
 
     @property

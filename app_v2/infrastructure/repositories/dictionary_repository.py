@@ -24,6 +24,11 @@ class DictionaryRepository:
     _cache_ttl_seconds = 600
 
     def __init__(self, store: Any | None = None, redis_client: RedisClient | None = None):
+        """初始化字典仓储。
+
+        字典内容仍以 MySQL 为准，Redis 只做短期缓存；store 参数只为旧代码兼容保留。
+        """
+
         # store 参数只保留给旧测试和过渡调用占位，真实数据访问已经改为 ORM。
         self.store = store
         self.redis_client = redis_client or get_redis_client()

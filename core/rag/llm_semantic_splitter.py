@@ -36,6 +36,11 @@ class LlmSemanticSplitter:
     """基于 LLM 的语义切片计划生成器。"""
 
     def __init__(self, *, model_mode: str | None = None, window_chars: int = 12000):
+        """初始化语义切片器。
+
+        model_mode 控制使用哪个聊天模型档位，window_chars 控制单次送入模型的文本窗口大小。
+        """
+
         self.model_mode = model_mode
         self.window_chars = window_chars
 

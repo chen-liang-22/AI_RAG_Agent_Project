@@ -65,6 +65,12 @@ class ReactAgent:
     """
 
     def __init__(self):
+        """初始化旧版 ReAct Agent。
+
+        这里使用 LangGraph 的工具调用链：模型先判断是否需要工具，
+        ToolNode 执行工具后再回到模型生成最终回答。
+        """
+
         # 工具列表仍然复用原项目工具；LangGraph 的 ToolNode 会负责真正执行它们。
         self.tools = [
             rag_summarize
@@ -303,6 +309,8 @@ class ReactAgent:
 
     @staticmethod
     def _retrieved_context_prompt() -> str:
+        """返回“已检索上下文直答”模式的系统提示词。"""
+
         return (
             "你是扫地机器人/扫拖一体机器人客服。"
             "请只根据参考资料回答用户问题，不要编造。"
@@ -315,6 +323,8 @@ class ReactAgent:
 
     @staticmethod
     def _retrieved_context_user_message(query: str, context: str) -> str:
+        """把用户问题和 RAG 参考资料组装成模型可读的用户消息。"""
+
         return (
             f"用户问题：{query}\n\n"
             f"参考资料：\n{context}\n\n"

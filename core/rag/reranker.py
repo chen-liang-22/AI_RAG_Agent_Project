@@ -200,6 +200,8 @@ class RuleBasedReranker:
 
     @staticmethod
     def _document_key(document: Document) -> str:
+        """生成去重键，优先使用向量点或业务切片编号。"""
+
         metadata = document.metadata
         point_id = metadata.get("_point_id")
         unit_id = metadata.get("unit_id")
