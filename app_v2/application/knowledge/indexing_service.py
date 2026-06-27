@@ -1,4 +1,4 @@
-"""知识库索引应用函数。
+﻿"""知识库索引应用函数。
 
 这个模块承接 KnowledgeApplicationService 的入库动作：
 - 把 documents 表中文件解析成文本片段；
@@ -10,13 +10,12 @@
 
 import os
 
-import yaml
 from fastapi import HTTPException
 
 from app_v2.shared.document_response import normalize_document_structure_type, normalize_split_strategy
 from app_v2.infrastructure.file_storage_service import get_file_storage_service
 from app_v2.infrastructure.id_generator import new_id
-from core.utils.config_handler import qdrant_conf
+from core.utils.config_handler import knowledge_manifest_conf, qdrant_conf
 from core.utils.file_handler import get_file_md5_hex, listdir_with_allowed_type
 from core.utils.logger_handler import logger
 from core.utils.path_tool import get_abs_path
@@ -117,18 +116,11 @@ def _index_document(
 
 
 def _load_data_manifest() -> dict:
-    """读取 config/knowledge_manifest.yml，缺失时返回空配置。"""
-
-    manifest_path = get_abs_path(os.path.join("config", "knowledge_manifest.yml"))
-    if not os.path.exists(manifest_path):
-        return {"defaults": {}, "files": {}}
-
-    with open(manifest_path, "r", encoding="utf-8") as file:
-        data = yaml.safe_load(file) or {}
+    """读取内置知识文件清单，缺失时返回空配置。"""
 
     return {
-        "defaults": data.get("defaults") or {},
-        "files": data.get("files") or {},
+        "defaults": knowledge_manifest_conf.get("defaults") or {},
+        "files": knowledge_manifest_conf.get("files") or {},
     }
 
 

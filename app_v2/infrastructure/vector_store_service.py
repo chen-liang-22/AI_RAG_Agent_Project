@@ -19,7 +19,7 @@ from core.model.factory import embed_model  # embedding 模型，用于把文本
 from core.rag.document_parser import DocumentParser  # 通用文档解析器，负责识别、切分和 FAQ 抽取
 from core.rag.file_processors import FileProcessorFactory  # 文件处理器工厂，根据类型选择具体读取策略
 from app_v2.infrastructure.file_storage_service import get_file_storage_service  # MinIO 文件读取服务
-from core.utils.config_handler import qdrant_conf  # 读取 config/qdrant.yml 中的向量库配置
+from core.utils.config_handler import qdrant_conf  # 读取 config/storage.yml 中的向量库配置
 from core.utils.file_handler import (  # 文件处理工具
     pdf_loader,  # PDF 加载器
     txt_loader,  # TXT 加载器

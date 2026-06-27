@@ -1,4 +1,4 @@
-"""把历史本地文件迁移到 MinIO。
+﻿"""把历史本地文件迁移到 MinIO。
 
 脚本会自动补齐本次迁移依赖的轻量字段；如果你希望显式管理 DDL，
 也可以先手工执行：
@@ -421,7 +421,7 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     if args.auto_create_bucket:
-        # 只影响本次脚本进程，不修改 config/minio.yml。
+        # 只影响本次脚本进程，不修改 config/storage.yml。
         # 这样既能适配新机器第一次迁移，也不会改变项目默认的保守配置。
         os.environ["MINIO_AUTO_CREATE_BUCKET"] = "true"
 
@@ -450,3 +450,4 @@ if __name__ == "__main__":
         logger.error("[文件迁移] 迁移中止 错误=%s", exc, exc_info=True)
         print(f"迁移中止：{exc}")
         sys.exit(1)
+

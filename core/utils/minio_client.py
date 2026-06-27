@@ -1,4 +1,4 @@
-"""MinIO 公共文件存储工具。
+﻿"""MinIO 公共文件存储工具。
 
 这个模块只负责把“本地文件 -> MinIO 对象”以及“MinIO 对象删除”封装起来，
 业务层以后直接调用这里即可，不要把 MinIO SDK 调用散落到各个 service 里。
@@ -140,7 +140,7 @@ class MinioStorageClient:
         if minio is None:
             raise RuntimeError("缺少 MinIO 依赖，请先执行 pip install -r requirements.txt")
         if not bool(self.config.get("enabled")):
-            raise RuntimeError("MinIO 未启用，请检查 config/minio.yml 或 MINIO_ENABLED")
+            raise RuntimeError("MinIO 未启用，请检查 config/storage.yml 或 MINIO_ENABLED")
         if self._client is None:
             self._client = minio.Minio(
                 endpoint=str(self.config.get("endpoint") or "127.0.0.1:9000"),

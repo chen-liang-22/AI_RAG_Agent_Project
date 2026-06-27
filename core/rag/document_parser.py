@@ -75,7 +75,7 @@ class _TitleMatch:
 class DocumentParseRules:
     """文档解析规则。
 
-    这些规则来自 `config/rag.yml` 的 document_parse_rules。
+    这些规则来自 `config/app.yml` 的 rag.document_parse_rules。
     规则对象负责“编译和使用正则”，DocumentParser 只关心解析流程，避免把资料格式写死在业务代码里。
     """
 
@@ -97,7 +97,7 @@ class DocumentParseRules:
         """
 
         if not isinstance(config, dict):
-            raise ValueError("document_parse_rules 配置缺失或格式错误，请在 config/rag.yml 中配置文档解析规则")
+            raise ValueError("document_parse_rules 配置缺失或格式错误，请在 config/app.yml 的 rag 节点中配置文档解析规则")
 
         question_marks = config.get("question_marks")
         if not isinstance(question_marks, list) or not question_marks:

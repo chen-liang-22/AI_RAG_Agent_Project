@@ -1,7 +1,7 @@
 """Qdrant 配置解析工具。
 
 这里统一处理 Qdrant 的 collection、连接参数、距离算法。
-优先读取环境变量，未配置时再读取 config/qdrant.yml，方便本地和部署环境复用同一套代码。
+优先读取环境变量，未配置时再读取 config/storage.yml，方便本地和部署环境复用同一套代码。
 """
 
 import os

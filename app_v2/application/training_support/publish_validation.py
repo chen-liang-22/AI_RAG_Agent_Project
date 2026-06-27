@@ -1,4 +1,4 @@
-"""销售训练资料发布后验证。
+﻿"""销售训练资料发布后验证。
 
 资料发布到正式 Qdrant collection 后，会随机抽样几个切片再检索一次。
 验证目标不是评估内容质量，而是确认“按 batch_id 能不能从正式向量库找回来”。
@@ -7,13 +7,9 @@
 
 from typing import Any
 
-import yaml
 
 from core.utils.logger_handler import logger
-from core.utils.path_tool import get_abs_path
-
-
-TRAINING_INGEST_CONFIG_PATH = get_abs_path("config/training_ingest.yml")
+from core.utils.config_handler import training_conf
 
 
 class TrainingPublishValidator:
@@ -135,12 +131,7 @@ class TrainingPublishValidator:
 
     @staticmethod
     def _load_config() -> dict[str, Any]:
-        """从配置文件读取发布验证参数。"""
+        """从统一训练配置中读取发布后验证参数。"""
 
-        try:
-            with open(TRAINING_INGEST_CONFIG_PATH, "r", encoding="utf-8") as config_file:
-                data = yaml.safe_load(config_file) or {}
-        except (OSError, yaml.YAMLError):
-            return {}
-        validation_config = data.get("publish_validation") if isinstance(data, dict) else {}
+        validation_config = training_conf.get("publish_validation")
         return validation_config if isinstance(validation_config, dict) else {}

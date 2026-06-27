@@ -20,7 +20,6 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any
 
-import yaml
 from fastapi import HTTPException, UploadFile
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -76,10 +75,9 @@ from app_v2.application.training_support.schemas import (
 )
 from core.utils.database_connection import DatabaseErrorTypes
 from core.utils.logger_handler import logger
-from core.utils.path_tool import get_abs_path
+from core.utils.config_handler import training_conf
 
 
-TRAINING_INGEST_CONFIG_PATH = get_abs_path("config/training_ingest.yml")
 DEFAULT_TRAINING_COLLECTION_NAME = "sales_training_cases"
 DEFAULT_TRAINING_STAGING_COLLECTION_NAME = "sales_training_cases_staging"
 TRAINING_COLLECTION_NAME = DEFAULT_TRAINING_COLLECTION_NAME
@@ -94,19 +92,10 @@ def _load_training_collection_config() -> dict[str, str]:
         "published": DEFAULT_TRAINING_COLLECTION_NAME,
         "staging": DEFAULT_TRAINING_STAGING_COLLECTION_NAME,
     }
-    try:
-        with open(TRAINING_INGEST_CONFIG_PATH, "r", encoding="utf-8") as config_file:
-            data = yaml.safe_load(config_file) or {}
-    except OSError as exc:
-        logger.warning("[销售训练] 读取训练入库配置失败，使用默认 collection 配置 错误=%s", exc)
-        return config
-    except yaml.YAMLError as exc:
-        logger.warning("[销售训练] 解析训练入库配置失败，使用默认 collection 配置 错误=%s", exc)
-        return config
-
-    collection_config = data.get("collections") if isinstance(data, dict) else {}
+    collection_config = training_conf.get("collections") if isinstance(training_conf, dict) else {}
     if not isinstance(collection_config, dict):
         return config
+
     published_collection = str(collection_config.get("published") or "").strip()
     staging_collection = str(collection_config.get("staging") or "").strip()
     if published_collection:

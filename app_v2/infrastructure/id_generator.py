@@ -177,16 +177,6 @@ def load_id_generator_config(config_path: str | None = None) -> IdGeneratorConfi
     )
 
 
-def _read_yaml(path: str) -> dict[str, Any]:
-    """读取 YAML 配置文件，不存在时返回空配置。"""
-
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as file:
-        data = yaml.safe_load(file) or {}
-    return data if isinstance(data, dict) else {}
-
-
 def _read_int(env_name: str, raw_value: Any, default: int) -> int:
     """读取整数配置，环境变量优先。"""
 

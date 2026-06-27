@@ -53,6 +53,7 @@ class TrainingProfileApplicationService:
     def list_profile_dictionaries(self) -> list[DictionaryGroupResponse]:
         """查询销售训练画像相关字典。"""
 
+        logger.info("[V2销售训练-画像] 查询画像字典 字典数量=%s", len(PROFILE_DICTIONARY_CODES))
         rows = []
         for dictionary_code in PROFILE_DICTIONARY_CODES:
             rows.extend(self.dictionary_repository.list_items(dictionary_code=dictionary_code))
@@ -67,9 +68,19 @@ class TrainingProfileApplicationService:
     def polish_scenario(self, request: ScenarioPolishRequest) -> ScenarioPolishResponse:
         """根据客户画像润色训练场景。"""
 
+        logger.info(
+            "[V2销售训练-画像] 润色训练场景 画像类型=%s 场景长度=%s",
+            request.profile_type,
+            len(request.scenario_description or ""),
+        )
         return self.core_service.polish_scenario(request)
 
     def generate_supplement_questions(self, request: RoleGenerateRequest) -> SupplementQuestionGenerateResponse:
         """生成角色补充问答。"""
 
+        logger.info(
+            "[V2销售训练-画像] 生成补充问答 学员编号=%s 画像类型=%s",
+            request.trainee.trainee_id,
+            request.profile_type,
+        )
         return self.core_service.generate_supplement_questions(request)

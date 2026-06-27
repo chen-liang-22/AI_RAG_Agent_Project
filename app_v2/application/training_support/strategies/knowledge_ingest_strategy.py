@@ -1,10 +1,10 @@
-"""训练资料入库切片策略。
+﻿"""训练资料入库切片策略。
 
 这里使用策略模式：
 - LMS 场景案例按案例标题、任务要求、标准话术、隐藏心理、评分规则切片；
 - 通用资料按普通文本兜底切片。
 
-切片规则配置放在 config/training_ingest.yml，避免业务关键词散落在代码里。
+切片规则配置放在 config/training.yml，避免业务关键词散落在代码里。
 """
 
 import re
@@ -12,36 +12,20 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-import yaml
 from langchain_core.documents import Document
 
 from core.rag.file_processors import FileProcessorFactory
 from core.utils.logger_handler import logger
-from core.utils.path_tool import get_abs_path
-
-
-TRAINING_INGEST_CONFIG_PATH = get_abs_path("config/training_ingest.yml")
+from core.utils.config_handler import training_conf
 
 
 def _load_training_ingest_config() -> dict[str, Any]:
-    """读取销售训练入库配置。
+    """读取销售训练入库配置。"""
 
-    配置文件是 LMS 切片规则的唯一来源，读取失败时直接抛出明确错误。
-    """
-
-    try:
-        with open(TRAINING_INGEST_CONFIG_PATH, "r", encoding="utf-8") as config_file:
-            data = yaml.safe_load(config_file) or {}
-    except OSError as exc:
-        logger.error("[销售训练] 读取入库配置文件失败 配置路径=%s 错误=%s", TRAINING_INGEST_CONFIG_PATH, exc, exc_info=True)
-        raise RuntimeError(f"销售训练入库配置文件读取失败：{TRAINING_INGEST_CONFIG_PATH}") from exc
-    except yaml.YAMLError as exc:
-        logger.error("[销售训练] 解析入库配置文件失败 配置路径=%s 错误=%s", TRAINING_INGEST_CONFIG_PATH, exc, exc_info=True)
-        raise RuntimeError(f"销售训练入库配置文件解析失败：{TRAINING_INGEST_CONFIG_PATH}") from exc
-    if not isinstance(data, dict):
-        logger.error("[销售训练] 入库配置文件根节点必须是字典 配置路径=%s", TRAINING_INGEST_CONFIG_PATH)
-        raise ValueError(f"销售训练入库配置文件根节点必须是字典：{TRAINING_INGEST_CONFIG_PATH}")
-    return data
+    if not isinstance(training_conf, dict):
+        logger.error("[销售训练] 训练配置根节点必须是字典")
+        raise ValueError("销售训练配置根节点必须是字典：config/training.yml")
+    return training_conf
 
 
 @dataclass
@@ -89,7 +73,7 @@ class LmsCaseIngestStrategy(KnowledgeIngestStrategy):
     def __init__(self, config: dict[str, Any] | None = None):
         """初始化 LMS 切片策略，并从配置文件读取标题关键词。
 
-        关键词放在 config/training_ingest.yml，避免业务词散落在代码里。
+        关键词放在 config/training.yml，避免业务词散落在代码里。
         """
 
         ingest_config = config or _load_training_ingest_config()

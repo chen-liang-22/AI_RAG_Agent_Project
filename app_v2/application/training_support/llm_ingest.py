@@ -1,4 +1,4 @@
-"""销售训练资料 LLM 兜底切分。
+﻿"""销售训练资料 LLM 兜底切分。
 
 规则切分是主路径，LLM 切分只在质量评分过低或用户手动重切时兜底。
 这样可以减少 token 消耗，同时避免模型输出不稳定直接影响每一次上传。
@@ -8,15 +8,11 @@ import json
 import re
 from typing import Any
 
-import yaml
 
 from core.model.factory import get_chat_model
 from app_v2.application.training_support.strategies.knowledge_ingest_strategy import TrainingChunk
 from core.utils.logger_handler import logger
-from core.utils.path_tool import get_abs_path
-
-
-TRAINING_INGEST_CONFIG_PATH = get_abs_path("config/training_ingest.yml")
+from core.utils.config_handler import training_conf
 
 
 class TrainingLlmFallbackSplitter:
@@ -276,12 +272,7 @@ JSON 格式：
 
     @staticmethod
     def _load_config() -> dict[str, Any]:
-        """从配置文件读取 LLM 兜底切分参数。"""
+        """从统一训练配置中读取 LLM 兜底切分参数。"""
 
-        try:
-            with open(TRAINING_INGEST_CONFIG_PATH, "r", encoding="utf-8") as config_file:
-                data = yaml.safe_load(config_file) or {}
-        except (OSError, yaml.YAMLError):
-            return {}
-        fallback_config = data.get("llm_fallback") if isinstance(data, dict) else {}
+        fallback_config = training_conf.get("llm_fallback")
         return fallback_config if isinstance(fallback_config, dict) else {}

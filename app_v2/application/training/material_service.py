@@ -50,11 +50,13 @@ class TrainingMaterialApplicationService:
     def list_batches(self, *, page: int, page_size: int) -> TrainingKnowledgeBatchListResponse:
         """分页查询训练资料批次。"""
 
+        logger.info("[V2销售训练-资料] 查询资料批次列表 页码=%s 每页数量=%s", page, page_size)
         return self.core_service.list_batches(page=page, page_size=page_size)
 
     def preview_batch(self, batch_id: str, *, max_chars: int) -> TrainingKnowledgePreviewResponse:
         """预览训练资料原文件。"""
 
+        logger.info("[V2销售训练-资料] 预览训练资料 批次编号=%s 最大字符数=%s", batch_id, max_chars)
         return self.core_service.preview_batch(batch_id, max_chars=max_chars)
 
     def delete_batch(self, batch_id: str) -> TrainingKnowledgeDeleteResponse:
@@ -72,6 +74,7 @@ class TrainingMaterialApplicationService:
     def rollback_batch(self, batch_id: str) -> TrainingKnowledgeRollbackResponse:
         """回滚训练资料版本。"""
 
+        logger.info("[V2销售训练-资料] 回滚训练资料版本 批次编号=%s", batch_id)
         return self.core_service.rollback_batch(batch_id)
 
     def reparse_batch(self, batch_id: str, *, use_llm_fallback: bool, model_mode: str | None) -> TrainingKnowledgeReparseResponse:
@@ -83,9 +86,11 @@ class TrainingMaterialApplicationService:
     def list_versions(self, batch_id: str) -> TrainingKnowledgeVersionListResponse:
         """查询训练资料版本链。"""
 
+        logger.info("[V2销售训练-资料] 查询训练资料版本 批次编号=%s", batch_id)
         return self.core_service.list_batch_versions(batch_id)
 
     def list_chunks(self, batch_id: str) -> TrainingKnowledgeChunkListResponse:
         """查询训练资料切片。"""
 
+        logger.info("[V2销售训练-资料] 查询训练资料切片 批次编号=%s", batch_id)
         return self.core_service.list_chunks(batch_id)

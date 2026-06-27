@@ -1,7 +1,7 @@
 """编号问答切分策略。
 
 适用于“1. 问题 / 答：答案”这类明确编号问答资料。
-具体编号和答案前缀规则来自 config/rag.yml 的 document_parse_rules。
+具体编号和答案前缀规则来自 config/app.yml 的 rag.document_parse_rules。
 """
 
 from core.rag.split_strategies.base import BaseSplitStrategy, SplitContext

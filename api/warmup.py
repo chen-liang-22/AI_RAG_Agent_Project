@@ -44,7 +44,7 @@ class WarmupSettings:
 
 
 def _config_bool(name: str, default: bool) -> bool:
-    """读取布尔配置，环境变量优先，其次读取 `config/rag.yml`。
+    """读取布尔配置，环境变量优先，其次读取 `config/app.yml` 的 rag 配置。
 
     约定：
     - 环境变量名使用大写，如 `WARMUP_QDRANT`。

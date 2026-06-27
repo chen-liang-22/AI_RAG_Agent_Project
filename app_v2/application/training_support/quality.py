@@ -1,4 +1,4 @@
-"""销售训练资料切片质量评估。
+﻿"""销售训练资料切片质量评估。
 
 这个模块不调用 LLM，只用通用指标检查切片是否健康：
 - 是否切出案例；
@@ -13,13 +13,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-import yaml
 
 from app_v2.application.training_support.strategies.knowledge_ingest_strategy import TrainingChunk
-from core.utils.path_tool import get_abs_path
-
-
-TRAINING_INGEST_CONFIG_PATH = get_abs_path("config/training_ingest.yml")
+from core.utils.config_handler import training_conf
 
 
 @dataclass
@@ -171,12 +167,7 @@ class TrainingIngestQualityEvaluator:
 
     @staticmethod
     def _load_quality_config() -> dict[str, Any]:
-        """从配置文件读取质量评估阈值。"""
+        """从统一训练配置中读取质量评估阈值。"""
 
-        try:
-            with open(TRAINING_INGEST_CONFIG_PATH, "r", encoding="utf-8") as config_file:
-                data = yaml.safe_load(config_file) or {}
-        except (OSError, yaml.YAMLError):
-            return {}
-        quality_config = data.get("quality") if isinstance(data, dict) else {}
+        quality_config = training_conf.get("quality")
         return quality_config if isinstance(quality_config, dict) else {}

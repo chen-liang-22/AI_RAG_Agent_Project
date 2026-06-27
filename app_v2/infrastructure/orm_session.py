@@ -1,7 +1,7 @@
 """SQLAlchemy ORM 会话适配层。
 
 这一层的作用类似 Java 项目里的数据源 + SqlSessionFactory：
-- 从现有 config/database.yml 和 .env 读取数据库配置；
+- 从现有 config/storage.yml 和 .env 读取数据库配置；
 - 只为 MySQL 创建 SQLAlchemy Engine；
 - 提供统一的 Session 上下文，正常提交、异常回滚。
 
@@ -100,7 +100,7 @@ def get_orm_engine() -> Engine:
 
     config = load_database_config()
     if config["type"] != "mysql":
-        raise RuntimeError("ORM层只支持 MySQL，请把 config/database.yml 的 type 配置为 mysql")
+        raise RuntimeError("ORM层只支持 MySQL，请把 config/storage.yml 的 database.type 配置为 mysql")
     _guard_real_database_in_tests(config["mysql"])
     signature = _mysql_engine_signature(config["mysql"])
 

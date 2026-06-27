@@ -1,4 +1,4 @@
-"""Redis 基础工具。
+﻿"""Redis 基础工具。
 
 这一层只负责连接、缓存、任务状态和轻量锁，不承载具体业务逻辑。
 业务代码不要直接依赖 redis-py，统一通过这里调用，方便后续做降级、替换或测试替身。
@@ -128,7 +128,7 @@ class RedisClient:
         if redis is None:
             raise RuntimeError("缺少 Redis 依赖，请先执行 pip install -r requirements.txt")
         if not bool(self.config.get("enabled")):
-            raise RuntimeError("Redis 未启用，请检查 config/redis.yml 或 REDIS_ENABLED")
+            raise RuntimeError("Redis 未启用，请检查 config/storage.yml 或 REDIS_ENABLED")
         if self._client is None:
             self._client = redis.Redis(
                 host=str(self.config.get("host") or "127.0.0.1"),

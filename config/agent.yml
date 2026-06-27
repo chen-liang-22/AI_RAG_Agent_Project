@@ -1,5 +1,0 @@
-# Agent 工具配置。
-
-# 外部业务数据 CSV 路径。
-# 作用：报告工具会读取该文件，查询用户清扫记录、耗材等模拟数据。
-external_data_path: data/external/records.csv

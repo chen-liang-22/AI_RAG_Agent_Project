@@ -35,17 +35,19 @@ class TrainingPlanApplicationService:
     def list_plans(self, *, page: int, page_size: int, keyword: str | None = None) -> TrainingPlanListResponse:
         """分页查询训练方案。"""
 
+        logger.info("[V2销售训练-方案] 查询训练方案列表 页码=%s 每页数量=%s 关键字=%s", page, page_size, keyword)
         return self.core_service.list_plans(page=page, page_size=page_size, keyword=keyword)
 
     def get_plan_detail(self, plan_id: str) -> TrainingPlanDetailResponse:
         """查看训练方案详情。"""
 
+        logger.info("[V2销售训练-方案] 查询训练方案详情 方案编号=%s", plan_id)
         return self.core_service.get_plan_detail(plan_id)
 
     def delete_plan(self, plan_id: str) -> TrainingPlanDeleteResponse:
         """删除训练方案。"""
 
-        logger.info("[V2销售训练 方案] 删除训练方案 方案编号=%s", plan_id)
+        logger.info("[V2销售训练-方案] 删除训练方案 方案编号=%s", plan_id)
         return self.core_service.delete_plan(plan_id)
 
     def update_plan(self, plan_id: str, request: TrainingPlanUpdateRequest) -> TrainingPlanDetailResponse:

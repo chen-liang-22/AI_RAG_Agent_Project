@@ -1,4 +1,4 @@
-# AI_RAG_Agent_Project
+﻿# AI_RAG_Agent_Project
 
 Deployable FastAPI service for a LangChain ReAct agent with Qdrant-backed RAG.
 
@@ -97,7 +97,7 @@ Load knowledge documents into Qdrant:
 Invoke-RestMethod -Method Post http://localhost:8000/knowledge/reload
 ```
 
-RAG query planning is configured in `config/rag.yml`. The recommended default is `query_planner_mode: adaptive`:
+RAG query planning is configured in `config/app.yml` under the `rag` section. The recommended default is `query_planner_mode: adaptive`:
 the backend first retrieves with the original question, evaluates recall quality, and only calls the LLM Query Planner
 when the first recall is weak. Rule-based keyword intent matching is not used in the main chain.
 
@@ -132,7 +132,7 @@ http://localhost:8080
 运行时默认数据库是 MySQL，连接配置在：
 
 ```text
-config/database.yml
+config/storage.yml
 ```
 
 新环境初始化文件统一放在：
@@ -152,7 +152,7 @@ mysql -u root -p < docs/初始化文件/mysql初始化建表和基础数据.sql
 重新生成 SQL：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\generate_mysql_init_sql.py
+# 初始化 SQL 当前保存在 docs/初始化文件/，如需重新生成请按项目脚本说明执行
 ```
 
 ## Vue Frontend
@@ -182,3 +182,4 @@ Vite serves the frontend at:
 ```text
 http://127.0.0.1:5173
 ```
+

@@ -37,7 +37,7 @@ class BaseModelFactory(ABC):
 class ChatModelFactory(BaseModelFactory):
     """聊天模型工厂。
 
-    根据 `config/rag.yml` 中的 chat_provider 和 chat_model_name 创建最终回答模型。
+    根据 `config/app.yml` 中 rag.chat_provider 和 rag.chat_model_name 创建最终回答模型。
     """
 
     def generator(self, model_name: str | None = None) -> Optional[Embeddings | BaseChatModel]:

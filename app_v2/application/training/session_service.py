@@ -44,11 +44,13 @@ class TrainingSessionApplicationService:
     def list_sessions(self, *, page: int, page_size: int, trainee_id: str | None = None) -> TrainingSessionListResponse:
         """分页查询训练会话。"""
 
+        logger.info("[V2销售训练-会话] 查询训练会话列表 页码=%s 每页数量=%s 学员编号=%s", page, page_size, trainee_id)
         return self.core_service.list_sessions(page=page, page_size=page_size, trainee_id=trainee_id)
 
     def get_session_detail(self, session_id: str) -> TrainingSessionDetailResponse:
         """查询训练会话复盘详情。"""
 
+        logger.info("[V2销售训练-会话] 查询训练会话详情 会话编号=%s", session_id)
         return self.core_service.get_session_detail(session_id)
 
     def submit_turn(self, session_id: str, request: TrainingTurnRequest) -> TrainingTurnResponse:
