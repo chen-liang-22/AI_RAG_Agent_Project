@@ -29,6 +29,7 @@ from api.services.upload_services import (
     load_upload_preview_config,
 )
 from infrastructure.file_storage_service import get_file_storage_service
+from infrastructure.id_generator import new_id
 from rag.file_processors import FileProcessorFactory
 from utils.file_handler import pdf_loader
 from utils.logger_handler import logger
@@ -258,7 +259,7 @@ def confirm_knowledge_file(request: KnowledgeUploadConfirmRequest) -> KnowledgeU
             document=_document_to_response(duplicate_document),
         )
 
-    document_id = f"doc_{uuid.uuid4().hex}"
+    document_id = new_id()
     try:
         stored_file = _promote_preview_file(upload_id, document_id)
     except Exception as exc:

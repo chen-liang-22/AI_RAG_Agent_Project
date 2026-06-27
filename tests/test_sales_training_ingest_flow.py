@@ -120,9 +120,10 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
     repository = TrainingRepository()
     service = SalesTrainingService(repository=repository)
     fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
+    unique_marker = uuid.uuid4().hex
     content = "\n".join([
         "一、客户案例",
-        "企业：某外贸公司",
+        f"企业：某外贸公司-{unique_marker}",
         "任务要求",
         "请完成需求挖掘。",
         "匹配答案",
@@ -130,7 +131,7 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
         "命中点",
         "确认客户预算和决策链。",
     ])
-    upload_file = UploadFile(filename="case.txt", file=BytesIO(content.encode("utf-8")))
+    upload_file = UploadFile(filename=f"case-{unique_marker}.txt", file=BytesIO(content.encode("utf-8")))
 
     upload_result = service.upload_knowledge(
         file=upload_file,
@@ -140,6 +141,8 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
 
     assert upload_result.status == "pending_review"
     assert upload_result.document_id
+    assert upload_result.document_id.isdigit()
+    assert upload_result.batch_id.isdigit()
     assert upload_result.point_count == upload_result.chunk_count
     assert upload_result.quality_report["score"] > 0
     assert fake_vector_service.documents == []
@@ -151,7 +154,7 @@ def test_training_upload_waits_for_manual_publish(tmp_path):
     assert batch["file_md5"] is None
     document = service.knowledge_store.get_document(upload_result.document_id)
     assert document is not None
-    assert document["filename"] == "case.txt"
+    assert document["filename"] == f"case-{unique_marker}.txt"
     assert document["collection_name"] == "sales_training_cases"
     assert document["status"] == "indexed"
     assert document["chunk_count"] == upload_result.chunk_count
@@ -204,6 +207,40 @@ def test_training_delete_uses_document_asset_service(monkeypatch):
     assert result.status == "deleted"
     assert result.batch_id == "batch_test"
     assert deleted_document_ids == ["doc_training"]
+
+
+def test_training_delete_legacy_batch_without_document_id(monkeypatch):
+    """删除历史批次时，即使没有 document_id，也应按 batch_id 清理训练资料。"""
+
+    repository = TrainingRepository()
+    service = SalesTrainingService(repository=repository)
+    fake_vector_service, fake_staging_service = attach_fake_vector_services(service)
+    fake_vector_service.documents.append(
+        type("Document", (), {"metadata": {"batch_id": "batch_legacy"}})()
+    )
+    fake_staging_service.documents.append(
+        type("Document", (), {"metadata": {"batch_id": "batch_legacy"}})()
+    )
+    deleted_batches = []
+
+    monkeypatch.setattr(
+        service,
+        "_get_active_batch",
+        lambda batch_id: {
+            "batch_id": batch_id,
+            "document_id": None,
+            "status": "published",
+        },
+    )
+    monkeypatch.setattr(repository, "delete_batch", lambda batch_id: deleted_batches.append(batch_id) or True)
+
+    result = service.delete_batch("batch_legacy")
+
+    assert result.status == "deleted"
+    assert result.batch_id == "batch_legacy"
+    assert deleted_batches == ["batch_legacy"]
+    assert fake_vector_service.documents == []
+    assert fake_staging_service.documents == []
 
 
 def test_training_upload_uses_llm_fallback_when_quality_is_low(tmp_path, monkeypatch):

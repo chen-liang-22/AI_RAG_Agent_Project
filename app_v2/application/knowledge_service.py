@@ -38,6 +38,7 @@ from app_v2.infrastructure.adapters.file_storage_adapter import FileStorageAdapt
 from app_v2.infrastructure.adapters.vector_store_adapter import VectorStoreAdapter
 from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from app_v2.infrastructure.repositories.document_repository import DocumentRepository
+from infrastructure.id_generator import new_id
 from rag.file_processors import FileProcessorFactory
 from utils.file_handler import pdf_loader
 from utils.logger_handler import logger
@@ -148,7 +149,7 @@ class KnowledgeApplicationService:
                 document=_document_to_response(duplicate_document, self._document_dictionary_snapshot()),
             )
 
-        document_id = f"doc_{uuid.uuid4().hex}"
+        document_id = new_id()
         try:
             stored_file = _promote_preview_file(upload_id, document_id)
         except Exception as exc:

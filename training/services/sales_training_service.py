@@ -15,6 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from api.services.document_asset_service import DocumentAssetService
 from infrastructure.file_storage_service import get_file_storage_service
+from infrastructure.id_generator import new_id
 from infrastructure.vector_store_service import VectorStoreService
 from model.factory import get_chat_model
 from rag.file_processors import FileProcessorFactory
@@ -167,8 +168,8 @@ class SalesTrainingService:
 
         # 阶段 2：为本次上传生成 document_id 和 batch_id。
         # document_id 管文件台账，batch_id 管训练资料的审核、发布、回滚流程。
-        document_id = f"doc_{uuid.uuid4().hex}"
-        batch_id = f"batch_{uuid.uuid4().hex}"
+        document_id = new_id()
+        batch_id = new_id()
         # 原始文件直接持久化到 MinIO，本地只在解析时使用临时下载文件。
         stored_file = get_file_storage_service().save_upload_file(
             file=file,
@@ -397,11 +398,27 @@ class SalesTrainingService:
         batch = self._get_active_batch(batch_id)
         document_id = str(batch.get("document_id") or "").strip()
         if not document_id:
-            logger.error("[销售训练] 训练资料缺少 document_id，无法执行统一删除 批次编号=%s", batch_id)
-            raise HTTPException(status_code=500, detail=f"训练资料缺少 document_id：{batch_id}")
+            return self._delete_legacy_batch_without_document(batch_id)
 
         DocumentAssetService().delete_document_asset(document_id)
         logger.info("[销售训练] 训练资料已删除 批次编号=%s 文档编号=%s", batch_id, document_id)
+        return TrainingKnowledgeDeleteResponse(status="deleted", batch_id=batch_id)
+
+    def _delete_legacy_batch_without_document(self, batch_id: str) -> TrainingKnowledgeDeleteResponse:
+        """删除没有 document_id 的历史训练批次。
+
+        老数据只存在 training_knowledge_batches 和训练向量库里，无法走 documents 统一文件资产链路。
+        因此这里按 batch_id 清理正式库、临时库和批次记录，保留历史数据兼容能力。
+        """
+
+        self.vector_service.delete_by_metadata("batch_id", batch_id)
+        self.staging_vector_service.delete_by_metadata("batch_id", batch_id)
+        deleted_batch = self.repository.delete_batch(batch_id)
+        logger.warning(
+            "[销售训练] 已按历史批次兼容方式删除训练资料 批次编号=%s 批次已删除=%s",
+            batch_id,
+            deleted_batch,
+        )
         return TrainingKnowledgeDeleteResponse(status="deleted", batch_id=batch_id)
 
     def publish_batch(self, batch_id: str) -> TrainingKnowledgePublishResponse:

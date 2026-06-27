@@ -198,7 +198,7 @@ def test_knowledge_service_confirm_upload_creates_and_indexes_through_repository
 
     def fake_index_document(store, document, **kwargs):
         indexed_store_objects.append(store)
-        assert document["document_id"].startswith("doc_")
+        assert str(document["document_id"]).isdigit()
         return {**document, "status": "indexed", "chunk_count": 4}
 
     monkeypatch.setattr(knowledge_service_module, "_get_preview_file", lambda upload_id: PreviewFile())

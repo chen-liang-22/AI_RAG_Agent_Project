@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import hashlib
@@ -6,7 +6,6 @@ import hmac
 import json
 import os
 import secrets
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -16,6 +15,7 @@ from jwt import ExpiredSignatureError, InvalidTokenError
 from sqlalchemy import select
 
 from domain.entities import SystemUserEntity
+from infrastructure.id_generator import new_id
 from infrastructure.orm_session import get_orm_engine, orm_session_context
 from utils.config_handler import load_env_file
 from utils.logger_handler import logger
@@ -212,7 +212,7 @@ class AuthRepository:
 
         now = _utc_now()
         user = SystemUserEntity(
-            user_id=f"user_{uuid.uuid4().hex}",
+            user_id=new_id(),
             username=username,
             display_name=display_name,
             password_hash=create_password_hash(password),

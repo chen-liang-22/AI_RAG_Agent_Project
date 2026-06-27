@@ -1,5 +1,4 @@
 import json
-import uuid
 from datetime import datetime
 from typing import Any
 
@@ -16,6 +15,7 @@ from domain.entities import (
     TrainingPlanEntity,
     TrainingRoleProfileEntity,
 )
+from infrastructure.id_generator import new_id
 from infrastructure.orm_session import orm_session_context
 from utils.logger_handler import logger
 
@@ -141,7 +141,7 @@ class TrainingRepository:
         """创建训练知识上传批次。"""
 
         now = utc_now()
-        batch_id = values.get("batch_id") or f"batch_{uuid.uuid4().hex}"
+        batch_id = values.get("batch_id") or new_id()
         batch = TrainingKnowledgeBatchEntity(
             batch_id=batch_id,
             document_id=values.get("document_id"),
@@ -394,7 +394,7 @@ class TrainingRepository:
         """创建训练方案。"""
 
         now = utc_now()
-        plan_id = values.get("plan_id") or f"plan_{uuid.uuid4().hex}"
+        plan_id = values.get("plan_id") or new_id()
         trainee = values["trainee"]
         plan = TrainingPlanEntity(
             plan_id=plan_id,
@@ -519,7 +519,7 @@ class TrainingRepository:
         """保存一次 AI 陪练角色。"""
 
         now = utc_now()
-        profile_id = values.get("profile_id") or f"profile_{uuid.uuid4().hex}"
+        profile_id = values.get("profile_id") or new_id()
         role_profile = TrainingRoleProfileEntity(
             profile_id=profile_id,
             trainee_id=values["trainee_id"],
@@ -580,7 +580,7 @@ class TrainingRepository:
         """保存开放式训练设置。"""
 
         now = utc_now()
-        setting_id = values.get("setting_id") or f"setting_{uuid.uuid4().hex}"
+        setting_id = values.get("setting_id") or new_id()
         setting = TrainingGoalSettingEntity(
             setting_id=setting_id,
             profile_id=values["profile_id"],
@@ -638,7 +638,7 @@ class TrainingRepository:
         """创建一次开放式训练会话。"""
 
         now = utc_now()
-        session_id = values.get("session_id") or f"session_{uuid.uuid4().hex}"
+        session_id = values.get("session_id") or new_id()
         training_session = SalesTrainingSessionEntity(
             session_id=session_id,
             profile_id=values["profile_id"],
@@ -750,7 +750,7 @@ class TrainingRepository:
         """保存训练对话轮次。"""
 
         now = utc_now()
-        turn_id = values.get("turn_id") or f"turn_{uuid.uuid4().hex}"
+        turn_id = values.get("turn_id") or new_id()
         turn = SalesTrainingTurnEntity(
             turn_id=turn_id,
             session_id=values["session_id"],
@@ -808,7 +808,7 @@ class TrainingRepository:
         """保存训练评分结果。"""
 
         now = utc_now()
-        score_id = values.get("score_id") or f"score_{uuid.uuid4().hex}"
+        score_id = values.get("score_id") or new_id()
         score = SalesTrainingScoreEntity(
             score_id=score_id,
             session_id=values["session_id"],

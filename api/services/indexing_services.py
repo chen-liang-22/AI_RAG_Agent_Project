@@ -1,5 +1,4 @@
 import os
-import uuid
 
 import yaml
 from fastapi import HTTPException
@@ -9,6 +8,7 @@ from api.services.common_services import (
     _normalize_split_strategy,
 )
 from infrastructure.file_storage_service import get_file_storage_service
+from infrastructure.id_generator import new_id
 from rag.knowledge_store import KnowledgeStore
 from utils.config_handler import qdrant_conf
 from utils.file_handler import get_file_md5_hex, listdir_with_allowed_type
@@ -161,7 +161,7 @@ def _sync_data_files_to_documents(store: KnowledgeStore) -> list[dict]:
             documents.append(existing_document)
             continue
 
-        document_id = f"doc_{uuid.uuid4().hex}"
+        document_id = new_id()
         stored_file = get_file_storage_service().save_local_file(
             file_path=file_path,
             filename=filename,

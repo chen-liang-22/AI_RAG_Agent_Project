@@ -1,5 +1,4 @@
-import json
-import uuid
+﻿import json
 from datetime import datetime
 from typing import Any
 
@@ -14,6 +13,7 @@ from domain.entities import (
     ExamQuestionEntity,
     ExamSessionEntity,
 )
+from infrastructure.id_generator import new_id
 from infrastructure.orm_session import orm_session_context
 from rag.profile_dictionaries import PROFILE_DICTIONARY_ITEMS
 from utils.knowledge_asset_constants import TRAINING_COLLECTION_NAMES
@@ -306,7 +306,7 @@ class KnowledgeStore:
                     existing.updated_at = now
                     dictionary_item_id = existing.dictionary_item_id
                 else:
-                    dictionary_item_id = f"dict_{uuid.uuid4().hex}"
+                    dictionary_item_id = new_id()
                     session.add(
                         DictionaryItemEntity(
                             dictionary_item_id=dictionary_item_id,
@@ -476,7 +476,7 @@ class KnowledgeStore:
                 existing.metadata_json = metadata_json
                 existing.updated_at = now
             else:
-                dictionary_item_id = f"dict_{uuid.uuid4().hex}"
+                dictionary_item_id = new_id()
                 session.add(
                     DictionaryItemEntity(
                         dictionary_item_id=dictionary_item_id,
@@ -740,9 +740,9 @@ class KnowledgeStore:
             if existing is not None and existing.get("status") != "deleted":
                 return existing
             if existing is not None and existing.get("status") == "deleted":
-                clean_conversation_id = f"conv_{uuid.uuid4().hex}"
+                clean_conversation_id = new_id()
         else:
-            clean_conversation_id = f"conv_{uuid.uuid4().hex}"
+            clean_conversation_id = new_id()
 
         now = utc_now()
         clean_title = (title or "").strip()[:80] or None
@@ -891,7 +891,7 @@ class KnowledgeStore:
 
         now = utc_now()
         metadata_json = json.dumps(metadata or {}, ensure_ascii=False) if metadata else None
-        message_id = f"msg_{uuid.uuid4().hex}"
+        message_id = new_id()
         with orm_session_context() as session:
             next_sequence_no = int(
                 session.scalar(
@@ -969,7 +969,7 @@ class KnowledgeStore:
         """创建一场对话式考试会话。"""
 
         now = utc_now()
-        clean_session_id = (session_id or "").strip() or f"exam_{uuid.uuid4().hex}"
+        clean_session_id = (session_id or "").strip() or new_id()
         exam_session = ExamSessionEntity(
             session_id=clean_session_id,
             user_id=user_id,
@@ -1018,7 +1018,7 @@ class KnowledgeStore:
         """保存考试会话中的单轮题目。"""
 
         now = utc_now()
-        exam_question_id = f"exam_q_{uuid.uuid4().hex}"
+        exam_question_id = new_id()
         question = ExamQuestionEntity(
             exam_question_id=exam_question_id,
             session_id=session_id,
