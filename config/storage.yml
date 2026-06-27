@@ -1,90 +1,217 @@
 # 存储与中间件配置。
-# 这里集中管理 MySQL、Redis、MinIO、Qdrant 这些外部服务。
+# 这个文件集中管理外部服务连接和存储行为：MySQL、Redis、MinIO、Qdrant。
+# 业务模型、RAG 行为、销售训练入库规则不放这里，分别看 app.yml 和 training.yml。
 
 database:
-  # 当前业务数据库统一使用 MySQL。
+  # 业务数据库类型。
+  # 当前代码统一使用 MySQL + SQLAlchemy ORM；该字段主要用于说明和后续扩展。
   type: mysql
 
   mysql:
+    # MySQL 主机地址。
+    # 可被环境变量 MYSQL_HOST 覆盖。
     host: "127.0.0.1"
+
+    # MySQL 端口。
+    # 可被环境变量 MYSQL_PORT 覆盖。
     port: 3306
+
+    # 业务数据库名。
+    # 可被环境变量 MYSQL_DATABASE 覆盖。
     database: "ai_rag_agent"
+
+    # MySQL 用户名。
+    # 可被环境变量 MYSQL_USER 覆盖。
     user: "root"
-    # 密码优先从环境变量 MYSQL_PASSWORD 读取，没有环境变量时使用 password。
+
+    # 密码环境变量名。
+    # load_database_config 会先读取该环境变量；没有时再读下面的 password。
     password_env: "MYSQL_PASSWORD"
+
+    # 本地开发兜底密码。
+    # 生产环境建议使用 MYSQL_PASSWORD 环境变量，不要依赖配置文件明文。
     password: "1234qwer"
+
+    # MySQL 字符集。
+    # utf8mb4 支持中文和 emoji，避免聊天内容或文件名写入失败。
     charset: "utf8mb4"
+
+    # SQLAlchemy 连接池常驻连接数。
+    # 值越大并发越稳，但会占用更多 MySQL 连接。
     pool_size: 5
+
+    # 连接池耗尽后允许临时额外创建的连接数。
     max_overflow: 10
+
+    # 从连接池获取连接的超时时间，单位秒。
+    # 超过该时间仍拿不到连接会报错，避免请求无限等待。
     pool_timeout_seconds: 5
+
+    # 连接回收时间，单位秒。
+    # 用于避免 MySQL 长连接空闲太久被服务端断开后复用失败。
     pool_recycle_seconds: 1800
 
 redis:
-  # Redis 用于缓存、任务状态和轻量锁。
+  # 是否启用 Redis。
+  # Redis 用于 refresh_token 会话、预览上传元数据、缓存和分布式轻量锁。
   enabled: true
+
+  # Redis 主机地址。
+  # 可被环境变量 REDIS_HOST 覆盖。
   host: "127.0.0.1"
+
+  # Redis 端口。
+  # 可被环境变量 REDIS_PORT 覆盖。
   port: 6379
+
+  # Redis 数据库编号。
+  # 可被环境变量 REDIS_DB 覆盖。
   db: 0
+
+  # Redis 密码环境变量名。
+  # load_redis_config 会先读取该环境变量；没有时再读下面的 password。
   password_env: "REDIS_PASSWORD"
+
+  # 本地开发兜底密码。
+  # 生产环境建议使用 REDIS_PASSWORD 环境变量。
   password: "1234qwer"
+
+  # Redis 命令读写超时时间，单位秒。
   socket_timeout_seconds: 2
+
+  # Redis 建立连接超时时间，单位秒。
   socket_connect_timeout_seconds: 2
+
+  # 项目 Redis key 前缀。
+  # RedisClient.build_key 会用它隔离不同项目或不同环境的数据。
   key_prefix: "ai_rag_agent"
+
+  # 默认缓存过期时间，单位秒。
+  # RedisClient.set_json 等未显式传 TTL 的写入会使用该值。
   default_ttl_seconds: 1800
+
+  # 分布式轻量锁默认过期时间，单位秒。
+  # 例如预览文件清理任务获取锁时使用，避免任务异常后锁永久不释放。
   lock_timeout_seconds: 30
 
 minio:
-  # MinIO 用于保存上传原文件和预览文件。
+  # 是否启用 MinIO。
+  # 当前系统把上传原文件、训练资料原文件、预览临时文件统一存到 MinIO。
   enabled: true
+
+  # MinIO 服务地址，不带 http/https 协议。
+  # 可被环境变量 MINIO_ENDPOINT 覆盖。
   endpoint: 127.0.0.1:9000
+
+  # MinIO Access Key。
+  # 可被环境变量 MINIO_ACCESS_KEY 覆盖。
   access_key: admin
+
+  # MinIO Secret Key 环境变量名。
+  # load_minio_config 会先读取该环境变量；没有时再读下面的 secret_key。
   secret_key_env: MINIO_ROOT_PASSWORD
+
+  # 本地开发兜底 Secret Key。
+  # 生产环境建议使用 MINIO_ROOT_PASSWORD 或 MINIO_SECRET_KEY 环境变量。
   secret_key: 1234qwer
+
+  # 是否使用 HTTPS 连接 MinIO。
   secure: false
+
+  # 默认存储桶名称。
+  # 文件存储服务未显式指定 bucket 时使用该桶。
   bucket_name: pub
+
+  # 文件公开访问基础地址。
+  # 为空时会根据 secure 和 endpoint 自动拼接；当前用于生成文件预览 URL。
   public_base_url: http://127.0.0.1:9000
+
+  # bucket 不存在时是否自动创建。
+  # 本地开发可开启；生产环境通常由运维预先创建并配置权限。
   auto_create_bucket: false
+
+  # 是否自动给 bucket 设置公开读取策略。
+  # true 时前端可直接访问 public_url；如果生产环境走鉴权下载，应关闭。
   public_read: true
 
 qdrant:
   # 默认知识库 collection 名称。
+  # 未指定 collection_name 的普通知识库检索和入库默认写入这里。
   collection_name: agent
 
-  # Qdrant HTTP 地址。本地 Docker 默认是 http://localhost:6333。
+  # Qdrant HTTP 地址。
+  # 本地 Docker 默认是 http://localhost:6333，可被环境变量 QDRANT_URL 覆盖。
   url: http://localhost:6333
 
-  # prefer_grpc=true 时会使用 6334。
+  # Qdrant gRPC 端口。
+  # prefer_grpc=true 时使用；HTTP 模式下不直接使用。
   grpc_port: 6334
+
+  # 是否优先使用 gRPC 连接 Qdrant。
+  # false 表示使用 HTTP 地址；本地开发通常保持 false。
   prefer_grpc: false
 
-  # 文本向量常用 COSINE。
+  # 向量距离算法。
+  # COSINE 适合文本向量相似度；更换距离算法通常需要重建 collection。
   distance: COSINE
 
-  # true 会删除并重建 collection，清空已有向量；默认不要开启。
+  # 启动向量库服务时是否强制删除并重建 collection。
+  # true 会清空已有向量，风险很高，默认必须保持 false。
   force_recreate: false
 
   # 旧版 retriever 默认 topK。
+  # 部分直接调用 as_retriever 的旧路径会使用该值。
   k: 3
 
-  # 多 query 检索参数。
+  # 每个 search_query 向 Qdrant 召回的候选数量。
+  # RAG 多意图拆分后，每个子问题都会按该数量召回。
   per_query_top_k: 5
+
+  # 每个 search_query 经过 rerank 后最多保留几条。
+  # 防止某一个子问题占满最终上下文。
   per_query_keep: 2
+
+  # 最终交给模型的参考资料总条数上限。
+  # 越大上下文越全，但模型输入越长、响应越慢。
   final_context_limit: 6
+
+  # 是否启用 metadata 过滤召回。
+  # 当前主链路默认不靠硬编码意图和 metadata 过滤，保持 false。
   use_metadata_filter: false
+
+  # 多 search_query 并行检索线程数。
+  # 多意图问题会并发查 Qdrant；过大可能增加本机和 Qdrant 压力。
   parallel_query_workers: 4
 
-  # 内置知识库目录和允许入库的文件类型。
+  # 内置知识库文件目录。
+  # app_v2/application/knowledge/indexing_service.py 同步 data/ 文件时使用。
   data_path: data
+
+  # 允许入库和上传预览的知识文件扩展名。
   allow_knowledge_file_type: ["txt", "pdf", "docx"]
 
   # 上传预览配置。
+  # 用户上传文件后先存 MinIO 临时区并做结构识别，确认后才正式入库。
   upload_preview:
+    # 预览上传元数据和临时对象保留时间，单位秒。
     ttl_seconds: 86400
+
+    # 单个预览上传文件最大大小，单位字节。
     max_file_size_bytes: 52428800
+
+    # 结构识别时读取的样本文本长度。
     sample_text_chars: 5000
+
+    # 模型推荐切分方式时可读取的样本文本长度。
     recommendation_sample_chars: 10000
 
-  # 普通文本切分配置。
+  # 普通文本递归切分的目标分片长度。
   chunk_size: 200
+
+  # 普通文本递归切分的相邻分片重叠长度。
+  # 用于减少语义被切断的问题。
   chunk_overlap: 20
+
+  # 普通文本递归切分分隔符优先级。
+  # 按段落、换行、英文标点、中文标点、空格到字符级逐步回退。
   separators: ["\n\n", "\n", ".", "!", "?", "。", "！", "？", " ", ""]

@@ -15,6 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from core.model.factory import chat_model
 from core.utils.config_handler import rag_conf
 from core.utils.logger_handler import logger
+from core.utils.prompt_manager import prompt_manager
 
 
 class QueryPlannerModelError(RuntimeError):
@@ -337,25 +338,13 @@ class QueryPlannerService:
     def _system_prompt() -> str:
         """返回 Query Planner 的系统提示词。"""
 
-        return (
-            "你是 RAG 检索 query planner。"
-            "你的任务是把用户问题拆成适合向量检索的 search_query。"
-            "只输出 JSON，不要输出解释。"
-            "JSON 格式必须是：{\"queries\":[\"...\"]}。"
-            "如果用户一次问多个问题，要拆成多个 query。"
-            "如果用户只有一个问题，输出 1 个 query。"
-            "不要编造知识答案，不要输出分类字段。"
-        )
+        return prompt_manager.get("rag.query_planner.system")
 
     @staticmethod
     def _user_prompt(query: str, history_text: str) -> str:
         """把历史会话和当前问题组装成 Query Planner 的用户提示词。"""
 
-        return (
-            f"最近会话历史：\n{history_text}\n\n"
-            f"用户当前问题：\n{query}\n\n"
-            "请输出 JSON。"
-        )
+        return prompt_manager.render("rag.query_planner.user", query=query, history_text=history_text)
 
     @staticmethod
     def _elapsed_ms(start_time: float) -> float:

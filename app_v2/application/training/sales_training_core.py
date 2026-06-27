@@ -76,6 +76,7 @@ from app_v2.application.training_support.schemas import (
 from core.utils.database_connection import DatabaseErrorTypes
 from core.utils.logger_handler import logger
 from core.utils.config_handler import training_conf
+from core.utils.prompt_manager import prompt_manager
 
 
 DEFAULT_TRAINING_COLLECTION_NAME = "sales_training_cases"
@@ -1511,7 +1512,7 @@ class V2SalesTrainingCoreService:
             self._short_text(trainee_message),
         )
         try:
-            response = model.invoke(self._messages("你是销售训练中的 AI 客户。", prompt))
+            response = model.invoke(self._messages(prompt_manager.get("training.ai_customer_system"), prompt))
             text = self._content_text(response.content).strip()
             if text:
                 logger.info(
@@ -1557,7 +1558,7 @@ class V2SalesTrainingCoreService:
             self._short_text(trainee_message),
         )
         try:
-            for chunk in model.stream(self._messages("你是销售训练中的 AI 客户。", prompt)):
+            for chunk in model.stream(self._messages(prompt_manager.get("training.ai_customer_system"), prompt)):
                 text = self._content_text(chunk.content)
                 if text:
                     chunk_count += 1
@@ -1592,7 +1593,9 @@ class V2SalesTrainingCoreService:
             len(prompt),
         )
         try:
-            response = get_chat_model(model_mode).invoke(self._messages("你是销售训练中的 AI 客户。", prompt))
+            response = get_chat_model(model_mode).invoke(
+                self._messages(prompt_manager.get("training.ai_customer_system"), prompt)
+            )
             text = self._content_text(response.content).strip()
             if text:
                 logger.info(
@@ -1691,7 +1694,9 @@ class V2SalesTrainingCoreService:
             self._dict_key_text(fallback),
         )
         try:
-            response = get_chat_model(model_mode).invoke(self._messages("请只输出 JSON。", prompt))
+            response = get_chat_model(model_mode).invoke(
+                self._messages(prompt_manager.get("training.json_only_system"), prompt)
+            )
             text = self._content_text(response.content)
             parsed = self._parse_json_object(text)
             logger.info(
@@ -2641,156 +2646,37 @@ class V2SalesTrainingCoreService:
     def _role_prompt(self, request: RoleGenerateRequest, evidence: list[dict[str, Any]]) -> str:
         """构造 AI 客户角色生成提示词。"""
 
-        return f"""
-请根据学员画像、客户画像字段、场景描述和训练知识，生成销售训练 AI 陪练角色。
-
-要求：
-1. 只输出 JSON 对象，不要输出 Markdown。
-2. 必须输出 visible_profile、hidden_profile、role_profile、role_confirm_card 四个对象。
-3. 只生成训练必要字段，不要生成大而全的客户画像详情。
-4. 每个数组最多 3 条，句子要短，避免长篇解释。
-5. hidden_profile 给 AI 客户内部使用，训练对话中不能原文暴露给学员。
-6. 不要编造具体数字；具体产品、案例、竞品、周期、效果等事实优先来自训练知识，没有证据就写成“需要进一步确认”。
-
-JSON 字段建议：
-{{
-  "visible_profile": {{
-    "角色名称": "适合页面展示的客户名称",
-    "性别": "男/女/未知",
-    "年龄": "合理年龄，可为空",
-    "职位": "根据行业和客户类型推断合理职位",
-    "身份": "职位 + 行业",
-    "性格特征": "一句话",
-    "角色摘要": "2-3句，说明客户背景、当前阶段和主要关注点",
-    "成本控制习惯": ["最多3条"],
-    "业务痛点": ["最多3条"],
-    "潜台词": ["最多3条"]
-  }},
-  "hidden_profile": {{
-    "真实顾虑": ["最多3条"],
-    "成交触发器": ["最多3条"],
-    "追问策略": ["最多3条"]
-  }},
-  "role_profile": {{
-    "职位": "AI 客户扮演身份",
-    "角色简介": "2-3句，供 AI 客户扮演使用",
-    "性格特征": "扮演时保持的性格",
-    "成本控制习惯": ["最多3条"],
-    "业务痛点": ["最多3条"],
-    "潜台词": ["最多3条"],
-    "挑战策略": ["最多3条，专门针对学员短板"],
-    "异议示例": ["最多3条"],
-    "不能直接透露": ["最多3条"]
-  }},
-  "role_confirm_card": {{
-    "角色名称": "页面标题",
-    "性别": "男/女/未知",
-    "年龄": "合理年龄，可为空",
-    "身份": "职位 + 行业",
-    "性格特征": "一句话",
-    "角色摘要": "2-3句，不能太短",
-    "成本控制习惯": ["最多3条"],
-    "业务痛点": ["最多3条"],
-    "潜台词": ["最多3条"]
-  }}
-}}
-
-学员画像：
-{request.trainee.model_dump_json(indent=2)}
-
-客户字段：
-{json.dumps(request.selected_fields, ensure_ascii=False, indent=2)}
-
-场景描述：
-{request.scenario_description}
-
-补充细节：
-{request.extra_details}
-
-训练知识：
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
-"""
+        return prompt_manager.render(
+            "training.role_generation.user",
+            trainee_json=request.trainee.model_dump_json(indent=2),
+            selected_fields_json=json.dumps(request.selected_fields, ensure_ascii=False, indent=2),
+            scenario_description=request.scenario_description,
+            extra_details=request.extra_details,
+            evidence_json=json.dumps(evidence, ensure_ascii=False, indent=2),
+        )
 
     def _scenario_polish_prompt(self, request: ScenarioPolishRequest) -> str:
         """构造场景描述润色提示词。"""
 
-        return f"""
-请根据客户画像字段、原始场景描述和补充细节，润色销售陪练的场景描述。
-
-要求：
-1. 只输出 JSON 对象，不要输出 Markdown。
-2. JSON 只有一个字段：polished_scenario。
-3. polished_scenario 使用中文，控制在 80-160 字。
-4. 要把客户身份、合作阶段、核心顾虑、沟通氛围写清楚。
-5. 不要新增没有依据的具体数字、公司名、成交金额或产品参数。
-6. 语气要适合训练配置页展示，清晰、具体、有业务现场感。
-
-输出示例：
-{{
-  "polished_scenario": "客户正在评估新的合作方案，当前对交付稳定性、投入产出和团队执行压力仍有顾虑。学员需要先通过提问确认客户真实目标，再结合案例和价值点推动客户愿意继续沟通。"
-}}
-
-画像类型：
-{request.profile_type}
-
-客户画像字段：
-{json.dumps(request.selected_fields, ensure_ascii=False, indent=2)}
-
-原始场景描述：
-{request.scenario_description}
-
-补充细节：
-{request.extra_details}
-"""
+        return prompt_manager.render(
+            "training.scenario_polish.user",
+            profile_type=request.profile_type,
+            selected_fields_json=json.dumps(request.selected_fields, ensure_ascii=False, indent=2),
+            scenario_description=request.scenario_description,
+            extra_details=request.extra_details,
+        )
 
     def _supplement_questions_prompt(self, request: RoleGenerateRequest, evidence: list[dict[str, Any]]) -> str:
         """构造补充问答生成提示词。"""
 
-        return f"""
-请根据客户画像、学员画像、场景描述和训练知识，生成“补充问答场景细节”的选择题。
-
-要求：
-1. 只输出 JSON 对象，不要输出 Markdown。
-2. questions 最少 1 道，最多 5 道，优先输出 5 道。
-3. 每道题必须有 4 个选项，选项编码固定为 A/B/C/D。
-4. 题目要覆盖客户核心痛点、价格/成本、性格与沟通风格、业务流程卡点、成交顾虑。
-5. 题干要像真实业务访谈，不要写成技术参数问卷。
-6. 选项要能直接影响后续 AI 客户角色，不要泛泛而谈。
-
-JSON 格式：
-{{
-  "questions": [
-    {{
-      "question_id": "q1",
-      "question_no": 1,
-      "dimension": "价格顾虑",
-      "question": "如果客户确实认可方案价值，在决策前最可能担心什么？",
-      "options": [
-        {{"option_code": "A", "option_text": "先对比几家，确认价格是否合理"}},
-        {{"option_code": "B", "option_text": "担心团队学习成本太高"}},
-        {{"option_code": "C", "option_text": "需要看到同行案例和效果证明"}},
-        {{"option_code": "D", "option_text": "希望先试用，确认节省时间再付费"}}
-      ],
-      "allow_other": true
-    }}
-  ]
-}}
-
-学员画像：
-{request.trainee.model_dump_json(indent=2)}
-
-客户字段：
-{json.dumps(request.selected_fields, ensure_ascii=False, indent=2)}
-
-场景描述：
-{request.scenario_description}
-
-已有补充细节：
-{request.extra_details}
-
-训练知识：
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
-"""
+        return prompt_manager.render(
+            "training.supplement_questions.user",
+            trainee_json=request.trainee.model_dump_json(indent=2),
+            selected_fields_json=json.dumps(request.selected_fields, ensure_ascii=False, indent=2),
+            scenario_description=request.scenario_description,
+            extra_details=request.extra_details,
+            evidence_json=json.dumps(evidence, ensure_ascii=False, indent=2),
+        )
 
     def _normalize_supplement_questions(self, raw_questions: Any, request: RoleGenerateRequest) -> list[SupplementQuestion]:
         """把 LLM 输出规整成前端稳定可渲染的 1-5 道题。"""

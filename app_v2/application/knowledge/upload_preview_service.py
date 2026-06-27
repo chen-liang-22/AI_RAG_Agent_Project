@@ -28,6 +28,7 @@ from app_v2.infrastructure.file_storage_service import StoredFileInfo, get_file_
 from core.model.factory import get_chat_model, get_chat_model_name_for_mode
 from core.utils.config_handler import qdrant_conf
 from core.utils.logger_handler import logger
+from core.utils.prompt_manager import prompt_manager
 
 
 def _sanitize_upload_filename(filename: str | None) -> str:
@@ -338,26 +339,16 @@ def _recommend_upload_split_strategy(upload_id: str) -> dict:
     model = get_chat_model(selected_model_mode)
     response = model.invoke(
         [
-            SystemMessage(
-                content=(
-                    "你是知识库文档切分策略推荐器。只根据文档结构推荐，不总结正文。"
-                    "必须只返回 JSON，不要返回 Markdown。"
-                )
-            ),
+            SystemMessage(content=prompt_manager.get("knowledge_upload.split_recommendation.system")),
             HumanMessage(
-                content=(
-                    "请从以下枚举中选择：\n"
-                    f"document_type: {document_type_options}\n"
-                    f"split_strategy: {split_strategy_options}\n\n"
-                    "判断原则：\n"
-                    "- 默认优先推荐 document_type=text，split_strategy=llm_semantic，让模型后续按语义边界给出原文范围。\n"
-                    "- 只有用户明确需要传统固定规则、或模型语义切片不可用时，才推荐 numbered_qa、outline_qa、numbered_segments 或 recursive。\n"
-                    "- 不要因为文件名、编号、Q/A 标记就强行选择规则切分；语义结构复杂时仍优先 llm_semantic。\n"
-                    "- 普通文本、问答材料、编号材料都可以使用 llm_semantic。\n\n"
-                    f"文件名：{filename}\n文件类型：{file_type}\n结构统计：{json.dumps(structure, ensure_ascii=False)}\n\n"
-                    f"文档结构样本：\n{sample_text}\n\n"
-                    "返回 JSON 格式："
-                    '{"document_type":"text","split_strategy":"recursive","confidence":0.75,"reasons":["原因1","原因2"]}'
+                content=prompt_manager.render(
+                    "knowledge_upload.split_recommendation.user",
+                    document_type_options=document_type_options,
+                    split_strategy_options=split_strategy_options,
+                    filename=filename,
+                    file_type=file_type,
+                    structure_json=json.dumps(structure, ensure_ascii=False),
+                    sample_text=sample_text,
                 )
             ),
         ]

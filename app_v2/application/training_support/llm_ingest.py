@@ -13,6 +13,7 @@ from core.model.factory import get_chat_model
 from app_v2.application.training_support.strategies.knowledge_ingest_strategy import TrainingChunk
 from core.utils.logger_handler import logger
 from core.utils.config_handler import training_conf
+from core.utils.prompt_manager import prompt_manager
 
 
 class TrainingLlmFallbackSplitter:
@@ -79,7 +80,9 @@ class TrainingLlmFallbackSplitter:
         )
 
         try:
-            response = get_chat_model(selected_model_mode).invoke(self._messages("请只输出 JSON。", prompt))
+            response = get_chat_model(selected_model_mode).invoke(
+                self._messages(prompt_manager.get("training.llm_ingest_split.system"), prompt)
+            )
             text = self._content_text(response.content)
             payload = self._parse_json_object(text)
             chunks = self._chunks_from_payload(
@@ -110,39 +113,14 @@ class TrainingLlmFallbackSplitter:
 
         max_cases = int(self.config.get("max_cases") or self.DEFAULT_CONFIG["max_cases"])
         max_chunks = int(self.config.get("max_chunks") or self.DEFAULT_CONFIG["max_chunks"])
-        return f"""
-你是销售训练资料入库助理。请把原始资料抽取成适合销售陪练检索的结构化切片。
-
-要求：
-1. 只根据原文抽取，不要补写原文没有的事实。
-2. 保留原文里的客户背景、任务要求、参考话术、客户隐性心理、评分标准。
-3. 每个案例最多输出 5 类片段：case_profile、task_requirement、standard_answer、hidden_psychology、scoring_rubric。
-4. case_profile/task_requirement/standard_answer 默认可见；hidden_psychology 默认 hidden；scoring_rubric 默认 scoring_only。
-5. 最多输出 {max_cases} 个案例、{max_chunks} 个切片。
-6. 只输出 JSON，不要解释。
-
-JSON 格式：
-{{
-  "cases": [
-    {{
-      "case_title": "案例标题",
-      "case_index": 1,
-      "parts": [
-        {{
-          "case_part": "case_profile",
-          "visibility": "visible",
-          "text": "切片正文"
-        }}
-      ]
-    }}
-  ]
-}}
-
-文件名：{source_file}
-资料类型：{source_type}
-原文：
-{source_text}
-""".strip()
+        return prompt_manager.render(
+            "training.llm_ingest_split.user",
+            max_cases=max_cases,
+            max_chunks=max_chunks,
+            source_file=source_file,
+            source_type=source_type,
+            source_text=source_text,
+        ).strip()
 
     def _chunks_from_payload(
             self,

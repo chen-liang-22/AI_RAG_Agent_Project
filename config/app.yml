@@ -1,120 +1,206 @@
 # 应用级配置。
-# 这里放和业务运行、RAG、模型、内置知识清单、ID 生成相关的配置。
+# 这个文件放“业务运行行为”相关配置：模型、RAG、Agent、文档解析、内置知识清单和 ID 生成。
+# 不放外部服务连接信息；MySQL、Redis、MinIO、Qdrant 连接信息在 storage.yml。
 
 rag:
   # 聊天模型调用方式。
+  # core/model/factory.py 会读取该值决定创建哪类聊天模型客户端。
   # openai_compatible/openai：使用 OpenAI 兼容接口，例如 DashScope compatible-mode/v1。
   # tongyi：使用 LangChain ChatTongyi 原生封装。
   chat_provider: openai_compatible
 
-  # 默认聊天模型名称，用于 Query Planner、最终回答、销售训练生成等场景。
+  # 默认聊天模型名称。
+  # 用于 Query Planner、智能客服最终回答、销售训练角色/目标/评分生成等默认场景。
   chat_model_name: deepseek-v4-flash
 
-  # 模型档位映射，前端传 low/medium/high 时会映射到这里的具体模型。
+  # 低档模型名称。
+  # 前端或接口传 model_mode=low 时，经字典归一化后映射到该模型。
   chat_model_low: qwen-turbo
+
+  # 中档模型名称。
+  # 前端或接口传 model_mode=medium 时使用，适合平衡速度和质量。
   chat_model_medium: qwen3.6-flash
+
+  # 高档模型名称。
+  # 前端或接口传 model_mode=high 时使用，适合更复杂的回答、评分和生成任务。
   chat_model_high: deepseek-v4-flash
 
-  # OpenAI 兼容接口地址，chat_provider=openai_compatible/openai 时使用。
+  # OpenAI 兼容接口地址。
+  # chat_provider=openai_compatible/openai 时传给 ChatOpenAI.base_url；DashScope 兼容模式使用当前地址。
   openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 
-  # 文本向量模型。更换模型或维度后，需要重建 Qdrant collection。
+  # 文本向量模型名称。
+  # core/model/factory.py 创建 Embedding 模型时使用；更换模型或向量维度后，需要重建 Qdrant collection。
   embedding_model_name: text-embedding-v4
 
   # 聊天路由模式。
-  # direct_rag：直接走知识库检索和最终回答，响应更短。
-  # agent/react_agent/legacy_agent：走 LangGraph/Agent 工具链，适合工具编排。
+  # app_v2/application/chat_generation_service.py 会读取该值决定走 direct_rag 还是 Agent。
+  # direct_rag：直接 RAG 检索并生成最终回答，链路短、响应快。
+  # agent/react_agent/legacy_agent：走 LangGraph ReAct Agent 工具链，适合需要工具编排的旧流程。
   chat_route_mode: agent
 
   # Query Planner 模式。
-  # adaptive：先原问题检索，召回弱时才调用 LLM 改写/拆分。
+  # core/rag/services/rag_service.py 和 query_planner_service.py 使用该值控制多意图拆分策略。
+  # adaptive：先用原问题检索，召回质量不足时才调用 LLM 改写/拆分。
   # llm：每次检索前都调用 LLM 改写/拆分。
-  # rule/rules/off/disabled：不调用 LLM，只使用原问题和显式多问号拆分。
+  # rule/rules/off/disabled：不调用 LLM，只使用原问题和用户显式问号/分号/换行拆分。
   query_planner_mode: adaptive
 
   # Query Planner 可读取的最近历史消息条数。
+  # 多轮追问时帮助模型理解上下文；过大会增加 token 消耗和延迟。
   query_planner_history_limit: 20
 
   # Query Planner 中每条历史消息最多保留的字符数。
+  # 用于截断长历史，避免查询规划阶段消耗过多 token。
   query_planner_history_chars: 300
 
-  # adaptive 模式下，首次召回 top1 分数低于该值时触发 Query Planner。
+  # adaptive 模式首轮召回的 top1 最低分。
+  # top1 低于该值时认为原问题召回偏弱，会触发 Query Planner 补充改写/拆分。
   adaptive_retrieve_min_score: 0.72
 
-  # adaptive 模式下，首次召回资料数量少于该值时触发 Query Planner。
+  # adaptive 模式首轮召回的最少资料数。
+  # 少于该数量时认为参考资料不足，会触发 Query Planner。
   adaptive_retrieve_min_docs: 3
 
-  # adaptive 模式下，首次召回 top3 平均分低于该值时触发 Query Planner。
+  # adaptive 模式首轮召回 top3 平均分阈值。
+  # top3 平均分低于该值时认为整体召回不稳，会触发 Query Planner。
   adaptive_retrieve_top3_avg_score: 0.68
 
-  # 召回极低时是否跳过 Query Planner，减少无关问题的等待时间。
+  # 首轮召回极低时是否跳过 Query Planner。
+  # true 表示当分数低到像“知识库没有相关内容”时，不再花时间让 LLM 改写问题。
   adaptive_skip_planner_on_very_low_score: true
+
+  # “极低召回”的 top1 分数阈值。
+  # adaptive_skip_planner_on_very_low_score=true 时生效；top1 低于该值才可能跳过 Query Planner。
   adaptive_skip_planner_max_score: 0.55
+
+  # “极低召回”的 top3 平均分阈值。
+  # 与 adaptive_skip_planner_max_score 同时满足时，才跳过 Query Planner。
   adaptive_skip_planner_top3_avg_score: 0.50
 
-  # FastAPI 启动预热配置。
+  # FastAPI 启动时是否执行预热。
+  # api/warmup.py 读取该值；预热可提前发现 Qdrant、Embedding、模型配置问题。
   startup_warmup_enabled: true
+
+  # 启动预热时是否检查 Qdrant 连接和默认 collection。
   warmup_qdrant: true
+
+  # 启动预热时是否调用一次 Embedding 模型。
+  # 能提前发现 API Key、模型名或网络问题。
   warmup_embedding: true
+
+  # 启动预热时是否调用一次聊天模型。
+  # 该项可能增加启动耗时和 token 消耗，默认关闭。
   warmup_chat_model: false
+
+  # 预热失败时是否中断 FastAPI 启动。
+  # false 表示只记录错误日志，服务仍继续启动；true 适合生产强校验。
   warmup_fail_fast: false
 
-  # 文档解析规则，集中管理编号、标题、问答前缀等格式约定。
+  # 文档解析规则。
+  # core/rag/document_parser.py 会把这些正则编译成 DocumentParseRules。
+  # 这些是“资料格式约定”，集中放配置里，避免把编号、答案前缀等格式写死在代码中。
   document_parse_rules:
+    # 识别“1. 问题内容”或“1、问题内容”这种编号条目。
     numbered_item_pattern: "^\\s*(\\d+)[.、]\\s*(.+)$"
+
+    # 识别 Markdown 二级到六级标题，用于标题结构切片。
     heading_pattern: "^\\s*#{2,6}\\s*(.+)$"
+
+    # 从文本开头提取并删除“1.”或“1、”这种编号前缀。
     number_prefix_pattern: "^\\s*(\\d+)[.、]\\s*"
+
+    # 判断一段文本是否只有编号前缀，没有有效正文。
     number_prefix_only_pattern: "^\\s*\\d+\\s*[.、]\\s*$"
+
+    # 清洗答案开头的“答案：”“答：”“A：”等前缀。
     answer_prefix_pattern: "^(?:答案|答|A)[:：]\\s*"
+
+    # 判断清洗后的答案是否只是“问题/答案/Q/A”等无效占位。
     invalid_answer_pattern: "^(?:问题|答案|答|Q|A)[:：]?$"
+
+    # 识别问题文本时使用的问题标点。
     question_marks:
       - "？"
       - "?"
 
 agent:
-  # 外部业务数据 CSV 路径，Agent 工具查询模拟业务记录时使用。
+  # 外部业务数据 CSV 路径。
+  # 旧版 Agent 工具查询模拟业务记录时使用；当前主聊天链路不依赖它。
   external_data_path: data/external/records.csv
 
 id_generator:
   # 是否启用雪花算法主键生成器。
+  # true 时 app_v2/infrastructure/id_generator.py 生成趋势递增的长整型 ID。
   enabled: true
-  # 雪花算法起始时间。固定后不要随意修改，否则会影响 ID 时间段。
+
+  # 雪花算法起始时间。
+  # 固定后不要随意修改，否则会改变 ID 时间段计算方式，可能影响排序和排查。
   epoch: "2026-01-01T00:00:00+08:00"
-  # 本机节点编号。生产多实例部署时每个实例必须不同。
+
+  # 本机节点编号。
+  # 多实例部署时每个实例必须不同，避免同一毫秒内生成重复 ID。
   worker_id: 0
+
   # 允许的轻微时钟回拨毫秒数。
+  # 机器时间倒退不超过该值时短暂等待；超过则抛错，避免生成重复 ID。
   max_clock_backward_ms: 5
 
 knowledge_manifest:
-  # data/ 内置知识文件默认入库配置。
+  # data/ 内置知识文件的默认入库配置。
+  # app_v2/application/knowledge/indexing_service.py 同步 data 目录时使用。
   defaults:
+    # 默认写入的 Qdrant collection。
     collection_name: agent
+
+    # 默认文档结构类型；text 表示普通文本资料。
     document_type: text
+
+    # 默认切分策略；recursive 表示按通用递归字符切分。
     split_strategy: recursive
 
-  # 指定文件的结构类型和切分策略。
+  # 指定文件的入库覆盖配置。
+  # key 必须和 data/ 下文件名一致；未配置的文件使用 defaults。
   files:
     扫地机器人100问.pdf:
+      # 该文件写入的 Qdrant collection。
       collection_name: agent
+      # qa 表示编号问答型资料，会额外抽取结构化问题和答案。
       document_type: qa
+      # numbered_qa 按“编号问题 + 答案”结构切片。
       split_strategy: numbered_qa
     扫地机器人100问2.txt:
+      # 该文件写入的 Qdrant collection。
       collection_name: agent
+      # qa 表示编号问答型资料，会额外抽取结构化问题和答案。
       document_type: qa
+      # numbered_qa 按“编号问题 + 答案”结构切片。
       split_strategy: numbered_qa
     扫拖一体机器人100问.txt:
+      # 该文件写入的 Qdrant collection。
       collection_name: agent
+      # qa 表示编号问答型资料，会额外抽取结构化问题和答案。
       document_type: qa
+      # numbered_qa 按“编号问题 + 答案”结构切片。
       split_strategy: numbered_qa
     故障排除.txt:
+      # 该文件写入的 Qdrant collection。
       collection_name: agent
+      # numbered 表示编号段落型资料，不强制抽取问答。
       document_type: numbered
+      # numbered_segments 按编号段落切片。
       split_strategy: numbered_segments
     维护保养.txt:
+      # 该文件写入的 Qdrant collection。
       collection_name: agent
+      # numbered 表示编号段落型资料，不强制抽取问答。
       document_type: numbered
+      # numbered_segments 按编号段落切片。
       split_strategy: numbered_segments
     选购指南.txt:
+      # 该文件写入的 Qdrant collection。
       collection_name: agent
+      # numbered 表示编号段落型资料，不强制抽取问答。
       document_type: numbered
+      # numbered_segments 按编号段落切片。
       split_strategy: numbered_segments

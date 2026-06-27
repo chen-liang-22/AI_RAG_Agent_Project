@@ -1,34 +1,53 @@
 # 销售训练资料入库配置。
-# 这里放训练资料 collection、LMS 案例切分、质量评估和发布验证配置。
+# 这个文件只管理销售陪练知识资料的入库规则：
+# - 训练资料写入哪个 Qdrant collection；
+# - LMS 场景案例如何切成业务片段；
+# - 切片质量如何评估；
+# - 质量不足时是否调用 LLM 兜底切分；
+# - 发布后如何抽样验证。
 
-# 销售训练向量库配置。
-# published：正式训练资料 collection，只有人工发布成功的数据参与训练检索。
-# staging：临时待审核 collection，上传和重新切分后的切片先写这里。
 collections:
+  # 正式训练资料 collection。
+  # 只有人工发布成功的数据会写入这里；训练角色生成、每轮对话检索、最终评分都会查这个库。
   published: "sales_training_cases"
+
+  # 临时待审核 collection。
+  # 上传和重新切分后的切片先写这里，前端确认发布后再进入 published。
   staging: "sales_training_cases_staging"
 
-# LMS 场景案例资料切分配置。
 lms_case:
-  # 中文编号标题识别规则，例如“一、客户案例”“二. 客户案例”。
+  # LMS 场景案例标题识别正则。
+  # app_v2/application/training_support/strategies/knowledge_ingest_strategy.py 用它识别“一、客户案例”这类案例起点。
   case_title_pattern: "^[一二三四五六七八九十]+[、.．]\\s*.+"
 
-  # 业务片段关键词配置，用于把案例正文归类到统一 case_part。
+  # 业务片段关键词配置。
+  # 规则切片时会用这些关键词判断当前文本属于哪个 case_part。
   part_markers:
+    # 客户/企业基本信息片段。
+    # 通常用于生成 AI 客户角色的显性身份、行业、阶段和背景。
     case_profile:
       - "客户案例"
       - "企业"
       - "老板身份"
       - "合作行业"
       - "客户阶段"
+
+    # 训练任务要求片段。
+    # 通常描述学员本次要完成的沟通任务和业务目标。
     task_requirement:
       - "任务要求"
+
+    # 标准话术或参考答案片段。
+    # 可用于角色生成、对话追问和评分时判断学员是否命中关键表达。
     standard_answer:
       - "匹配答案"
       - "话术案例"
       - "话术原文"
       - "谈单话术"
       - "参考答案"
+
+    # 客户隐藏心理或底层顾虑片段。
+    # 只给 AI 客户扮演时使用，帮助 AI 提出更真实的追问和异议。
     hidden_psychology:
       - "隐性心理"
       - "底层顾虑"
@@ -36,6 +55,9 @@ lms_case:
       - "客户底层心理"
       - "核心显性卡点"
       - "隐性痛点"
+
+    # 评分规则或扣分点片段。
+    # 训练结束评分时使用，帮助 LLM 按案例要求判断学员表现。
     scoring_rubric:
       - "命中点"
       - "扣分点"
@@ -43,43 +65,90 @@ lms_case:
       - "能力维度"
 
   # 不同 case_part 的默认可见性。
-  # visible：角色生成、对话和评分都可以使用。
-  # hidden：只给 AI 客户扮演使用，不直接展示给学员。
-  # scoring_only：只给训练结束评分使用。
+  # 写入 Qdrant metadata.visibility 后，角色生成、对话和评分会按可见性过滤使用。
   part_visibility:
+    # visible：角色生成、对话检索、评分都可以使用，也可以给管理员/教练查看。
     case_profile: "visible"
+
+    # visible：任务要求是训练主目标，角色生成、对话和评分都可以使用。
     task_requirement: "visible"
+
+    # visible：标准话术可用于训练反馈和评分，也可作为显性参考。
     standard_answer: "visible"
+
+    # hidden：只给 AI 客户扮演使用，不直接展示给学员。
     hidden_psychology: "hidden"
+
+    # scoring_only：只给训练结束评分使用，不参与 AI 客户日常对话扮演。
     scoring_rubric: "scoring_only"
 
-# 切片质量评估配置。
 quality:
+  # 切片质量通过分。
+  # 质量分达到该值时认为规则切片结果可直接发布或进入正常审核。
   pass_score: 80
+
+  # 切片质量人工复核分。
+  # 低于 pass_score 但达到该值时，表示可人工确认；低于该值通常建议重切或 LLM 兜底。
   review_score: 60
+
+  # 单个切片最大推荐字符数。
+  # 超过该值会计入 oversize_chunk_count，提示切片过长。
   max_chunk_chars: 1800
+
+  # 单一 case_part 占比上限。
+  # 如果某一类片段占比过高，说明切片可能偏斜，例如全部被归到 standard_answer。
   max_single_part_ratio: 0.75
+
+  # 必须出现的片段类型。
+  # 缺失这些片段会降低质量分，因为训练角色和任务目标需要这些基础信息。
   required_parts:
     - "case_profile"
     - "task_requirement"
     - "standard_answer"
+
+  # 推荐出现的片段类型。
+  # 缺失会轻微扣分，但不会像 required_parts 那样严重。
   recommended_parts:
     - "scoring_rubric"
 
-# LLM 兜底切分配置。
-# 规则切分质量低时才调用模型重新抽取结构化切片，避免每次上传都消耗模型。
 llm_fallback:
+  # 是否启用 LLM 兜底切分。
+  # 规则切分质量过低或用户手动重切时，才会尝试调用模型重新抽取结构化切片。
   enabled: true
+
+  # 自动触发 LLM 兜底的质量分阈值。
+  # quality.score 低于该值时，TrainingLlmFallbackSplitter.should_trigger 返回 true。
   trigger_score_below: 60
-  # 留空表示使用 app.yml 中 rag.chat_model_name 对应的默认聊天模型。
+
+  # LLM 兜底切分使用的模型档位。
+  # null 表示使用 app.yml 中 rag.chat_model_name 对应的默认聊天模型；也可填 low/medium/high。
   model_mode: null
+
+  # 送入 LLM 的原文最大字符数。
+  # 用于控制 token 消耗，超出部分会被截断。
   max_source_chars: 12000
+
+  # LLM 最多抽取的案例数量。
+  # 防止大文件一次性生成过多案例，导致响应慢或 JSON 过长。
   max_cases: 20
+
+  # LLM 最多输出的切片数量。
+  # 超过该数量的切片会被截断，防止一次兜底写入过多数据。
   max_chunks: 80
 
-# 发布后抽样检索验证配置。
 publish_validation:
+  # 发布后是否执行抽样检索验证。
+  # 发布到正式 collection 后会随机抽样切片再查一次，确认 batch_id 过滤能召回。
   enabled: true
+
+  # 发布验证抽样切片数量。
+  # 数量越大验证越充分，但发布耗时越长。
   sample_size: 3
+
+  # 每个抽样切片执行检索时的 topK。
+  # 用于判断该切片内容能否在正式 collection 中被查回。
   search_k: 3
+
+  # 发布验证通过所需的最低命中率。
+  # 命中率 = 成功召回的样本数 / 抽样样本数。
   min_hit_ratio: 0.6

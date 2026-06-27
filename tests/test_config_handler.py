@@ -1,5 +1,5 @@
-def test_config_handler_does_not_keep_legacy_prompts_config():
-    """删除 prompts.yml 机制后，基础配置模块仍然应该可以正常导入。"""
+def test_config_handler_does_not_expose_prompt_config_directly():
+    """基础配置模块仍只暴露业务配置，提示词由 PromptManager 单独管理。"""
 
     import core.utils.config_handler as config_handler
 

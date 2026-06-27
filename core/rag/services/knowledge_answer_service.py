@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemM
 from core.model.factory import get_chat_model, get_chat_model_name_for_mode, normalize_chat_model_mode
 from core.rag.services.rag_service import RagSummarizeService
 from core.utils.logger_handler import logger
+from core.utils.prompt_manager import prompt_manager
 
 
 class KnowledgeAnswerService:
@@ -227,25 +228,13 @@ class KnowledgeAnswerService:
     def _system_prompt() -> str:
         """返回知识直答模式的系统提示词。"""
 
-        return (
-            "你是扫地/扫拖机器人客服,叫阿良。"
-            "优先根据参考资料回答。"
-            "如果问题属于基础常识，可以直接简洁回答。"
-            "不要编造具体品牌型号、价格、参数、APP路径、售后政策或故障代码。"
-            "先给结论，再给步骤。"
-            "不要输出参考资料原文、编号和元数据。"
-            "资料不足且不是基础常识时，直接说明缺少依据。"
-        )
+        return prompt_manager.get("knowledge.answer.system")
 
     @staticmethod
     def _user_message(query: str, context: str) -> str:
         """把用户问题和 RAG 参考资料组装成 HumanMessage 内容。"""
 
-        return (
-            f"用户问题：{query}\n\n"
-            f"参考资料：\n{context}\n\n"
-            "请生成最终回答。"
-        )
+        return prompt_manager.render("knowledge.answer.user", query=query, context=context)
 
     @staticmethod
     def _new_trace_id() -> str:

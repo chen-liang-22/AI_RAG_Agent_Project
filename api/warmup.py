@@ -192,11 +192,12 @@ def _warmup_chat_model() -> None:
     from langchain_core.messages import HumanMessage
 
     from core.model.factory import chat_model
+    from core.utils.prompt_manager import prompt_manager
 
     chunk_count = 0
 
     # 只等待第一个有效分片即可，预热目标是建立连接和触发模型侧初始化，不需要完整回答。
-    for chunk in chat_model.stream([HumanMessage(content="请只回复：ok")]):
+    for chunk in chat_model.stream([HumanMessage(content=prompt_manager.get("system.warmup_user"))]):
         content = getattr(chunk, "content", "")
         if content:
             chunk_count += 1

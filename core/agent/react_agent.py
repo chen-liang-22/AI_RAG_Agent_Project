@@ -23,24 +23,7 @@ from core.agent.tools.agent_tools import (  # 项目原有工具，继续复用
 )
 from core.model.factory import chat_model  # 项目统一模型实例，已开启 streaming=True
 from core.utils.logger_handler import logger  # 项目统一日志
-
-
-DEFAULT_SYSTEM_PROMPT = (
-    "你是扫地/扫拖机器人客服，叫阿良。"
-    "优先根据参考资料回答。"
-    "如果问题属于基础常识，可以直接简洁回答。"
-    "不要编造具体品牌型号、价格、参数、APP路径、售后政策或故障代码。"
-    "先给结论，再给步骤。"
-    "不要输出参考资料原文、编号和元数据。"
-    "资料不足且不是基础常识时，直接说明缺少依据。"
-)
-
-DEFAULT_REPORT_PROMPT = (
-    "你是中文对话报告生成助手。"
-    "请基于用户信息、对话历史和工具结果生成结构清晰的报告。"
-    "不要编造未提供的数据；缺少依据时明确说明未提供。"
-    "输出要自然、简洁、专业。"
-)
+from core.utils.prompt_manager import prompt_manager  # 提示词统一从 config/prompts.yml 读取
 
 
 class AgentState(TypedDict, total=False):
@@ -196,13 +179,13 @@ class ReactAgent:
     def _system_prompt() -> str:
         """返回旧 Agent 模式的默认客服系统提示词。"""
 
-        return DEFAULT_SYSTEM_PROMPT
+        return prompt_manager.get("agent.default_system")
 
     @staticmethod
     def _report_prompt() -> str:
         """返回旧 Agent 模式的默认报告生成提示词。"""
 
-        return DEFAULT_REPORT_PROMPT
+        return prompt_manager.get("agent.report_system")
 
     @staticmethod
     def _update_report_state(state: AgentState) -> dict:
@@ -311,25 +294,17 @@ class ReactAgent:
     def _retrieved_context_prompt() -> str:
         """返回“已检索上下文直答”模式的系统提示词。"""
 
-        return (
-            "你是扫地机器人/扫拖一体机器人客服。"
-            "请只根据参考资料回答用户问题，不要编造。"
-            "可以结合会话历史理解用户省略的上下文。"
-            "回答要像真实客服对话一样自然、简洁、专业。"
-            "不要机械复述字段名，比如“来源文件、分类”，除非用户明确问来源。"
-            "如果用户问第几问，说明该问题是什么，并直接给出答案。"
-            "如果参考资料是问题清单，保留编号和问题标题，不要擅自删减。"
-        )
+        return prompt_manager.get("knowledge.retrieved_context.system")
 
     @staticmethod
     def _retrieved_context_user_message(query: str, context: str) -> str:
         """把用户问题和 RAG 参考资料组装成模型可读的用户消息。"""
 
-        return (
-            f"用户问题：{query}\n\n"
-            f"参考资料：\n{context}\n\n"
-            "请基于参考资料给出最终回答。"
-        )
+        return prompt_manager.render("knowledge.retrieved_context.user", query=query, context=context)
+
+
+DEFAULT_SYSTEM_PROMPT = ReactAgent._system_prompt()
+DEFAULT_REPORT_PROMPT = ReactAgent._report_prompt()
 
 
 if __name__ == '__main__':  # 允许直接运行本文件做手动测试

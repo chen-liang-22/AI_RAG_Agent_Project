@@ -14,6 +14,7 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from core.utils.logger_handler import logger
+from core.utils.prompt_manager import prompt_manager
 
 
 @dataclass(frozen=True)
@@ -58,24 +59,11 @@ class LlmSemanticSplitter:
         model = get_chat_model(self.model_mode)
         response = model.invoke(
             [
-                SystemMessage(
-                    content=(
-                        "你是知识库语义切片规划器。只能基于用户给出的原文做切片计划，"
-                        "不要改写、总结或补充原文。必须只返回 JSON。"
-                    )
-                ),
+                SystemMessage(content=prompt_manager.get("rag.semantic_splitter.system")),
                 HumanMessage(
-                    content=(
-                        "请为下面原文生成语义切片计划。要求：\n"
-                        "1. 只返回 JSON，不要 Markdown。\n"
-                        "2. 每个 chunk 必须给出 start/end 字符偏移，偏移基于原文字符串。\n"
-                        "3. content_type 只能是 segment 或 qa。\n"
-                        "4. 如果是 qa，可给出 question/category；answer 不需要返回，后端会按原文截取。\n"
-                        "5. 不要返回切片正文 content。\n"
-                        "6. 覆盖核心内容，避免大量重复。\n\n"
-                        "返回格式："
-                        '{"chunks":[{"title":"主题","start":0,"end":120,"content_type":"segment","reason":"原因"}]}\n\n'
-                        f"原文：\n{full_text[:self.window_chars]}"
+                    content=prompt_manager.render(
+                        "rag.semantic_splitter.user",
+                        source_text=full_text[:self.window_chars],
                     )
                 ),
             ]
