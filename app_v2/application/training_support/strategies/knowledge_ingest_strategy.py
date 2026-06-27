@@ -1,3 +1,12 @@
+"""训练资料入库切片策略。
+
+这里使用策略模式：
+- LMS 场景案例按案例标题、任务要求、标准话术、隐藏心理、评分规则切片；
+- 通用资料按普通文本兜底切片。
+
+切片规则配置放在 config/training_ingest.yml，避免业务关键词散落在代码里。
+"""
+
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field

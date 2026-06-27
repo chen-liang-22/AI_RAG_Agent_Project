@@ -1,3 +1,9 @@
+"""训练资料入库策略工厂。
+
+上传训练资料时，应用服务只传 source_type。
+工厂负责选择 LMS 案例策略或通用策略，避免主流程出现一堆 if/else。
+"""
+
 from app_v2.application.training_support.strategies.knowledge_ingest_strategy import (
     GenericTrainingIngestStrategy,
     KnowledgeIngestStrategy,

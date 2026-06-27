@@ -1,3 +1,9 @@
+"""认证接口请求和响应模型。
+
+这里只定义 FastAPI/Pydantic DTO，不写认证逻辑。
+字段名属于前后端协议，修改前需要同步前端和接口文档。
+"""
+
 from pydantic import BaseModel, Field
 
 

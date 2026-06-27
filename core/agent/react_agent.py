@@ -17,7 +17,24 @@ from core.agent.tools.agent_tools import (  # 项目原有工具，继续复用
 )
 from core.model.factory import chat_model  # 项目统一模型实例，已开启 streaming=True
 from core.utils.logger_handler import logger  # 项目统一日志
-from core.utils.prompt_loader import load_report_prompts, load_system_prompts  # 普通客服提示词和报告提示词
+
+
+DEFAULT_SYSTEM_PROMPT = (
+    "你是扫地/扫拖机器人客服，叫阿良。"
+    "优先根据参考资料回答。"
+    "如果问题属于基础常识，可以直接简洁回答。"
+    "不要编造具体品牌型号、价格、参数、APP路径、售后政策或故障代码。"
+    "先给结论，再给步骤。"
+    "不要输出参考资料原文、编号和元数据。"
+    "资料不足且不是基础常识时，直接说明缺少依据。"
+)
+
+DEFAULT_REPORT_PROMPT = (
+    "你是中文对话报告生成助手。"
+    "请基于用户信息、对话历史和工具结果生成结构清晰的报告。"
+    "不要编造未提供的数据；缺少依据时明确说明未提供。"
+    "输出要自然、简洁、专业。"
+)
 
 
 class AgentState(TypedDict, total=False):
@@ -156,12 +173,24 @@ class ReactAgent:
 
         messages = state.get("messages", [])  # 取出当前图状态里的完整消息历史
         report = state.get("report", False)  # 判断是否处于报告生成场景
-        prompt = load_report_prompts() if report else load_system_prompts()  # 根据状态选择系统提示词
+        prompt = self._report_prompt() if report else self._system_prompt()  # 根据状态选择系统提示词
 
         logger.info(f"[LangGraph代理] 调用模型 消息数={len(messages)} 是否报告模式={report}")  # 记录模型调用日志
         response = self.model.invoke([SystemMessage(content=prompt), *messages])  # 系统提示词 + 历史消息一起发给模型
 
         return {"messages": [response]}  # 返回新 AIMessage，由 add_messages 合并进 state["messages"]
+
+    @staticmethod
+    def _system_prompt() -> str:
+        """返回旧 Agent 模式的默认客服系统提示词。"""
+
+        return DEFAULT_SYSTEM_PROMPT
+
+    @staticmethod
+    def _report_prompt() -> str:
+        """返回旧 Agent 模式的默认报告生成提示词。"""
+
+        return DEFAULT_REPORT_PROMPT
 
     @staticmethod
     def _update_report_state(state: AgentState) -> dict:

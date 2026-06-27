@@ -7,13 +7,13 @@
 """
 
 from typing import Callable
-from core.utils.prompt_loader import load_system_prompts, load_report_prompts
 from langchain.agents import AgentState
 from langchain.agents.middleware import wrap_tool_call, before_model, dynamic_prompt, ModelRequest
 from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 from langgraph.types import Command
+from core.agent.react_agent import DEFAULT_REPORT_PROMPT, DEFAULT_SYSTEM_PROMPT
 from core.utils.logger_handler import logger
 
 
@@ -62,6 +62,6 @@ def report_prompt_switch(request: ModelRequest):     # 动态切换提示词
 
     is_report = request.runtime.context.get("report", False)
     if is_report:               # 是报告生成场景，返回报告生成提示词内容
-        return load_report_prompts()
+        return DEFAULT_REPORT_PROMPT
 
-    return load_system_prompts()
+    return DEFAULT_SYSTEM_PROMPT
