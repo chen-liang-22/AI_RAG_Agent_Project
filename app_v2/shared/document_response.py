@@ -6,7 +6,7 @@ from datetime import date, datetime
 from fastapi import HTTPException
 
 from api.schemas import KnowledgeFileResponse
-from utils.qdrant_options import get_qdrant_collection_name
+from core.utils.qdrant_options import get_qdrant_collection_name
 
 
 @dataclass(frozen=True)

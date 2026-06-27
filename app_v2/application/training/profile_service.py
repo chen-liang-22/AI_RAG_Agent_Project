@@ -3,14 +3,14 @@
 from api.schemas import DictionaryGroupResponse
 from app_v2.application.dictionary_service import DictionaryApplicationService
 from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
-from training.schemas import (
+from app_v2.application.training_support.schemas import (
     RoleGenerateRequest,
     RoleGenerateResponse,
     ScenarioPolishRequest,
     ScenarioPolishResponse,
     SupplementQuestionGenerateResponse,
 )
-from utils.logger_handler import logger
+from core.utils.logger_handler import logger
 
 from .service_provider import get_training_core_service
 

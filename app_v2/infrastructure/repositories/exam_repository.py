@@ -7,10 +7,10 @@ from typing import Any
 
 from sqlalchemy import func, or_, select
 
-from domain.entities import DocumentEntity, ExamQuestionEntity, ExamSessionEntity
-from infrastructure.id_generator import new_id
-from infrastructure.orm_session import orm_session_context
-from training.repository import utc_now
+from app_v2.domain.entities import DocumentEntity, ExamQuestionEntity, ExamSessionEntity
+from app_v2.infrastructure.id_generator import new_id
+from app_v2.infrastructure.orm_session import orm_session_context
+from app_v2.application.training_support.repository import utc_now
 
 
 class ExamRepository:

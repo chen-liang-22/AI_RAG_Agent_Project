@@ -33,9 +33,9 @@ from app_v2.application.chat_generation_service import (
 )
 from app_v2.infrastructure.repositories.conversation_repository import ConversationRepository
 from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
-from model.factory import get_chat_model_name_for_mode, normalize_chat_model_mode
-from utils.logger_handler import logger
-from utils.qdrant_options import normalize_qdrant_collection_name
+from core.model.factory import get_chat_model_name_for_mode, normalize_chat_model_mode
+from core.utils.logger_handler import logger
+from core.utils.qdrant_options import normalize_qdrant_collection_name
 
 
 class ChatApplicationService:
@@ -220,7 +220,7 @@ class ChatApplicationService:
 
         logger.info("[V2聊天] 检索调试请求 问题=%s", request.query)
         try:
-            from rag.services.rag_service import RagSummarizeService
+            from core.rag.services.rag_service import RagSummarizeService
 
             return RagSummarizeService().debug_retrieve(request.query)
         except Exception as exc:

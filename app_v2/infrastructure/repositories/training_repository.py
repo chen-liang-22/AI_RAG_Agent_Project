@@ -3,7 +3,7 @@
 第一阶段继承旧仓储，先稳定接口；后续把自动建表和业务 SQL 拆到本模块。
 """
 
-from training.repository import TrainingRepository
+from app_v2.application.training_support.repository import TrainingRepository
 
 
 class V2TrainingRepository(TrainingRepository):

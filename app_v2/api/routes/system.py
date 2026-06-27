@@ -22,7 +22,7 @@ from app_v2.domain.system_schemas import (
     SystemUserResponse,
     SystemUserUpdateRequest,
 )
-from domain.entities import SystemUserEntity
+from app_v2.domain.entities import SystemUserEntity
 
 router = APIRouter(prefix="/system", tags=["V2 系统管理"])
 

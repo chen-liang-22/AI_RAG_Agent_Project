@@ -1,7 +1,7 @@
 """销售训练目标应用服务。"""
 
-from training.schemas import GoalSettingGenerateRequest, GoalSettingResponse
-from utils.logger_handler import logger
+from app_v2.application.training_support.schemas import GoalSettingGenerateRequest, GoalSettingResponse
+from core.utils.logger_handler import logger
 
 from .service_provider import get_training_core_service
 

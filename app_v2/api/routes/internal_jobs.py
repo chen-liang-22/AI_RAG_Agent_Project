@@ -5,9 +5,9 @@ import os
 from fastapi import APIRouter, Header, HTTPException
 
 from app_v2.application.knowledge.upload_preview_cleanup_service import PreviewUploadCleanupService
-from utils.config_handler import load_env_file
-from utils.logger_handler import logger
-from utils.redis_client import get_redis_client
+from core.utils.config_handler import load_env_file
+from core.utils.logger_handler import logger
+from core.utils.redis_client import get_redis_client
 
 
 router = APIRouter(prefix="/internal/jobs", tags=["V2 内部任务"])

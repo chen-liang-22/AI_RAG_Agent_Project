@@ -14,7 +14,7 @@ def test_document_parser_import_does_not_load_model_factory():
             "-c",
             (
                 "import sys; "
-                "from rag.document_parser import DocumentParser; "
+                "from core.rag.document_parser import DocumentParser; "
                 "print('model.factory' in sys.modules)"
             ),
         ],
@@ -28,7 +28,7 @@ def test_document_parser_import_does_not_load_model_factory():
 
 
 def test_detect_document_type_defaults_to_plain_recursive_without_regex_guessing():
-    from rag.document_parser import DocumentParser
+    from core.rag.document_parser import DocumentParser
 
     parser = DocumentParser(
         RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=0),
@@ -46,7 +46,7 @@ def test_detect_document_type_defaults_to_plain_recursive_without_regex_guessing
 
 
 def test_llm_semantic_strategy_slices_original_text_by_model_spans():
-    from rag.document_parser import DocumentParser
+    from core.rag.document_parser import DocumentParser
 
     documents = [
         Document(page_content="第一段保留原文。"),

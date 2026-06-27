@@ -5,9 +5,31 @@ Deployable FastAPI service for a LangChain ReAct agent with Qdrant-backed RAG.
 ## Services
 
 - `api.main:app`: FastAPI backend.
-- `app.py`: Streamlit demo UI.
 - `qdrant`: Vector database.
 - `../AI_RAG_Agent_Frontend`: Vue 3 frontend.
+
+## Backend Layout
+
+```text
+api/                 # FastAPI 启动入口，保留 api.main:app
+app_v2/
+  api/               # 路由层
+  application/       # 业务服务层
+  domain/            # ORM 实体、请求响应 schema、常量
+  infrastructure/    # MySQL、MinIO、Qdrant、Redis、ID 生成等基础设施
+  shared/            # 分页、响应转换等共享能力
+core/
+  agent/             # ReAct Agent 与工具
+  model/             # LLM / Embedding 工厂
+  rag/               # RAG 检索、切分、精排、答案生成
+  utils/             # 配置、日志、路径、文件工具
+config/              # YAML 配置
+docs/                # 项目文档
+scripts/             # 维护脚本
+tests/               # 后端测试
+```
+
+`api` 只作为启动门面保留，真实业务入口统一在 `app_v2`，可复用的 RAG、模型和工具能力统一在 `core`。
 
 ## Environment
 

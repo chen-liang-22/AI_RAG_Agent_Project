@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from app_v2.application.knowledge.upload_preview_state import PREVIEW_OBJECT_PREFIX, load_upload_preview_config
-from infrastructure.file_storage_service import FileStorageService, get_file_storage_service
-from utils.logger_handler import logger
+from app_v2.infrastructure.file_storage_service import FileStorageService, get_file_storage_service
+from core.utils.logger_handler import logger
 
 
 @dataclass(frozen=True)

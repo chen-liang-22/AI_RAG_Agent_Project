@@ -14,12 +14,12 @@ import jwt
 from jwt import ExpiredSignatureError, InvalidTokenError
 from sqlalchemy import select
 
-from domain.entities import SystemUserEntity
-from infrastructure.id_generator import new_id
-from infrastructure.orm_session import get_orm_engine, orm_session_context
-from utils.config_handler import load_env_file
-from utils.logger_handler import logger
-from utils.redis_client import RedisClient, get_redis_client
+from app_v2.domain.entities import SystemUserEntity
+from app_v2.infrastructure.id_generator import new_id
+from app_v2.infrastructure.orm_session import get_orm_engine, orm_session_context
+from core.utils.config_handler import load_env_file
+from core.utils.logger_handler import logger
+from core.utils.redis_client import RedisClient, get_redis_client
 
 
 PASSWORD_HASH_ALGORITHM = "pbkdf2_sha256"

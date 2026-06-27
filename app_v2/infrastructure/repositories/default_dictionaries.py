@@ -1,6 +1,6 @@
 """系统默认字典种子数据。"""
 
-from rag.profile_dictionaries import PROFILE_DICTIONARY_ITEMS
+from core.rag.profile_dictionaries import PROFILE_DICTIONARY_ITEMS
 
 
 DEFAULT_DICTIONARY_ITEMS = [

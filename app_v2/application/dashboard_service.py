@@ -15,9 +15,9 @@ from app_v2.infrastructure.repositories.dictionary_repository import DictionaryR
 from app_v2.infrastructure.repositories.training_repository import V2TrainingRepository
 from app_v2.application.training.sales_training_core import V2SalesTrainingCoreService
 from app_v2.shared.document_response import DictionaryCodeSnapshot, document_to_response
-from utils.logger_handler import logger
-from utils.qdrant_options import get_qdrant_client_options, get_qdrant_collection_name
-from utils.redis_client import get_redis_client
+from core.utils.logger_handler import logger
+from core.utils.qdrant_options import get_qdrant_client_options, get_qdrant_collection_name
+from core.utils.redis_client import get_redis_client
 
 
 class DashboardApplicationService:

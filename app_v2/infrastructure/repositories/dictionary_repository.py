@@ -7,11 +7,11 @@ from typing import Any
 
 from sqlalchemy import select
 
-from domain.entities import DictionaryItemEntity
+from app_v2.domain.entities import DictionaryItemEntity
 from app_v2.infrastructure.repositories.default_dictionaries import DEFAULT_DICTIONARY_ITEMS, DEPRECATED_DICTIONARY_CODES
-from infrastructure.orm_session import orm_session_context
-from training.repository import utc_now
-from utils.redis_client import RedisClient, get_redis_client
+from app_v2.infrastructure.orm_session import orm_session_context
+from app_v2.application.training_support.repository import utc_now
+from core.utils.redis_client import RedisClient, get_redis_client
 
 
 class DictionaryRepository:

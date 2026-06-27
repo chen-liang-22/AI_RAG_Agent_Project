@@ -4,13 +4,13 @@ import yaml
 from fastapi import HTTPException
 
 from app_v2.shared.document_response import normalize_document_structure_type, normalize_split_strategy
-from infrastructure.file_storage_service import get_file_storage_service
-from infrastructure.id_generator import new_id
-from utils.config_handler import qdrant_conf
-from utils.file_handler import get_file_md5_hex, listdir_with_allowed_type
-from utils.logger_handler import logger
-from utils.path_tool import get_abs_path
-from utils.qdrant_options import normalize_qdrant_collection_name
+from app_v2.infrastructure.file_storage_service import get_file_storage_service
+from app_v2.infrastructure.id_generator import new_id
+from core.utils.config_handler import qdrant_conf
+from core.utils.file_handler import get_file_md5_hex, listdir_with_allowed_type
+from core.utils.logger_handler import logger
+from core.utils.path_tool import get_abs_path
+from core.utils.qdrant_options import normalize_qdrant_collection_name
 
 
 def _index_document(
@@ -51,7 +51,7 @@ def _index_document(
 
     try:
         if vector_store is None:
-            from infrastructure.vector_store_service import VectorStoreService
+            from app_v2.infrastructure.vector_store_service import VectorStoreService
 
             vector_store = VectorStoreService(collection_name=final_collection_name)
 

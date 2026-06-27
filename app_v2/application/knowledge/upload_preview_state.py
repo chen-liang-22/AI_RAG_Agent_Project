@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from infrastructure.file_storage_service import StoredFileInfo
-from utils.config_handler import qdrant_conf
-from utils.redis_client import RedisClient, get_redis_client
+from app_v2.infrastructure.file_storage_service import StoredFileInfo
+from core.utils.config_handler import qdrant_conf
+from core.utils.redis_client import RedisClient, get_redis_client
 
 
 DEFAULT_PREVIEW_TTL_SECONDS = 86400

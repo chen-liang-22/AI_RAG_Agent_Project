@@ -5,9 +5,9 @@ from __future__ import annotations
 from sqlalchemy import case, func, or_, select
 
 from app_v2.shared.pagination import escape_like_keyword, normalize_page
-from domain.entities import SystemMenuEntity, SystemRoleEntity, SystemRoleMenuEntity, SystemUserEntity
-from infrastructure.orm_session import orm_session_context
-from training.repository import utc_now
+from app_v2.domain.entities import SystemMenuEntity, SystemRoleEntity, SystemRoleMenuEntity, SystemUserEntity
+from app_v2.infrastructure.orm_session import orm_session_context
+from app_v2.application.training_support.repository import utc_now
 
 _UNSET = object()
 

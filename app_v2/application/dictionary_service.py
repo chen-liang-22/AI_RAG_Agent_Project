@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 from api.schemas import DictionaryGroupResponse, DictionaryItemResponse
 from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
-from utils.logger_handler import logger
+from core.utils.logger_handler import logger
 
 
 class DictionaryApplicationService:

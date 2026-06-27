@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import UploadFile
 
-from infrastructure.file_storage_service import FileStorageService, StoredFileInfo, get_file_storage_service
+from app_v2.infrastructure.file_storage_service import FileStorageService, StoredFileInfo, get_file_storage_service
 
 
 class FileStorageAdapter:

@@ -3,7 +3,7 @@
 from pydantic import BaseModel, Field
 
 from api.schemas import ConversationSummaryResponse, HealthResponse, KnowledgeFileResponse
-from training.schemas import TrainingKnowledgeBatchResponse, TrainingPlanSummaryResponse, TrainingSessionSummaryResponse
+from app_v2.application.training_support.schemas import TrainingKnowledgeBatchResponse, TrainingPlanSummaryResponse, TrainingSessionSummaryResponse
 
 
 class DashboardOverviewResponse(BaseModel):

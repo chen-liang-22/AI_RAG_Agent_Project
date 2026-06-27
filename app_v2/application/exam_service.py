@@ -38,10 +38,10 @@ from api.exam_schemas import (
     ExamStartResponse,
 )
 from app_v2.infrastructure.repositories.exam_repository import ExamRepository, get_exam_repository
-from model.factory import get_chat_model
-from utils.database_connection import IntegrityErrorTypes
-from utils.logger_handler import logger
-from utils.qdrant_options import get_qdrant_client_options, normalize_qdrant_collection_name
+from core.model.factory import get_chat_model
+from core.utils.database_connection import IntegrityErrorTypes
+from core.utils.logger_handler import logger
+from core.utils.qdrant_options import get_qdrant_client_options, normalize_qdrant_collection_name
 
 router = APIRouter(prefix="/exam", tags=["V2 问答考试"])
 

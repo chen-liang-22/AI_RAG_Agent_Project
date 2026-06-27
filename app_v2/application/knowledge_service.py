@@ -39,11 +39,11 @@ from app_v2.infrastructure.adapters.vector_store_adapter import VectorStoreAdapt
 from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from app_v2.infrastructure.repositories.document_repository import DocumentRepository
 from app_v2.shared.document_response import DictionaryCodeSnapshot, document_to_response
-from infrastructure.id_generator import new_id
-from rag.file_processors import FileProcessorFactory
-from utils.file_handler import pdf_loader
-from utils.logger_handler import logger
-from utils.qdrant_options import get_qdrant_collection_name, normalize_qdrant_collection_name
+from app_v2.infrastructure.id_generator import new_id
+from core.rag.file_processors import FileProcessorFactory
+from core.utils.file_handler import pdf_loader
+from core.utils.logger_handler import logger
+from core.utils.qdrant_options import get_qdrant_collection_name, normalize_qdrant_collection_name
 
 DEFAULT_PREVIEW_CHAR_LIMIT = 20000
 MAX_PREVIEW_CHAR_LIMIT = 100000

@@ -25,8 +25,8 @@ from app_v2.domain.system_schemas import (
     SystemUserUpdateRequest,
 )
 from app_v2.infrastructure.repositories.system_repository import SystemRepository
-from domain.entities import SystemMenuEntity, SystemUserEntity
-from infrastructure.id_generator import new_id
+from app_v2.domain.entities import SystemMenuEntity, SystemUserEntity
+from app_v2.infrastructure.id_generator import new_id
 
 
 class SystemApplicationService:

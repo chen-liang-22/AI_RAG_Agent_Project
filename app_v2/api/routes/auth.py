@@ -5,8 +5,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from api.auth_schemas import CurrentUserResponse, LoginRequest, LoginResponse, LogoutResponse, RefreshResponse
 from app_v2.application.auth_service import AuthService
-from domain.entities import SystemUserEntity
-from utils.logger_handler import logger
+from app_v2.domain.entities import SystemUserEntity
+from core.utils.logger_handler import logger
 
 router = APIRouter(prefix="/auth", tags=["V2 认证"])
 bearer_scheme = HTTPBearer(auto_error=False)

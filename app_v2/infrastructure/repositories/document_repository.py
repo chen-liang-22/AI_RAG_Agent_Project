@@ -7,11 +7,11 @@ from typing import Any
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
-from domain.entities import DocumentEntity
-from infrastructure.orm_session import orm_session_context
-from training.repository import utc_now
-from utils.knowledge_asset_constants import TRAINING_COLLECTION_NAMES
-from utils.logger_handler import logger
+from app_v2.domain.entities import DocumentEntity
+from app_v2.infrastructure.orm_session import orm_session_context
+from app_v2.application.training_support.repository import utc_now
+from core.utils.knowledge_asset_constants import TRAINING_COLLECTION_NAMES
+from core.utils.logger_handler import logger
 
 
 class DocumentRepository:

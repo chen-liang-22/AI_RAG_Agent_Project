@@ -11,11 +11,11 @@ from dataclasses import dataclass, field
 from fastapi import HTTPException
 
 from app_v2.infrastructure.repositories.document_repository import DocumentRepository
-from infrastructure.file_storage_service import FileStorageService, get_file_storage_service
-from infrastructure.vector_store_service import VectorStoreService
-from training.repository import TrainingRepository
-from utils.knowledge_asset_constants import TRAINING_COLLECTION_NAMES
-from utils.logger_handler import logger
+from app_v2.infrastructure.file_storage_service import FileStorageService, get_file_storage_service
+from app_v2.infrastructure.vector_store_service import VectorStoreService
+from app_v2.application.training_support.repository import TrainingRepository
+from core.utils.knowledge_asset_constants import TRAINING_COLLECTION_NAMES
+from core.utils.logger_handler import logger
 
 
 @dataclass(slots=True)

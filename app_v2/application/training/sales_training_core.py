@@ -15,17 +15,17 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app_v2.application.knowledge.document_asset_service import DocumentAssetService
 from app_v2.infrastructure.repositories.document_repository import DocumentRepository
-from infrastructure.file_storage_service import get_file_storage_service
-from infrastructure.id_generator import new_id
-from infrastructure.vector_store_service import VectorStoreService
-from model.factory import get_chat_model
-from rag.file_processors import FileProcessorFactory
-from training.factories.knowledge_ingest_strategy_factory import KnowledgeIngestStrategyFactory
-from training.llm_ingest import TrainingLlmFallbackSplitter
-from training.publish_validation import TrainingPublishValidator
-from training.quality import TrainingIngestQualityEvaluator
-from training.repository import TrainingRepository, utc_now_text
-from training.schemas import (
+from app_v2.infrastructure.file_storage_service import get_file_storage_service
+from app_v2.infrastructure.id_generator import new_id
+from app_v2.infrastructure.vector_store_service import VectorStoreService
+from core.model.factory import get_chat_model
+from core.rag.file_processors import FileProcessorFactory
+from app_v2.application.training_support.factories.knowledge_ingest_strategy_factory import KnowledgeIngestStrategyFactory
+from app_v2.application.training_support.llm_ingest import TrainingLlmFallbackSplitter
+from app_v2.application.training_support.publish_validation import TrainingPublishValidator
+from app_v2.application.training_support.quality import TrainingIngestQualityEvaluator
+from app_v2.application.training_support.repository import TrainingRepository, utc_now_text
+from app_v2.application.training_support.schemas import (
     GoalSettingResponse,
     GoalStage,
     RoleGenerateRequest,
@@ -62,9 +62,9 @@ from training.schemas import (
     TrainingTurnRequest,
     TrainingTurnResponse,
 )
-from utils.database_connection import DatabaseErrorTypes
-from utils.logger_handler import logger
-from utils.path_tool import get_abs_path
+from core.utils.database_connection import DatabaseErrorTypes
+from core.utils.logger_handler import logger
+from core.utils.path_tool import get_abs_path
 
 
 TRAINING_INGEST_CONFIG_PATH = get_abs_path("config/training_ingest.yml")

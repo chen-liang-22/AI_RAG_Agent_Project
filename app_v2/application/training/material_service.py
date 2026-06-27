@@ -2,7 +2,7 @@
 
 from fastapi import UploadFile
 
-from training.schemas import (
+from app_v2.application.training_support.schemas import (
     TrainingKnowledgeBatchListResponse,
     TrainingKnowledgeChunkListResponse,
     TrainingKnowledgeDeleteResponse,
@@ -13,7 +13,7 @@ from training.schemas import (
     TrainingKnowledgeUploadResponse,
     TrainingKnowledgeVersionListResponse,
 )
-from utils.logger_handler import logger
+from core.utils.logger_handler import logger
 
 from .service_provider import get_training_core_service
 

@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from infrastructure.vector_store_service import VectorStoreService
+from app_v2.infrastructure.vector_store_service import VectorStoreService
 
 
 class VectorStoreAdapter:

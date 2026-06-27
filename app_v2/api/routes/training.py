@@ -10,7 +10,7 @@ from app_v2.application.training.plan_service import TrainingPlanApplicationServ
 from app_v2.application.training.profile_service import TrainingProfileApplicationService
 from app_v2.application.training.scoring_service import TrainingScoringApplicationService
 from app_v2.application.training.session_service import TrainingSessionApplicationService
-from training.schemas import (
+from app_v2.application.training_support.schemas import (
     GoalSettingGenerateRequest,
     GoalSettingResponse,
     RoleGenerateRequest,

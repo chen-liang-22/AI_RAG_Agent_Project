@@ -7,10 +7,10 @@ from fastapi import HTTPException
 
 from api.schemas import ChatRequest
 from app_v2.infrastructure.repositories.conversation_repository import ConversationRepository
-from model.factory import get_chat_model_name_for_mode, normalize_chat_model_mode
-from utils.config_handler import rag_conf
-from utils.logger_handler import logger
-from utils.qdrant_options import normalize_qdrant_collection_name
+from core.model.factory import get_chat_model_name_for_mode, normalize_chat_model_mode
+from core.utils.config_handler import rag_conf
+from core.utils.logger_handler import logger
+from core.utils.qdrant_options import normalize_qdrant_collection_name
 
 
 _agent = None  # 全局 Agent 单例；第一次聊天请求进来时才真正初始化
@@ -30,7 +30,7 @@ def _get_agent():
     with _agent_lock:
         if _agent is None:
             try:
-                from agent.react_agent import ReactAgent
+                from core.agent.react_agent import ReactAgent
 
                 _agent = ReactAgent()
             except (ImportError, RuntimeError, ValueError) as exc:
@@ -50,7 +50,7 @@ def _get_knowledge_answer_service():
     with _knowledge_answer_lock:
         if _knowledge_answer_service is None:
             try:
-                from rag.services.knowledge_answer_service import KnowledgeAnswerService
+                from core.rag.services.knowledge_answer_service import KnowledgeAnswerService
 
                 _knowledge_answer_service = KnowledgeAnswerService()
             except (ImportError, RuntimeError, ValueError) as exc:

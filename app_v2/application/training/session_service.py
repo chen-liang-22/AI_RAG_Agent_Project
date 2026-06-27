@@ -2,7 +2,7 @@
 
 from collections.abc import Iterator
 
-from training.schemas import (
+from app_v2.application.training_support.schemas import (
     TrainingSessionDetailResponse,
     TrainingSessionListResponse,
     TrainingSessionResponse,
@@ -10,7 +10,7 @@ from training.schemas import (
     TrainingTurnRequest,
     TrainingTurnResponse,
 )
-from utils.logger_handler import logger
+from core.utils.logger_handler import logger
 
 from .service_provider import get_training_core_service
 

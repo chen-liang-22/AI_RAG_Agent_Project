@@ -14,9 +14,9 @@ import os
 import time
 from dataclasses import dataclass
 
-from utils.config_handler import qdrant_conf, rag_conf
-from utils.logger_handler import logger
-from utils.qdrant_options import get_qdrant_client_options, get_qdrant_collection_name
+from core.utils.config_handler import qdrant_conf, rag_conf
+from core.utils.logger_handler import logger
+from core.utils.qdrant_options import get_qdrant_client_options, get_qdrant_collection_name
 
 
 @dataclass(frozen=True)
@@ -175,7 +175,7 @@ def _warmup_qdrant() -> None:
 def _warmup_embedding() -> None:
     """调用一次 embedding 模型，提前完成向量模型冷启动。"""
 
-    from model.factory import embed_model
+    from core.model.factory import embed_model
 
     # 使用极短中文文本，既能验证模型可用性，又尽量减少调用成本。
     vector = embed_model.embed_query("预热")
@@ -191,7 +191,7 @@ def _warmup_chat_model() -> None:
 
     from langchain_core.messages import HumanMessage
 
-    from model.factory import chat_model
+    from core.model.factory import chat_model
 
     chunk_count = 0
 

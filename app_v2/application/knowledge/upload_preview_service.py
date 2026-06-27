@@ -12,10 +12,10 @@ from app_v2.application.knowledge.upload_preview_state import (
 )
 from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from app_v2.shared.document_response import normalize_document_structure_type, normalize_split_strategy
-from infrastructure.file_storage_service import StoredFileInfo, get_file_storage_service
-from model.factory import get_chat_model, get_chat_model_name_for_mode
-from utils.config_handler import qdrant_conf
-from utils.logger_handler import logger
+from app_v2.infrastructure.file_storage_service import StoredFileInfo, get_file_storage_service
+from core.model.factory import get_chat_model, get_chat_model_name_for_mode
+from core.utils.config_handler import qdrant_conf
+from core.utils.logger_handler import logger
 
 
 def _sanitize_upload_filename(filename: str | None) -> str:
@@ -276,7 +276,7 @@ def _recommend_upload_split_strategy(upload_id: str) -> dict:
     stored_file = _get_preview_file(upload_id)
     filename = stored_file.filename
     file_type = _validate_file_type(filename)
-    from infrastructure.vector_store_service import VectorStoreService
+    from app_v2.infrastructure.vector_store_service import VectorStoreService
 
     with get_file_storage_service().downloaded_temp_file(
             bucket_name=stored_file.bucket_name,

@@ -2,7 +2,7 @@
 
 from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from app_v2.infrastructure.repositories.document_repository import DocumentRepository
-from infrastructure.orm_session import orm_session_context
+from app_v2.infrastructure.orm_session import orm_session_context
 
 
 _BOOTSTRAPPED = False
