@@ -52,6 +52,22 @@ class FakeSessionBasicService:
         return "detail-result"
 
 
+class FakeSessionTurnService:
+    """记录核心外观是否把训练对话入口委托给会话对话服务。"""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.calls = []
+
+    def submit_turn(self, session_id: str, request):
+        self.calls.append(("submit_turn", session_id, request))
+        return "submit-result"
+
+    def stream_turn(self, session_id: str, request):
+        self.calls.append(("stream_turn", session_id, request))
+        return iter(["event: done\ndata: {}\n\n"])
+
+
 def _patch_core_dependencies(monkeypatch):
     """替换核心外观的重依赖，专注验证委托边界。"""
 
@@ -61,6 +77,7 @@ def _patch_core_dependencies(monkeypatch):
     monkeypatch.setattr(sales_training_core, "TrainingKnowledgeService", FakeKnowledgeService)
     monkeypatch.setattr(sales_training_core, "TrainingPlanDomainService", FakePlanService)
     monkeypatch.setattr(sales_training_core, "TrainingSessionBasicService", FakeSessionBasicService)
+    monkeypatch.setattr(sales_training_core, "TrainingSessionTurnService", FakeSessionTurnService)
 
 
 def test_core_delegates_session_basic_methods(monkeypatch):
@@ -78,4 +95,20 @@ def test_core_delegates_session_basic_methods(monkeypatch):
         ("start_session", start_request),
         ("list_sessions", 0, 999, "stu_1"),
         ("get_session_detail", "session_1"),
+    ]
+
+
+def test_core_delegates_session_turn_methods(monkeypatch):
+    """一次性对话和流式对话入口应委托给 TrainingSessionTurnService。"""
+
+    _patch_core_dependencies(monkeypatch)
+    turn_request = object()
+
+    core_service = sales_training_core.V2SalesTrainingCoreService()
+
+    assert core_service.submit_turn("session_1", turn_request) == "submit-result"
+    assert list(core_service.stream_turn("session_1", turn_request)) == ["event: done\ndata: {}\n\n"]
+    assert core_service.session_turn_service.calls == [
+        ("submit_turn", "session_1", turn_request),
+        ("stream_turn", "session_1", turn_request),
     ]

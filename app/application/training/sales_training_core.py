@@ -23,7 +23,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.infrastructure.repositories.document_repository import DocumentRepository
 from app.infrastructure.vector_store_service import VectorStoreService
 from core.model.factory import get_chat_model
-from app.application.training_support.repository import TrainingRepository, utc_now_text
+from app.application.training_support.repository import TrainingRepository
 from app.application.training_support.schemas import (
     GoalSettingResponse,
     GoalStage,
@@ -64,6 +64,7 @@ from app.application.training.training_knowledge_service import TrainingKnowledg
 from app.application.training.training_plan_domain_service import TrainingPlanDomainService
 from app.application.training.training_session_basic_service import TrainingSessionBasicService
 from app.application.training.training_session_prompt_service import TrainingSessionPromptService
+from app.application.training.training_session_turn_service import TrainingSessionTurnService
 from app.application.training.training_score_service import TrainingScoreService
 from core.utils.logger_handler import logger
 from core.utils.config_handler import training_conf
@@ -163,6 +164,12 @@ class V2SalesTrainingCoreService:
         # 会话创建、历史列表和复盘详情拆到会话基础服务；对话流和评分后续单独拆。
         self.session_basic_service = TrainingSessionBasicService(
             repository=self.repository,
+            session_prompt_service=self.session_prompt_service,
+        )
+        # 会话对话提交和 SSE 流式回复拆到会话对话服务；最终评分后续单独拆。
+        self.session_turn_service = TrainingSessionTurnService(
+            repository=self.repository,
+            query_service=self.query_service,
             session_prompt_service=self.session_prompt_service,
         )
         logger.info(
@@ -557,8 +564,7 @@ class V2SalesTrainingCoreService:
     def submit_turn(self, session_id: str, request: TrainingTurnRequest) -> TrainingTurnResponse:
         """提交学员回复并一次性返回 AI 客户回复。"""
 
-        response = self._handle_turn(session_id, request, stream=False)
-        return response
+        return self.session_turn_service.submit_turn(session_id, request)
 
     def stream_turn(self, session_id: str, request: TrainingTurnRequest) -> Iterator[str]:
         """提交学员回复并返回 SSE 流。
@@ -574,71 +580,7 @@ class V2SalesTrainingCoreService:
         - error：异常。
         """
 
-        try:
-            # perf_counter 适合做耗时统计，不受系统时间调整影响。
-            start_perf = time.perf_counter()
-            session = self._require_session(session_id)
-            started_at = utc_now_text()
-            round_no = self.repository.next_round_no(session_id)
-            logger.info(
-                "[销售训练][流式轮次] 开始处理 会话编号=%s 轮次=%s 模型档位=%s 学员输入长度=%s 输入预览=%s",
-                session_id,
-                round_no,
-                request.model_mode or "默认",
-                len(request.message or ""),
-                self._short_text(request.message),
-            )
-            self.repository.add_turn(
-                session_id=session_id,
-                role="trainee",
-                content=request.message,
-                round_no=round_no,
-                response_mode="stream",
-                started_at=started_at,
-                submitted_at=started_at,
-            )
-            evidence = self._turn_evidence(session, request.message)
-            logger.info(
-                "[销售训练][流式轮次] 本轮检索完成 会话编号=%s 轮次=%s 证据数量=%s 命中切片=%s",
-                session_id,
-                round_no,
-                len(evidence),
-                self._join_values(item.get("chunk_id") for item in evidence),
-            )
-            # 先把检索结果发给前端，方便页面显示“本轮命中了哪些切片”。
-            yield self._sse("retrieval_done", {"retrieved_chunk_ids": [item["chunk_id"] for item in evidence], "evidence": evidence})
-
-            chunks: list[str] = []
-            # model.stream(...) 会逐块返回模型输出，前端就能看到“打字机效果”。
-            for chunk in self._stream_customer_reply(session, request.message, evidence, model_mode=request.model_mode):
-                chunks.append(chunk)
-                yield self._sse("customer_delta", {"content": chunk})
-
-            customer_reply = "".join(chunks).strip() or self._fallback_customer_reply(evidence)
-            response = self._finish_customer_turn(
-                session=session,
-                round_no=round_no,
-                customer_reply=customer_reply,
-                response_mode="stream",
-                evidence=evidence,
-                started_at=started_at,
-                start_perf=start_perf,
-            )
-            yield self._sse(
-                "stage_decision",
-                {"stage_status": response.stage_status, "session_status": response.session_status},
-            )
-            yield self._sse("turn_done", response.model_dump())
-            logger.info(
-                "[销售训练][流式轮次] 处理完成 会话编号=%s 轮次=%s 回复长度=%s 总耗时秒=%s",
-                session_id,
-                round_no,
-                len(customer_reply),
-                round(max(0.0, time.perf_counter() - start_perf), 3),
-            )
-        except Exception as exc:
-            logger.error("[销售训练] 流式训练轮次失败 会话编号=%s 错误=%s", session_id, exc, exc_info=True)
-            yield self._sse("error", {"error": str(exc)})
+        yield from self.session_turn_service.stream_turn(session_id, request)
 
     def final_score(self, session_id: str, model_mode: str | None = None) -> TrainingScoreResponse:
         """结束训练并生成评分报告。
@@ -716,228 +658,10 @@ class V2SalesTrainingCoreService:
         logger.info("[销售训练] 训练评分完成 会话编号=%s 得分=%s 等级=%s", session_id, final_score, level)
         return self._score_response(score)
 
-    def _handle_turn(self, session_id: str, request: TrainingTurnRequest, *, stream: bool) -> TrainingTurnResponse:
-        """处理一次训练轮次，非流式和流式共用同一套收尾逻辑。
-
-        stream 参数目前只是保留语义，真正流式走 stream_turn。
-        一次性接口会在这里完整生成 AI 客户回复后再返回 JSON。
-        """
-
-        session = self._require_session(session_id)
-        start_perf = time.perf_counter()
-        started_at = utc_now_text()
-        round_no = self.repository.next_round_no(session_id)
-        response_mode = self._normalize_response_mode(request.response_mode)
-        logger.info(
-            "[销售训练][一次性轮次] 开始处理 会话编号=%s 轮次=%s 回复模式=%s 模型档位=%s 学员输入长度=%s 输入预览=%s",
-            session_id,
-            round_no,
-            response_mode,
-            request.model_mode or "默认",
-            len(request.message or ""),
-            self._short_text(request.message),
-        )
-        self.repository.add_turn(
-            session_id=session_id,
-            role="trainee",
-            content=request.message,
-            round_no=round_no,
-            response_mode=response_mode,
-            started_at=started_at,
-            submitted_at=started_at,
-        )
-        evidence = self._turn_evidence(session, request.message)
-        logger.info(
-            "[销售训练][一次性轮次] 本轮检索完成 会话编号=%s 轮次=%s 证据数量=%s 命中切片=%s",
-            session_id,
-            round_no,
-            len(evidence),
-            self._join_values(item.get("chunk_id") for item in evidence),
-        )
-        customer_reply = self._generate_customer_reply(session, request.message, evidence, model_mode=request.model_mode)
-        return self._finish_customer_turn(
-            session=session,
-            round_no=round_no,
-            customer_reply=customer_reply,
-            response_mode=response_mode,
-            evidence=evidence,
-            started_at=started_at,
-            start_perf=start_perf,
-        )
-
-    def _finish_customer_turn(
-            self,
-            *,
-            session: dict[str, Any],
-            round_no: int,
-            customer_reply: str,
-            response_mode: str,
-            evidence: list[dict[str, Any]],
-            started_at: str,
-            start_perf: float,
-    ) -> TrainingTurnResponse:
-        """保存 AI 客户回复并更新本轮状态。
-
-        一期只有开放式一个阶段，因此 current_stage_no 固定为 1。
-        当学员轮次达到 round_limit 时，会话进入 scoring 状态，提示前端可以评分。
-        """
-
-        session_status = "active"
-        stage_status = "active"
-        if round_no >= int(session["round_limit"]):
-            session_status = "scoring"
-            stage_status = "round_limit_reached"
-            self.repository.update_session_status(session["session_id"], status=session_status)
-
-        now = utc_now_text()
-        # 这里统计从接收学员回复到 AI 客户回复落库的端到端耗时，便于前端展示训练响应速度。
-        response_seconds = round(max(0.0, time.perf_counter() - start_perf), 3)
-        coach_analysis = self._build_turn_coach_analysis(session, round_no, evidence)
-        self.repository.add_turn(
-            session_id=session["session_id"],
-            role="customer",
-            content=customer_reply,
-            round_no=round_no,
-            response_mode=response_mode,
-            stage_no=1,
-            started_at=started_at,
-            submitted_at=now,
-            response_seconds=response_seconds,
-            retrieved_chunk_ids=[item["chunk_id"] for item in evidence],
-            retrieved_evidence=evidence,
-            stage_decision={"stage_status": stage_status, "session_status": session_status},
-            coach_analysis=coach_analysis,
-        )
-        logger.info(
-            "[销售训练] 训练轮次完成 会话编号=%s 轮次=%s 状态=%s 回复模式=%s 回复长度=%s 证据数量=%s 耗时秒=%s",
-            session["session_id"],
-            round_no,
-            session_status,
-            response_mode,
-            len(customer_reply or ""),
-            len(evidence),
-            response_seconds,
-        )
-        return TrainingTurnResponse(
-            customer_reply=customer_reply,
-            current_stage_no=1,
-            stage_status=stage_status,
-            session_status=session_status,
-            retrieved_chunk_ids=[item["chunk_id"] for item in evidence],
-            coach_analysis=coach_analysis,
-            response_seconds=response_seconds,
-        )
-
-    def _turn_evidence(self, session: dict[str, Any], message: str) -> list[dict[str, Any]]:
-        """为某一轮学员回复检索训练证据。"""
-
-        profile = self._require_role_profile(session["profile_id"])
-        # 查询文本不只用学员本轮话术，还拼上场景描述，召回更贴近当前训练情境。
-        query = f"{message}\n{profile.get('scenario_description') or ''}"
-        logger.info(
-            "[销售训练][本轮证据] 构造检索文本 会话编号=%s 角色编号=%s 学员输入预览=%s 检索文本长度=%s",
-            session["session_id"],
-            session["profile_id"],
-            self._short_text(message),
-            len(query),
-        )
-        return self._search_training_evidence(query, visibility=("visible", "hidden"), k=5)
-
     def _search_training_evidence(self, query: str, *, visibility: tuple[str, ...], k: int) -> list[dict[str, Any]]:
         """检索训练证据库，并过滤学员不可直接看到的内容。"""
 
         return self.query_service.search_training_evidence(query, visibility=visibility, k=k)
-
-    def _generate_customer_reply(
-            self,
-            session: dict[str, Any],
-            trainee_message: str,
-            evidence: list[dict[str, Any]],
-            *,
-            model_mode: str | None,
-    ) -> str:
-        """一次性生成 AI 客户回复。"""
-
-        model = get_chat_model(model_mode)
-        prompt = self._customer_prompt(session, trainee_message, evidence)
-        start_perf = time.perf_counter()
-        logger.info(
-            "[销售训练][AI客户回复] 一次性调用开始 会话编号=%s 模型档位=%s 提示词长度=%s 证据数量=%s 学员输入预览=%s",
-            session["session_id"],
-            model_mode or "默认",
-            len(prompt),
-            len(evidence),
-            self._short_text(trainee_message),
-        )
-        try:
-            response = model.invoke(self._messages(prompt_manager.get("training.ai_customer_system"), prompt))
-            text = self._content_text(response.content).strip()
-            if text:
-                logger.info(
-                    "[销售训练][AI客户回复] 一次性调用完成 会话编号=%s 回复长度=%s 耗时秒=%s 回复预览=%s",
-                    session["session_id"],
-                    len(text),
-                    round(max(0.0, time.perf_counter() - start_perf), 3),
-                    self._short_text(text),
-                )
-                return text
-            logger.warning("[销售训练][AI客户回复] 模型返回为空，使用兜底回复 会话编号=%s", session["session_id"])
-            return self._fallback_customer_reply(evidence)
-        except Exception as exc:
-            logger.warning(
-                "[销售训练] AI客户回复生成失败，使用兜底回复 会话编号=%s 耗时秒=%s 错误=%s",
-                session["session_id"],
-                round(max(0.0, time.perf_counter() - start_perf), 3),
-                exc,
-            )
-            return self._fallback_customer_reply(evidence)
-
-    def _stream_customer_reply(
-            self,
-            session: dict[str, Any],
-            trainee_message: str,
-            evidence: list[dict[str, Any]],
-            *,
-            model_mode: str | None,
-    ) -> Iterator[str]:
-        """流式生成 AI 客户回复。"""
-
-        model = get_chat_model(model_mode)
-        prompt = self._customer_prompt(session, trainee_message, evidence)
-        start_perf = time.perf_counter()
-        chunk_count = 0
-        char_count = 0
-        logger.info(
-            "[销售训练][AI客户回复] 流式调用开始 会话编号=%s 模型档位=%s 提示词长度=%s 证据数量=%s 学员输入预览=%s",
-            session["session_id"],
-            model_mode or "默认",
-            len(prompt),
-            len(evidence),
-            self._short_text(trainee_message),
-        )
-        try:
-            for chunk in model.stream(self._messages(prompt_manager.get("training.ai_customer_system"), prompt)):
-                text = self._content_text(chunk.content)
-                if text:
-                    chunk_count += 1
-                    char_count += len(text)
-                    yield text
-            logger.info(
-                "[销售训练][AI客户回复] 流式调用完成 会话编号=%s 分片数量=%s 回复累计长度=%s 耗时秒=%s",
-                session["session_id"],
-                chunk_count,
-                char_count,
-                round(max(0.0, time.perf_counter() - start_perf), 3),
-            )
-        except Exception as exc:
-            logger.warning(
-                "[销售训练] AI客户流式生成失败，使用兜底回复 会话编号=%s 已返回分片=%s 耗时秒=%s 错误=%s",
-                session["session_id"],
-                chunk_count,
-                round(max(0.0, time.perf_counter() - start_perf), 3),
-                exc,
-            )
-            yield self._fallback_customer_reply(evidence)
 
     @staticmethod
     def _messages(system: str, human: str) -> list:
@@ -1077,12 +801,6 @@ class V2SalesTrainingCoreService:
             return default
 
     @staticmethod
-    def _normalize_response_mode(response_mode: str | None) -> str:
-        """统一响应模式枚举。"""
-
-        return "blocking" if response_mode in {"blocking", "once"} else "stream"
-
-    @staticmethod
     def _normalize_round_limit(value: Any) -> int:
         """把模型返回的轮数限制在合理范围。
 
@@ -1119,19 +837,6 @@ class V2SalesTrainingCoreService:
         if not plan:
             raise HTTPException(status_code=404, detail="训练方案不存在")
         return plan
-
-    def _require_session(self, session_id: str) -> dict[str, Any]:
-        """查询可继续对话的训练会话。
-
-        completed/deleted 等状态不能继续提交学员回复。
-        """
-
-        session = self.repository.get_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="训练会话不存在")
-        if session["status"] not in {"active", "scoring"}:
-            raise HTTPException(status_code=400, detail=f"当前训练状态不允许继续对话：{session['status']}")
-        return session
 
     def _goal_response(self, row: dict[str, Any]) -> GoalSettingResponse:
         """把数据库训练设置行转换成 Pydantic 响应。"""
@@ -1259,61 +964,6 @@ class V2SalesTrainingCoreService:
 
         return TrainingScoreService.normalize_dimension_scores(dimensions, total_score=total_score)
 
-    def _build_turn_coach_analysis(
-            self,
-            session: dict[str, Any],
-            round_no: int,
-            evidence: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """生成每轮即时教练分析。
-
-        一期先用规则生成，优点是快且稳定；后续可替换为 LLM 专项分析接口。
-        """
-
-        turns = self.repository.list_turns(session["session_id"])
-        trainee_turn = next((item for item in reversed(turns) if item["role"] == "trainee" and int(item["round_no"]) == round_no), None)
-        trainee_text = str(trainee_turn.get("content") or "") if trainee_turn else ""
-        has_question = "?" in trainee_text or "？" in trainee_text
-        has_case = any(keyword in trainee_text for keyword in ("案例", "客户", "数据", "证据", "效果", "ROI", "试点"))
-        has_next_step = any(keyword in trainee_text for keyword in ("下一步", "约", "试", "确认", "发您", "安排", "继续"))
-        strengths: list[str] = []
-        suggestions: list[str] = []
-        if has_question:
-            strengths.append("本轮有提问动作，能推动客户继续释放信息。")
-        else:
-            suggestions.append("建议先追问客户当前最核心的顾虑，避免直接进入方案介绍。")
-        if has_case:
-            strengths.append("本轮尝试使用证据或案例降低客户不确定感。")
-        else:
-            suggestions.append("可以补一句同类客户案例、数据或试点路径，让表达更可信。")
-        if has_next_step:
-            strengths.append("本轮有下一步推进意识。")
-        else:
-            suggestions.append("结尾建议给出轻量下一步，例如约 15 分钟确认需求或先做小范围验证。")
-        if not strengths:
-            strengths.append("表达已完成基础回应，但还需要增强销售推进动作。")
-        return {
-            "round_no": round_no,
-            "summary": "本轮建议优先补强需求挖掘、证据化表达和下一步推进。",
-            "strengths": strengths,
-            "suggestions": suggestions,
-            "retrieval_hint": f"本轮命中 {len(evidence)} 条训练知识，可结合命中切片补充案例化表达。",
-            "next_reply_hint": "先承接客户顾虑，再追问影响范围，最后用案例或试点降低风险。",
-        }
-
-    @staticmethod
-    def _sse(event: str, payload: dict) -> str:
-        """把事件名和数据包装成 SSE 协议文本。
-
-        SSE 格式要求：
-            event: 事件名
-            data: JSON字符串
-
-        末尾两个换行表示一个事件结束。
-        """
-
-        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
     def _build_role_query(self, request: RoleGenerateRequest) -> str:
         """构造角色生成前的向量检索查询文本。"""
 
@@ -1343,20 +993,6 @@ class V2SalesTrainingCoreService:
         """构造开放式训练目标和评分规则生成提示词。"""
 
         return self.goal_setting_service.goal_prompt(profile)
-
-    def _customer_prompt(self, session: dict[str, Any], trainee_message: str, evidence: list[dict[str, Any]]) -> str:
-        """构造每轮 AI 客户回复提示词。"""
-
-        profile = self._require_role_profile(session["profile_id"])
-        setting = self._require_goal_setting(session["setting_id"])
-        turns = self.repository.list_turns(session["session_id"])[-10:]
-        return self.session_prompt_service.customer_prompt(
-            profile,
-            setting,
-            turns=turns,
-            trainee_message=trainee_message,
-            evidence=evidence,
-        )
 
     def _score_prompt(
             self,
@@ -1403,12 +1039,6 @@ class V2SalesTrainingCoreService:
         """训练目标生成失败时的本地兜底结果。"""
 
         return TrainingGoalSettingService.fallback_goal(profile)
-
-    @staticmethod
-    def _fallback_customer_reply(evidence: list[dict[str, Any]]) -> str:
-        """AI 客户回复失败时的兜底话术。"""
-
-        return TrainingSessionPromptService.fallback_customer_reply(evidence)
 
     @staticmethod
     def _fallback_score(turns: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> dict:

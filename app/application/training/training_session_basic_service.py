@@ -31,7 +31,7 @@ class TrainingSessionBasicService:
     """销售训练会话基础服务。
 
     这里使用外观模式，把会话创建、会话列表和复盘详情收拢成稳定接口。
-    对话提交、流式回复和最终评分仍由核心服务暂时编排，后续再拆。
+    对话提交和流式回复由会话对话服务处理，最终评分后续再拆。
     """
 
     def __init__(self, *, repository: TrainingRepository, session_prompt_service: TrainingSessionPromptService):
