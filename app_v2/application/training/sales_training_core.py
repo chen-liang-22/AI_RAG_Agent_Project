@@ -2732,59 +2732,11 @@ class V2SalesTrainingCoreService:
 
         role_profile = self._load_json(profile.get("role_profile_json"), {})
         hidden_profile = self._load_json(profile.get("hidden_profile_json"), {})
-        return f"""
-请生成一期开放式销售训练设置，只输出 JSON。
-
-字段要求：
-- training_purpose：20字以内
-- round_limit：5到100之间，必须动态判断，不要固定值
-- stages：数组，只能有一个阶段，包含 stage_no、stage_name、core_goal、success_conditions、failure_conditions
-- scoring_rules：评分规则对象。通用能力固定 40 分不用改；你只生成 stage_dimensions，合计 60 分。
-- stage_dimensions 至少 3 个评分维度；每个评分维度至少 3 个考核点；不要只输出一个大维度。
-- 每个考核点要能对应实际对话表现，描述要具体，不要写成空泛口号。
-
-scoring_rules 格式：
-{{
-  "stage_dimensions": [
-    {{
-      "dimension_name": "需求挖掘与痛点确认",
-      "score": 20,
-      "core_goal": "和训练目标一致",
-      "points": [
-        {{"point_name": "背景追问", "score": 7, "description": "能追问客户背景和现有流程"}},
-        {{"point_name": "痛点定位", "score": 7, "description": "能定位客户明确痛点"}},
-        {{"point_name": "需求确认", "score": 6, "description": "能确认优先级和下一步意向"}}
-      ]
-    }},
-    {{
-      "dimension_name": "价值呈现与证据支撑",
-      "score": 20,
-      "core_goal": "和训练目标一致",
-      "points": [
-        {{"point_name": "价值匹配", "score": 7, "description": "能把方案价值和客户痛点连接"}},
-        {{"point_name": "证据提供", "score": 7, "description": "能提供案例、数据或知识库事实"}},
-        {{"point_name": "风险降低", "score": 6, "description": "能说明试点、交付或验证路径"}}
-      ]
-    }},
-    {{
-      "dimension_name": "异议处理与推进动作",
-      "score": 20,
-      "core_goal": "和训练目标一致",
-      "points": [
-        {{"point_name": "异议承接", "score": 7, "description": "能先承接客户异议"}},
-        {{"point_name": "针对回应", "score": 7, "description": "能针对具体异议给出回应"}},
-        {{"point_name": "下一步推进", "score": 6, "description": "能推进试点、资料交换或下次沟通"}}
-      ]
-    }}
-  ]
-}}
-
-AI 陪练角色：
-{json.dumps(role_profile, ensure_ascii=False, indent=2)}
-
-隐藏顾虑：
-{json.dumps(hidden_profile, ensure_ascii=False, indent=2)}
-"""
+        return prompt_manager.render(
+            "training.goal_setting.user",
+            role_profile_json=json.dumps(role_profile, ensure_ascii=False, indent=2),
+            hidden_profile_json=json.dumps(hidden_profile, ensure_ascii=False, indent=2),
+        )
 
     def _opening_prompt(self, session: dict[str, Any]) -> str:
         """构造 AI 客户开场白提示词。"""
@@ -2794,24 +2746,12 @@ AI 陪练角色：
         role_profile = self._load_json(profile.get("role_profile_json"), {})
         hidden_profile = self._load_json(profile.get("hidden_profile_json"), {})
         stages = self._load_json(setting.get("stages_json"), [])
-        return f"""
-你正在扮演销售训练中的客户。请生成训练开场白，只输出客户说的话。
-
-要求：
-1. 不要暴露 hidden_profile 和评分规则。
-2. 语气要符合客户身份和性格，不要像客服助手。
-3. 主动抛出一个业务背景或顾虑，让学员可以接话。
-4. 控制在 60-120 字。
-
-角色设定：
-{json.dumps(role_profile, ensure_ascii=False, indent=2)}
-
-隐藏顾虑：
-{json.dumps(hidden_profile, ensure_ascii=False, indent=2)}
-
-训练目标：
-{json.dumps(stages, ensure_ascii=False, indent=2)}
-"""
+        return prompt_manager.render(
+            "training.opening_message.user",
+            role_profile_json=json.dumps(role_profile, ensure_ascii=False, indent=2),
+            hidden_profile_json=json.dumps(hidden_profile, ensure_ascii=False, indent=2),
+            stages_json=json.dumps(stages, ensure_ascii=False, indent=2),
+        )
 
     def _customer_prompt(self, session: dict[str, Any], trainee_message: str, evidence: list[dict[str, Any]]) -> str:
         """构造每轮 AI 客户回复提示词。"""
@@ -2822,33 +2762,19 @@ AI 陪练角色：
         hidden_profile = self._load_json(profile.get("hidden_profile_json"), {})
         stages = self._load_json(setting.get("stages_json"), [])
         turns = self.repository.list_turns(session["session_id"])[-10:]
-        return f"""
-你正在扮演销售训练中的客户，不是客服助手。
-
-规则：
-1. 必须保持客户身份、性格和隐藏顾虑。
-2. 不要直接说出 hidden_profile 原文。
-3. 根据学员回复逐步释放信息、追问、质疑或给出继续沟通信号。
-4. 回复要自然，控制在 80-180 字。
-
-角色设定：
-{json.dumps(role_profile, ensure_ascii=False, indent=2)}
-
-隐藏顾虑：
-{json.dumps(hidden_profile, ensure_ascii=False, indent=2)}
-
-训练目标：
-{json.dumps(stages, ensure_ascii=False, indent=2)}
-
-最近对话：
-{json.dumps([{"role": item["role"], "content": item["content"]} for item in turns], ensure_ascii=False, indent=2)}
-
-本轮学员回复：
-{trainee_message}
-
-本轮检索证据：
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
-"""
+        return prompt_manager.render(
+            "training.customer_reply.user",
+            role_profile_json=json.dumps(role_profile, ensure_ascii=False, indent=2),
+            hidden_profile_json=json.dumps(hidden_profile, ensure_ascii=False, indent=2),
+            stages_json=json.dumps(stages, ensure_ascii=False, indent=2),
+            recent_turns_json=json.dumps(
+                [{"role": item["role"], "content": item["content"]} for item in turns],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            trainee_message=trainee_message,
+            evidence_json=json.dumps(evidence, ensure_ascii=False, indent=2),
+        )
 
     def _score_prompt(
             self,
@@ -2860,32 +2786,18 @@ AI 陪练角色：
         """构造最终评分报告提示词。"""
 
         scoring_rules = self._load_json(setting.get("scoring_rules_json"), self._default_scoring_rules())
-        return f"""
-请作为销售训练考官，对本次开放式训练评分，只输出 JSON。
-
-输出字段：
-total_score、general_score、stage_score、penalty_score、hit_points、missing_points、wrong_points、
-evidence_refs、improvement_advice、reference_script、next_training_plan。
-
-评分规则：
-必须严格按照 scoring_rules 评分。通用能力最高 40 分，阶段能力最高 60 分，附加扣分一期只包含文字响应时效。
-评分必须引用对话轮次或知识库证据。
-
-角色：
-{profile.get("role_profile_json")}
-
-训练设置：
-{setting.get("stages_json")}
-
-评分设置：
-{json.dumps(scoring_rules, ensure_ascii=False, indent=2)}
-
-完整对话：
-{json.dumps([{"round_no": item["round_no"], "role": item["role"], "content": item["content"]} for item in turns], ensure_ascii=False, indent=2)}
-
-知识证据：
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
-"""
+        return prompt_manager.render(
+            "training.score_report.user",
+            role_profile_json=profile.get("role_profile_json"),
+            stages_json=setting.get("stages_json"),
+            scoring_rules_json=json.dumps(scoring_rules, ensure_ascii=False, indent=2),
+            conversation_json=json.dumps(
+                [{"round_no": item["round_no"], "role": item["role"], "content": item["content"]} for item in turns],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            evidence_json=json.dumps(evidence, ensure_ascii=False, indent=2),
+        )
 
     @staticmethod
     def _conversation_text(turns: list[dict[str, Any]]) -> str:

@@ -41,6 +41,7 @@ from app_v2.infrastructure.repositories.exam_repository import ExamRepository, g
 from core.model.factory import get_chat_model
 from core.utils.database_connection import IntegrityErrorTypes
 from core.utils.logger_handler import logger
+from core.utils.prompt_manager import prompt_manager
 from core.utils.qdrant_options import get_qdrant_client_options, normalize_qdrant_collection_name
 
 router = APIRouter(prefix="/exam", tags=["V2 问答考试"])
@@ -717,33 +718,14 @@ def _generate_question_with_model(
         extra_requirement = f"本题必须设计成答案为“{target_answer}”的判断题。"
     response = model.invoke(
         [
-            SystemMessage(
-                content=(
-                    "你是资深中文考试命题老师，负责把知识库问答改写成正式考试题。"
-                    "必须只依据给定原始问题和参考答案命题，不要补充资料外的新事实。"
-                    "题干要像正式试题，不能像客服问答或知识片段。"
-                    "正确答案要改写成面向考生的标准答案，不能直接照搬原文。"
-                    "只返回 JSON，不要返回 Markdown。"
-                )
-            ),
+            SystemMessage(content=prompt_manager.get("exam.question_generation.system")),
             HumanMessage(
-                content=(
-                    f"目标题型：{_question_type_label(question_type)}\n\n"
-                    f"原始问题：{question}\n\n"
-                    f"参考答案：{reference_answer}\n\n"
-                    "请生成一题正式考试题，并严格返回 JSON：\n"
-                    "{"
-                    '"prompt":"正式题干",'
-                    '"options":["选项A","选项B","选项C","选项D"],'
-                    '"correct_answer":"标准答案或正确选项；多选题为字符串数组"'
-                    "}\n"
-                    "要求："
-                    "单选题提供 4 个选项且只有 1 个正确答案；"
-                    "多选题提供 4 到 6 个选项，正确答案至少 2 个；"
-                    "判断题 options 固定为 [\"正确\",\"错误\"]，correct_answer 只能是 正确 或 错误；"
-                    "填空题题干必须自然出现空缺，不要把原始问句原样当题干；"
-                    "简答题不需要 options。"
-                    f"{extra_requirement}"
+                content=prompt_manager.render(
+                    "exam.question_generation.user",
+                    question_type_label=_question_type_label(question_type),
+                    question=question,
+                    reference_answer=reference_answer,
+                    extra_requirement=extra_requirement,
                 )
             ),
         ]
@@ -962,27 +944,16 @@ def _model_answer_analysis(question: dict[str, Any], user_answer: str, model_mod
         # 简答、填空、选择、判断都统一交给模型分析，这样可以处理同义表达、漏点和表述不完整。
         response = model.invoke(
             [
-                SystemMessage(
-                    content=(
-                        "你是严格但公正的中文考试阅卷老师。"
-                        "必须根据题目、题型、标准答案和参考答案分析用户答案。"
-                        "即使是选择题、判断题和填空题，也要给出自然、专业的阅卷点评。"
-                        "correct_answer 必须润色成适合展示给考生的标准答案，不要机械照搬原始知识库片段。"
-                        "评分要稳健：同义表达、合理缩写和顺序差异可以酌情判对；明显漏点或错选要扣分。"
-                        "只返回 JSON，不要返回 Markdown。"
-                    )
-                ),
+                SystemMessage(content=prompt_manager.get("exam.answer_grading.system")),
                 HumanMessage(
-                    content=(
-                        f"题型：{_question_type_label(question['question_type'])}\n\n"
-                        f"题目：{question['prompt']}\n\n"
-                        f"系统保存的标准答案：{correct_answer}\n\n"
-                        f"参考答案：{question.get('reference_answer') or ''}\n\n"
-                        f"用户答案：{user_answer}\n\n"
-                        f"本题满分：{max_score}\n\n"
-                        "请返回 JSON："
-                        '{"score":0,"is_correct":false,"correct_answer":"润色后的标准答案",'
-                        '"hit_points":[],"missing_points":[],"wrong_points":[],"comment":""}'
+                    content=prompt_manager.render(
+                        "exam.answer_grading.user",
+                        question_type_label=_question_type_label(question["question_type"]),
+                        prompt=question["prompt"],
+                        correct_answer=correct_answer,
+                        reference_answer=question.get("reference_answer") or "",
+                        user_answer=user_answer,
+                        max_score=max_score,
                     )
                 ),
             ]
