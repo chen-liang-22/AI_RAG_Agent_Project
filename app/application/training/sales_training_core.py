@@ -10,12 +10,10 @@
 文件较大是因为一期先保证流程闭环，后续可以继续按资料、角色、会话、评分拆小。
 """
 
-import json
 from collections.abc import Iterator
 from datetime import date, datetime
-from typing import Any
 
-from fastapi import HTTPException, UploadFile
+from fastapi import UploadFile
 
 from app.infrastructure.repositories.document_repository import DocumentRepository
 from app.infrastructure.vector_store_service import VectorStoreService
@@ -40,14 +38,12 @@ from app.application.training_support.schemas import (
     TrainingKnowledgeVersionListResponse,
     TrainingSessionDetailResponse,
     TrainingSessionListResponse,
-    TrainingSessionSummaryResponse,
     TrainingKnowledgeChunkListResponse,
     TrainingKnowledgePreviewResponse,
     TrainingKnowledgeUploadResponse,
     TrainingScoreResponse,
     TrainingSessionResponse,
     TrainingSessionStartRequest,
-    TrainingTurnRecordResponse,
     TrainingTurnRequest,
     TrainingTurnResponse,
 )
@@ -438,101 +434,4 @@ class V2SalesTrainingCoreService:
         """结束训练并生成评分报告。"""
 
         return self.session_scoring_service.final_score(session_id, model_mode=model_mode)
-
-    @staticmethod
-    def _load_json(value: Any, default: Any) -> Any:
-        """安全读取 JSON 字段。
-
-        关系型数据库里 JSON 读出来可能是 str，也可能已是 dict/list。
-        但部分内部调用可能已经传入 dict/list，这里直接返回，减少重复 json.loads。
-        """
-
-        if not value:
-            return default
-        if isinstance(value, (dict, list)):
-            return value
-        if not isinstance(value, str):
-            return default
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return default
-
-    def _require_role_profile(self, profile_id: str) -> dict[str, Any]:
-        """查询 AI 角色画像，不存在时直接抛出 404。"""
-
-        profile = self.repository.get_role_profile(profile_id)
-        if not profile:
-            raise HTTPException(status_code=404, detail="AI 陪练角色不存在")
-        return profile
-
-    def _require_goal_setting(self, setting_id: str) -> dict[str, Any]:
-        """查询训练目标设置，不存在时直接抛出 404。"""
-
-        setting = self.repository.get_goal_setting(setting_id)
-        if not setting:
-            raise HTTPException(status_code=404, detail="训练设置不存在")
-        return setting
-
-    def _require_plan(self, plan_id: str) -> dict[str, Any]:
-        """查询训练方案，不存在时直接抛出 404。"""
-
-        plan = self.repository.get_plan(plan_id)
-        if not plan:
-            raise HTTPException(status_code=404, detail="训练方案不存在")
-        return plan
-
-    @staticmethod
-    def _session_response(row: dict[str, Any], opening_message: str | None = None) -> TrainingSessionResponse:
-        """把数据库训练会话行转换成接口响应对象。"""
-
-        return TrainingSessionResponse(
-            session_id=row["session_id"],
-            profile_id=row["profile_id"],
-            setting_id=row["setting_id"],
-            trainee_id=row["trainee_id"],
-            training_mode=row["training_mode"],
-            response_mode=row["response_mode"],
-            current_stage_no=int(row["current_stage_no"]),
-            status=row["status"],
-            round_limit=int(row["round_limit"]),
-            opening_message=opening_message,
-        )
-
-    @staticmethod
-    def _session_summary(row: dict[str, Any]) -> TrainingSessionSummaryResponse:
-        """把数据库会话行转换成前端历史摘要。"""
-
-        return TrainingSessionSummaryResponse(
-            session_id=row["session_id"],
-            trainee_id=row["trainee_id"],
-            training_mode=row["training_mode"],
-            response_mode=row["response_mode"],
-            status=row["status"],
-            round_limit=int(row["round_limit"]),
-            answered_count=int(row.get("answered_count") or 0),
-            total_score=row.get("total_score"),
-            level=row.get("level"),
-            started_at=_format_response_time(row["started_at"]),
-            ended_at=_format_response_time(row.get("ended_at")),
-            updated_at=_format_response_time(row["updated_at"]),
-        )
-
-    def _turn_record(self, row: dict[str, Any]) -> TrainingTurnRecordResponse:
-        """把数据库轮次行转换成复盘消息。"""
-
-        return TrainingTurnRecordResponse(
-            turn_id=row["turn_id"],
-            session_id=row["session_id"],
-            role=row["role"],
-            content=row["content"],
-            round_no=int(row["round_no"]),
-            stage_no=int(row["stage_no"]),
-            response_mode=row.get("response_mode"),
-            response_seconds=row.get("response_seconds"),
-            retrieved_chunk_ids=self._load_json(row.get("retrieved_chunk_ids_json"), []),
-            stage_decision=self._load_json(row.get("stage_decision_json"), {}),
-            coach_analysis=self._load_json(row.get("coach_analysis_json"), {}),
-            created_at=_format_response_time(row["created_at"]),
-        )
 

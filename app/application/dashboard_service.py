@@ -14,6 +14,7 @@ from app.infrastructure.repositories.document_repository import DocumentReposito
 from app.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from app.infrastructure.repositories.training_repository import V2TrainingRepository
 from app.application.training.sales_training_core import V2SalesTrainingCoreService
+from app.application.training.training_session_basic_service import TrainingSessionBasicService
 from app.shared.document_response import DictionaryCodeSnapshot, document_to_response
 from core.utils.logger_handler import logger
 from core.utils.qdrant_options import get_qdrant_client_options, get_qdrant_collection_name
@@ -101,7 +102,7 @@ class DashboardApplicationService:
             knowledge_files=knowledge_files,
             training_batches=[V2SalesTrainingCoreService._batch_response(row) for row in batches],
             training_plans=[V2SalesTrainingCoreService._plan_summary(row) for row in plans],
-            training_sessions=[V2SalesTrainingCoreService._session_summary(row) for row in sessions],
+            training_sessions=[TrainingSessionBasicService.session_summary(row) for row in sessions],
             recent_conversations=recent_conversations,
             metrics={
                 "document_total": len(documents),
