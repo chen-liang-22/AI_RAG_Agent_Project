@@ -75,6 +75,7 @@ from app.application.training_support.schemas import (
 from app.application.training.training_query_service import TrainingQueryService
 from app.application.training.training_goal_setting_service import TrainingGoalSettingService
 from app.application.training.training_role_service import TrainingRoleService
+from app.application.training.training_session_prompt_service import TrainingSessionPromptService
 from app.application.training.training_score_service import TrainingScoreService
 from core.utils.database_connection import DatabaseErrorTypes
 from core.utils.logger_handler import logger
@@ -161,6 +162,8 @@ class V2SalesTrainingCoreService:
         self.role_service = TrainingRoleService()
         # 训练目标生成同样拆成纯逻辑服务，避免核心编排类继续堆积提示词和兜底模板。
         self.goal_setting_service = TrainingGoalSettingService()
+        # 会话提示词和兜底话术拆到独立服务，核心外观继续负责仓库读写和流式编排。
+        self.session_prompt_service = TrainingSessionPromptService()
         logger.info(
             "[销售训练] 核心服务初始化完成 正式Collection=%s 临时Collection=%s",
             self.training_collection_name,
@@ -2517,37 +2520,20 @@ class V2SalesTrainingCoreService:
 
         profile = self._require_role_profile(session["profile_id"])
         setting = self._require_goal_setting(session["setting_id"])
-        role_profile = self._load_json(profile.get("role_profile_json"), {})
-        hidden_profile = self._load_json(profile.get("hidden_profile_json"), {})
-        stages = self._load_json(setting.get("stages_json"), [])
-        return prompt_manager.render(
-            "training.opening_message.user",
-            role_profile_json=json.dumps(role_profile, ensure_ascii=False, indent=2),
-            hidden_profile_json=json.dumps(hidden_profile, ensure_ascii=False, indent=2),
-            stages_json=json.dumps(stages, ensure_ascii=False, indent=2),
-        )
+        return self.session_prompt_service.opening_prompt(profile, setting)
 
     def _customer_prompt(self, session: dict[str, Any], trainee_message: str, evidence: list[dict[str, Any]]) -> str:
         """构造每轮 AI 客户回复提示词。"""
 
         profile = self._require_role_profile(session["profile_id"])
         setting = self._require_goal_setting(session["setting_id"])
-        role_profile = self._load_json(profile.get("role_profile_json"), {})
-        hidden_profile = self._load_json(profile.get("hidden_profile_json"), {})
-        stages = self._load_json(setting.get("stages_json"), [])
         turns = self.repository.list_turns(session["session_id"])[-10:]
-        return prompt_manager.render(
-            "training.customer_reply.user",
-            role_profile_json=json.dumps(role_profile, ensure_ascii=False, indent=2),
-            hidden_profile_json=json.dumps(hidden_profile, ensure_ascii=False, indent=2),
-            stages_json=json.dumps(stages, ensure_ascii=False, indent=2),
-            recent_turns_json=json.dumps(
-                [{"role": item["role"], "content": item["content"]} for item in turns],
-                ensure_ascii=False,
-                indent=2,
-            ),
+        return self.session_prompt_service.customer_prompt(
+            profile,
+            setting,
+            turns=turns,
             trainee_message=trainee_message,
-            evidence_json=json.dumps(evidence, ensure_ascii=False, indent=2),
+            evidence=evidence,
         )
 
     def _score_prompt(
@@ -2559,25 +2545,13 @@ class V2SalesTrainingCoreService:
     ) -> str:
         """构造最终评分报告提示词。"""
 
-        scoring_rules = self._load_json(setting.get("scoring_rules_json"), self._default_scoring_rules())
-        return prompt_manager.render(
-            "training.score_report.user",
-            role_profile_json=profile.get("role_profile_json"),
-            stages_json=setting.get("stages_json"),
-            scoring_rules_json=json.dumps(scoring_rules, ensure_ascii=False, indent=2),
-            conversation_json=json.dumps(
-                [{"round_no": item["round_no"], "role": item["role"], "content": item["content"]} for item in turns],
-                ensure_ascii=False,
-                indent=2,
-            ),
-            evidence_json=json.dumps(evidence, ensure_ascii=False, indent=2),
-        )
+        return self.session_prompt_service.score_prompt(profile, setting, turns=turns, evidence=evidence)
 
     @staticmethod
     def _conversation_text(turns: list[dict[str, Any]]) -> str:
         """把训练对话轮次拼成评分和证据检索使用的纯文本。"""
 
-        return "\n".join(f"{item['role']}：{item['content']}" for item in turns)
+        return TrainingSessionPromptService.conversation_text(turns)
 
     @staticmethod
     def _fallback_polished_scenario(request: ScenarioPolishRequest) -> str:
@@ -2612,19 +2586,13 @@ class V2SalesTrainingCoreService:
     def _fallback_customer_reply(evidence: list[dict[str, Any]]) -> str:
         """AI 客户回复失败时的兜底话术。"""
 
-        if evidence:
-            return "你说的方向我能理解，不过我更关心实际效果和投入风险。你能结合类似客户案例，具体说说为什么这个方案适合我吗？"
-        return "我先听听你的思路，但我比较关注投入产出和落地风险，你别只讲概念。"
+        return TrainingSessionPromptService.fallback_customer_reply(evidence)
 
     def _fallback_opening_message(self, session: dict[str, Any]) -> str:
         """AI 客户开场白失败时的兜底话术。"""
 
         profile = self._require_role_profile(session["profile_id"])
-        role_profile = self._load_json(profile.get("role_profile_json"), {})
-        position = role_profile.get("position") or "业务负责人"
-        pain_points = role_profile.get("business_pain_points") or ["投入产出和落地风险"]
-        first_pain = str(pain_points[0]) if pain_points else "投入产出和落地风险"
-        return f"我是这边的{position}。你可以先简单讲讲方案，不过我更关心{first_pain}，如果只是概念性的介绍，可能很难推动内部继续评估。"
+        return self.session_prompt_service.fallback_opening_message(profile)
 
     @staticmethod
     def _fallback_score(turns: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> dict:
