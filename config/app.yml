@@ -34,7 +34,7 @@ rag:
   embedding_model_name: text-embedding-v4
 
   # 聊天路由模式。
-  # app_v2/application/chat_generation_service.py 会读取该值决定走 direct_rag 还是 Agent。
+  # app/application/chat_generation_service.py 会读取该值决定走 direct_rag 还是 Agent。
   # direct_rag：直接 RAG 检索并生成最终回答，链路短、响应快。
   # agent/react_agent/legacy_agent：走 LangGraph ReAct Agent 工具链，适合需要工具编排的旧流程。
   chat_route_mode: agent
@@ -131,7 +131,7 @@ agent:
 
 id_generator:
   # 是否启用雪花算法主键生成器。
-  # true 时 app_v2/infrastructure/id_generator.py 生成趋势递增的长整型 ID。
+  # true 时 app/infrastructure/id_generator.py 生成趋势递增的长整型 ID。
   enabled: true
 
   # 雪花算法起始时间。
@@ -148,7 +148,7 @@ id_generator:
 
 knowledge_manifest:
   # data/ 内置知识文件的默认入库配置。
-  # app_v2/application/knowledge/indexing_service.py 同步 data 目录时使用。
+  # app/application/knowledge/indexing_service.py 同步 data 目录时使用。
   defaults:
     # 默认写入的 Qdrant collection。
     collection_name: agent

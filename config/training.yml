@@ -17,7 +17,7 @@ collections:
 
 lms_case:
   # LMS 场景案例标题识别正则。
-  # app_v2/application/training_support/strategies/knowledge_ingest_strategy.py 用它识别“一、客户案例”这类案例起点。
+  # app/application/training_support/strategies/knowledge_ingest_strategy.py 用它识别“一、客户案例”这类案例起点。
   case_title_pattern: "^[一二三四五六七八九十]+[、.．]\\s*.+"
 
   # 业务片段关键词配置。

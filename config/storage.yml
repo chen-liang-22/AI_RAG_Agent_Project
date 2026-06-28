@@ -184,7 +184,7 @@ qdrant:
   parallel_query_workers: 4
 
   # 内置知识库文件目录。
-  # app_v2/application/knowledge/indexing_service.py 同步 data/ 文件时使用。
+  # app/application/knowledge/indexing_service.py 同步 data/ 文件时使用。
   data_path: data
 
   # 允许入库和上传预览的知识文件扩展名。

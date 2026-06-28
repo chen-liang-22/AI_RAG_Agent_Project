@@ -12,7 +12,7 @@ Deployable FastAPI service for a LangChain ReAct agent with Qdrant-backed RAG.
 
 ```text
 api/                 # FastAPI 启动入口，保留 api.main:app
-app_v2/
+app/
   api/               # 路由层
   application/       # 业务服务层
   domain/            # ORM 实体、请求响应 schema、常量
@@ -29,7 +29,7 @@ scripts/             # 维护脚本
 tests/               # 后端测试
 ```
 
-`api` 只作为启动门面保留，真实业务入口统一在 `app_v2`，可复用的 RAG、模型和工具能力统一在 `core`。
+`api` 只作为启动门面保留，真实业务入口统一在 `app`，可复用的 RAG、模型和工具能力统一在 `core`。
 
 ## Environment
 

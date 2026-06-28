@@ -63,7 +63,7 @@ knowledge:
 
 knowledge_upload:
   # 知识库上传预览阶段的文档切分策略推荐提示词。
-  # 使用位置：app_v2/application/knowledge/upload_preview_service.py
+  # 使用位置：app/application/knowledge/upload_preview_service.py
   # 作用：用户正式确认入库前，让模型根据样本文本推荐 document_type 和 split_strategy。
   # 变量：
   # - {document_type_options}：数据库字典中启用的文档结构类型枚举。
@@ -181,7 +181,7 @@ agent:
 
 training:
   # 销售训练资料 LLM 兜底切分。
-  # 使用位置：app_v2/application/training_support/llm_ingest.py
+  # 使用位置：app/application/training_support/llm_ingest.py
   # 作用：规则切分质量低或用户手动重切时，让模型把原始销售训练资料抽取成结构化切片。
   # 变量：
   # - {max_cases}：最多抽取的案例数量。
@@ -229,21 +229,21 @@ training:
       {source_text}
 
   # 销售训练 JSON 生成通用系统提示词。
-  # 使用位置：app_v2/application/training/sales_training_core.py
+  # 使用位置：app/application/training/sales_training_core.py
   # 作用：角色生成、场景润色、补充问题、目标和评分规则等 JSON 任务共用。
   # 变量：无。
   json_only_system: |
     请只输出 JSON。
 
   # 销售训练 AI 客户扮演通用系统提示词。
-  # 使用位置：app_v2/application/training/sales_training_core.py
+  # 使用位置：app/application/training/sales_training_core.py
   # 作用：AI 客户开场白、流式回复和一次性回复共用。
   # 变量：无。
   ai_customer_system: |
     你是销售训练中的 AI 客户。
 
   # AI 陪练角色生成提示词。
-  # 使用位置：app_v2/application/training/sales_training_core.py::_role_prompt
+  # 使用位置：app/application/training/sales_training_core.py::_role_prompt
   # 作用：根据学员画像、客户画像字段、场景和训练知识生成 AI 客户角色。
   # 变量：
   # - {trainee_json}：学员画像 JSON。
@@ -325,7 +325,7 @@ training:
       {evidence_json}
 
   # 销售训练场景描述润色提示词。
-  # 使用位置：app_v2/application/training/sales_training_core.py::_scenario_polish_prompt
+  # 使用位置：app/application/training/sales_training_core.py::_scenario_polish_prompt
   # 作用：把用户输入的原始场景描述润色成训练配置页可展示的业务场景。
   # 变量：
   # - {profile_type}：画像类型。
@@ -363,7 +363,7 @@ training:
       {extra_details}
 
   # 补充问答选择题生成提示词。
-  # 使用位置：app_v2/application/training/sales_training_core.py::_supplement_questions_prompt
+  # 使用位置：app/application/training/sales_training_core.py::_supplement_questions_prompt
   # 作用：AI 角色生成前，基于客户画像、学员画像和训练知识生成 1-5 道补充选择题。
   # 变量：
   # - {trainee_json}：学员画像 JSON。
@@ -419,7 +419,7 @@ training:
       {evidence_json}
 
   # 开放式训练目标和评分规则生成提示词。
-  # 使用位置：app_v2/application/training/sales_training_core.py::_goal_prompt
+  # 使用位置：app/application/training/sales_training_core.py::_goal_prompt
   # 作用：根据 AI 客户角色和隐藏顾虑，生成训练目标、阶段和评分维度。
   # 变量：
   # - {role_profile_json}：AI 客户角色 JSON。
@@ -480,7 +480,7 @@ training:
       {hidden_profile_json}
 
   # AI 客户开场白提示词。
-  # 使用位置：app_v2/application/training/sales_training_core.py::_opening_prompt
+  # 使用位置：app/application/training/sales_training_core.py::_opening_prompt
   # 作用：训练会话开始时生成客户第一句话。
   # 变量：
   # - {role_profile_json}：AI 客户角色 JSON。
@@ -507,7 +507,7 @@ training:
       {stages_json}
 
   # AI 客户每轮回复提示词。
-  # 使用位置：app_v2/application/training/sales_training_core.py::_customer_prompt
+  # 使用位置：app/application/training/sales_training_core.py::_customer_prompt
   # 作用：根据角色、隐藏顾虑、最近对话和本轮证据生成客户回复。
   # 变量：
   # - {role_profile_json}：AI 客户角色 JSON。
@@ -546,7 +546,7 @@ training:
       {evidence_json}
 
   # 销售训练最终评分报告提示词。
-  # 使用位置：app_v2/application/training/sales_training_core.py::_score_prompt
+  # 使用位置：app/application/training/sales_training_core.py::_score_prompt
   # 作用：训练结束后，根据完整对话、评分规则和知识证据生成评分报告。
   # 变量：
   # - {role_profile_json}：AI 客户角色 JSON 字符串。
@@ -584,7 +584,7 @@ training:
 
 exam:
   # 考试命题提示词。
-  # 使用位置：app_v2/application/exam_service.py::_generate_question_with_model
+  # 使用位置：app/application/exam_service.py::_generate_question_with_model
   # 作用：把知识库中的原始 QA 改写成正式考试题。
   # 变量：
   # - {question_type_label}：题型中文名，例如“单选题”“简答题”。
@@ -620,7 +620,7 @@ exam:
       {extra_requirement}
 
   # 考试阅卷提示词。
-  # 使用位置：app_v2/application/exam_service.py::_model_answer_analysis
+  # 使用位置：app/application/exam_service.py::_model_answer_analysis
   # 作用：根据题目、标准答案、参考答案和用户答案给出得分与点评。
   # 变量：
   # - {question_type_label}：题型中文名。

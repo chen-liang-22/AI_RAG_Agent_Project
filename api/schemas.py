@@ -1,7 +1,7 @@
 """通用 API 请求和响应模型。
 
 这里主要放聊天、知识库、字典、首页等接口 DTO。
-业务逻辑在 app_v2/application 中，schema 文件只负责参数校验和 OpenAPI 文档生成。
+业务逻辑在 app/application 中，schema 文件只负责参数校验和 OpenAPI 文档生成。
 """
 
 from pydantic import BaseModel, Field

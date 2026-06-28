@@ -150,8 +150,8 @@ def _warmup_services() -> None:
     """
 
     # 延迟导入可以避免模块加载时就触发模型和向量库初始化，只有真正预热时才执行。
-    from app_v2.application.chat_generation_service import _get_knowledge_answer_service
-    from app_v2.infrastructure.repositories.bootstrap import bootstrap_v2_metadata
+    from app.application.chat_generation_service import _get_knowledge_answer_service
+    from app.infrastructure.repositories.bootstrap import bootstrap_v2_metadata
 
     bootstrap_v2_metadata()
     service = _get_knowledge_answer_service()

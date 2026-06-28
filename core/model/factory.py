@@ -15,7 +15,7 @@ from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.embeddings import Embeddings
 from langchain_openai import ChatOpenAI
 
-from app_v2.infrastructure.repositories.dictionary_repository import DictionaryRepository
+from app.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from core.utils.config_handler import rag_conf
 from core.utils.logger_handler import logger
 

@@ -28,11 +28,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app_v2.domain.entities import DocumentEntity, TrainingKnowledgeBatchEntity
-from app_v2.infrastructure.file_storage_service import get_file_storage_service
-from app_v2.infrastructure.orm_session import orm_session_context
-from app_v2.infrastructure.repositories.document_repository import DocumentRepository
-from app_v2.application.training_support.repository import TrainingRepository
+from app.domain.entities import DocumentEntity, TrainingKnowledgeBatchEntity
+from app.infrastructure.file_storage_service import get_file_storage_service
+from app.infrastructure.orm_session import orm_session_context
+from app.infrastructure.repositories.document_repository import DocumentRepository
+from app.application.training_support.repository import TrainingRepository
 from core.utils.logger_handler import logger
 
 

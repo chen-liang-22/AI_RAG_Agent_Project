@@ -24,7 +24,7 @@ from langchain_core.documents import Document
 from core.rag.services.query_planner_service import QueryPlannerService
 from core.rag.query_pipeline import QueryAnalysis
 from core.rag.reranker import RuleBasedReranker
-from app_v2.infrastructure.vector_store_service import VectorStoreService
+from app.infrastructure.vector_store_service import VectorStoreService
 from core.utils.config_handler import qdrant_conf, rag_conf
 from core.utils.logger_handler import logger
 from core.utils.qdrant_options import normalize_qdrant_collection_name
