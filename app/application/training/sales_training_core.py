@@ -64,6 +64,7 @@ from app.application.training.training_knowledge_service import TrainingKnowledg
 from app.application.training.training_plan_domain_service import TrainingPlanDomainService
 from app.application.training.training_session_basic_service import TrainingSessionBasicService
 from app.application.training.training_session_prompt_service import TrainingSessionPromptService
+from app.application.training.training_session_scoring_service import TrainingSessionScoringService
 from app.application.training.training_session_turn_service import TrainingSessionTurnService
 from app.application.training.training_score_service import TrainingScoreService
 from core.utils.logger_handler import logger
@@ -168,6 +169,12 @@ class V2SalesTrainingCoreService:
         )
         # 会话对话提交和 SSE 流式回复拆到会话对话服务；最终评分后续单独拆。
         self.session_turn_service = TrainingSessionTurnService(
+            repository=self.repository,
+            query_service=self.query_service,
+            session_prompt_service=self.session_prompt_service,
+        )
+        # 最终评分拆到会话评分服务，核心服务只保留对外入口和跨模块编排。
+        self.session_scoring_service = TrainingSessionScoringService(
             repository=self.repository,
             query_service=self.query_service,
             session_prompt_service=self.session_prompt_service,
@@ -583,80 +590,9 @@ class V2SalesTrainingCoreService:
         yield from self.session_turn_service.stream_turn(session_id, request)
 
     def final_score(self, session_id: str, model_mode: str | None = None) -> TrainingScoreResponse:
-        """结束训练并生成评分报告。
+        """结束训练并生成评分报告。"""
 
-        注意这里先查 session，再查已有评分：
-        已完成会话重复点击“生成评分”时直接返回已有报告，避免重复写入评分记录。
-        """
-
-        session = self.repository.get_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="训练会话不存在")
-        existing_score = self.repository.get_latest_score_by_session(session_id)
-        if existing_score and session["status"] == "completed":
-            logger.info("[销售训练] 训练评分已存在，直接返回 会话编号=%s", session_id)
-            return self._score_response(existing_score)
-        if session["status"] not in {"active", "scoring"}:
-            raise HTTPException(status_code=400, detail=f"当前训练状态不允许评分：{session['status']}")
-
-        turns = self.repository.list_turns(session_id)
-        if not any(turn["role"] == "trainee" for turn in turns):
-            raise HTTPException(status_code=400, detail="没有学员回复，不能评分")
-
-        setting = self._require_goal_setting(session["setting_id"])
-        profile = self._require_role_profile(session["profile_id"])
-        conversation_text = self._conversation_text(turns)
-        logger.info(
-            "[销售训练][评分] 开始生成评分 会话编号=%s 模型档位=%s 对话轮次=%s 对话长度=%s",
-            session_id,
-            model_mode or "默认",
-            len(turns),
-            len(conversation_text),
-        )
-        evidence = self._search_training_evidence(conversation_text, visibility=("visible", "scoring_only"), k=6)
-        logger.info(
-            "[销售训练][评分] 评分证据召回完成 会话编号=%s 证据数量=%s 命中切片=%s",
-            session_id,
-            len(evidence),
-            self._join_values(item.get("chunk_id") for item in evidence),
-        )
-        result = self._invoke_json(
-            self._score_prompt(profile, setting, turns, evidence),
-            model_mode=model_mode,
-            fallback=self._fallback_score(turns, evidence),
-            task_name="训练评分报告生成",
-        )
-
-        general_score = int(max(0, min(40, result.get("general_score") or 32)))
-        stage_score = int(max(0, min(60, result.get("stage_score") or 43)))
-        penalty_score = int(max(0, min(20, result.get("penalty_score") or 0)))
-        # 最终得分以后端公式为准，不直接相信 LLM 返回的 total_score。
-        final_score = int(max(0, min(100, general_score + stage_score - penalty_score)))
-        level = self._score_level(final_score)
-        report = {
-            "hit_points": result.get("hit_points") or [],
-            "missing_points": result.get("missing_points") or [],
-            "wrong_points": result.get("wrong_points") or [],
-            "evidence_refs": result.get("evidence_refs") or [],
-            "improvement_advice": result.get("improvement_advice") or "",
-            "reference_script": result.get("reference_script") or "",
-            "next_training_plan": result.get("next_training_plan") or [],
-            "scoring_rules": self._load_json(setting.get("scoring_rules_json"), self._default_scoring_rules()),
-        }
-        score = self.repository.save_score(
-            session_id=session_id,
-            general_score=general_score,
-            stage_score=stage_score,
-            penalty_score=penalty_score,
-            final_score=final_score,
-            level=level,
-            is_passed=final_score >= 75,
-            detail=report,
-            review_status="confirmed",
-        )
-        self.repository.update_session_status(session_id, status="completed", total_score=final_score, level=level, report=report)
-        logger.info("[销售训练] 训练评分完成 会话编号=%s 得分=%s 等级=%s", session_id, final_score, level)
-        return self._score_response(score)
+        return self.session_scoring_service.final_score(session_id, model_mode=model_mode)
 
     def _search_training_evidence(self, query: str, *, visibility: tuple[str, ...], k: int) -> list[dict[str, Any]]:
         """检索训练证据库，并过滤学员不可直接看到的内容。"""
@@ -910,21 +846,6 @@ class V2SalesTrainingCoreService:
             created_at=_format_response_time(row["created_at"]),
         )
 
-    def _score_response(self, row: dict[str, Any]) -> TrainingScoreResponse:
-        """把数据库评分行转换成评分响应。"""
-
-        return TrainingScoreResponse(
-            score_id=row["score_id"],
-            session_id=row["session_id"],
-            total_score=int(row["final_score"]),
-            level=row["level"],
-            is_passed=bool(row["is_passed"]),
-            general_score=int(row["general_score"]),
-            stage_score=int(row["stage_score"]),
-            penalty_score=int(row["penalty_score"]),
-            report=self._load_json(row.get("detail_json"), {}),
-        )
-
     def _normalize_scoring_rules(
             self,
             raw_rules: Any,
@@ -994,23 +915,6 @@ class V2SalesTrainingCoreService:
 
         return self.goal_setting_service.goal_prompt(profile)
 
-    def _score_prompt(
-            self,
-            profile: dict[str, Any],
-            setting: dict[str, Any],
-            turns: list[dict[str, Any]],
-            evidence: list[dict[str, Any]],
-    ) -> str:
-        """构造最终评分报告提示词。"""
-
-        return self.session_prompt_service.score_prompt(profile, setting, turns=turns, evidence=evidence)
-
-    @staticmethod
-    def _conversation_text(turns: list[dict[str, Any]]) -> str:
-        """把训练对话轮次拼成评分和证据检索使用的纯文本。"""
-
-        return TrainingSessionPromptService.conversation_text(turns)
-
     @staticmethod
     def _fallback_polished_scenario(request: ScenarioPolishRequest) -> str:
         """模型润色失败时的本地兜底文案。
@@ -1039,19 +943,4 @@ class V2SalesTrainingCoreService:
         """训练目标生成失败时的本地兜底结果。"""
 
         return TrainingGoalSettingService.fallback_goal(profile)
-
-    @staticmethod
-    def _fallback_score(turns: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> dict:
-        """评分模型失败时的兜底评分。
-
-        兜底分只用于保证流程闭环，真实评分仍应优先使用 LLM 按评分规则判断。
-        """
-
-        return TrainingScoreService.fallback_score(turns, evidence)
-
-    @staticmethod
-    def _score_level(score: int) -> str:
-        """把最终得分转换成中文等级。"""
-
-        return TrainingScoreService.score_level(score)
 

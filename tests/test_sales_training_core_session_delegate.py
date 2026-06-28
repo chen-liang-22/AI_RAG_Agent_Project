@@ -68,6 +68,18 @@ class FakeSessionTurnService:
         return iter(["event: done\ndata: {}\n\n"])
 
 
+class FakeSessionScoringService:
+    """记录核心外观是否把最终评分入口委托给会话评分服务。"""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.calls = []
+
+    def final_score(self, session_id: str, model_mode: str | None = None):
+        self.calls.append(("final_score", session_id, model_mode))
+        return "score-result"
+
+
 def _patch_core_dependencies(monkeypatch):
     """替换核心外观的重依赖，专注验证委托边界。"""
 
@@ -78,6 +90,7 @@ def _patch_core_dependencies(monkeypatch):
     monkeypatch.setattr(sales_training_core, "TrainingPlanDomainService", FakePlanService)
     monkeypatch.setattr(sales_training_core, "TrainingSessionBasicService", FakeSessionBasicService)
     monkeypatch.setattr(sales_training_core, "TrainingSessionTurnService", FakeSessionTurnService)
+    monkeypatch.setattr(sales_training_core, "TrainingSessionScoringService", FakeSessionScoringService)
 
 
 def test_core_delegates_session_basic_methods(monkeypatch):
@@ -111,4 +124,17 @@ def test_core_delegates_session_turn_methods(monkeypatch):
     assert core_service.session_turn_service.calls == [
         ("submit_turn", "session_1", turn_request),
         ("stream_turn", "session_1", turn_request),
+    ]
+
+
+def test_core_delegates_session_scoring_methods(monkeypatch):
+    """最终评分入口应委托给 TrainingSessionScoringService。"""
+
+    _patch_core_dependencies(monkeypatch)
+
+    core_service = sales_training_core.V2SalesTrainingCoreService()
+
+    assert core_service.final_score("session_1", model_mode="fast") == "score-result"
+    assert core_service.session_scoring_service.calls == [
+        ("final_score", "session_1", "fast"),
     ]
