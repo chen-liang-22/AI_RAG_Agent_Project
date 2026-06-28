@@ -145,6 +145,14 @@ class RagSummarizeService(object):
             self._format_query_lines(search_queries),
         )
         logger.info("[RAG精排] 最终上下文=%s", self._summarize_documents_for_log(reranked_docs))
+        self._log_observability_summary(
+            trace_id=trace_id,
+            collection_name=normalize_qdrant_collection_name(collection_name),
+            query_count=len(search_queries),
+            retrieved_count=sum(len(documents) for _, documents in candidate_groups),
+            reranked_count=len(reranked_docs),
+            total_ms=self._elapsed_ms(total_start_time),
+        )
         logger.info(
             "[性能] RAG检索精排总耗时 追踪编号=%s 耗时毫秒=%.2f",
             trace_id,
@@ -612,6 +620,28 @@ class RagSummarizeService(object):
         if not queries:
             return "无"
         return "\n".join(f"第{index}个：{query}" for index, query in enumerate(queries, start=1))
+
+    @staticmethod
+    def _log_observability_summary(
+            *,
+            trace_id: str | None,
+            collection_name: str,
+            query_count: int,
+            retrieved_count: int,
+            reranked_count: int,
+            total_ms: float,
+    ) -> None:
+        """输出 RAG 链路核心观测字段，便于按 trace_id 定位慢点和召回质量。"""
+
+        logger.info(
+            "[可观测性] RAG链路汇总 追踪编号=%s Collection=%s 检索问题数=%s 候选资料数=%s 最终资料数=%s 总耗时毫秒=%.2f",
+            trace_id,
+            collection_name,
+            query_count,
+            retrieved_count,
+            reranked_count,
+            total_ms,
+        )
 
     def _keyword_retrieve(self, analysis: QueryAnalysis, limit: int) -> list[Document]:
         """旧版关系型数据库关键词补充召回入口。

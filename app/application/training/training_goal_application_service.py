@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import HTTPException
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.application.training.goal_stage_adapter import GoalStageAdapter
 from app.application.training.training_goal_setting_service import TrainingGoalSettingService
 from app.application.training.training_score_service import TrainingScoreService
 from app.application.training_support.repository import TrainingRepository
@@ -70,9 +71,10 @@ class TrainingGoalApplicationService:
             task_name="训练阶段和评分规则生成",
         )
         round_limit = self.normalize_round_limit(result.get("round_limit"))
-        stages = result.get("stages") or []
-        if not stages:
-            stages = fallback["stages"]
+        stages = GoalStageAdapter.normalize_stages(
+            result.get("stages"),
+            fallback_stages=fallback["stages"],
+        )
         scoring_rules = TrainingScoreService.normalize_scoring_rules(result.get("scoring_rules"), stages[:1], profile)
 
         saved = self.repository.save_goal_setting(
@@ -117,7 +119,10 @@ class TrainingGoalApplicationService:
     def goal_response(self, row: dict[str, Any]) -> GoalSettingResponse:
         """把数据库训练设置行转换成 Pydantic 响应。"""
 
-        stages = [GoalStage(**item) for item in self.load_json(row.get("stages_json"), [])]
+        stages = [
+            GoalStage(**item)
+            for item in GoalStageAdapter.normalize_stages(self.load_json(row.get("stages_json"), []))
+        ]
         return GoalSettingResponse(
             setting_id=row["setting_id"],
             profile_id=row["profile_id"],

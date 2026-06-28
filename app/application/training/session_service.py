@@ -38,7 +38,12 @@ class TrainingSessionApplicationService:
     def start_session(self, request: TrainingSessionStartRequest) -> TrainingSessionResponse:
         """开始训练会话。"""
 
-        logger.info("[V2销售训练-会话] 开始训练会话 方案编号=%s 学员编号=%s", request.plan_id, request.trainee_id)
+        logger.info(
+            "[V2销售训练-会话] 开始训练会话 角色编号=%s 设置编号=%s 学员编号=%s",
+            request.profile_id,
+            request.setting_id,
+            request.trainee_id,
+        )
         return self.core_service.start_session(request)
 
     def list_sessions(self, *, page: int, page_size: int, trainee_id: str | None = None) -> TrainingSessionListResponse:

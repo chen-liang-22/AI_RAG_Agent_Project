@@ -307,9 +307,20 @@ class TrainingKnowledgeService:
         if not document_id:
             return self.delete_legacy_batch_without_document(batch_id)
 
-        self.asset_service.delete_document_asset(document_id)
-        logger.info("[销售训练] 训练资料已删除 批次编号=%s 文档编号=%s", batch_id, document_id)
-        return TrainingKnowledgeDeleteResponse(status="deleted", batch_id=batch_id)
+        result = self.asset_service.delete_document_asset(document_id)
+        logger.info(
+            "[销售训练] 训练资料删除完成 批次编号=%s 文档编号=%s 状态=%s",
+            batch_id,
+            document_id,
+            result.status,
+        )
+        return TrainingKnowledgeDeleteResponse(
+            status=result.status,
+            batch_id=batch_id,
+            document_id=document_id,
+            resource_results=result.resource_results,
+            errors=result.errors,
+        )
 
     def delete_legacy_batch_without_document(self, batch_id: str) -> TrainingKnowledgeDeleteResponse:
         """删除没有 document_id 的历史训练批次。"""
@@ -322,7 +333,14 @@ class TrainingKnowledgeService:
             batch_id,
             deleted_batch,
         )
-        return TrainingKnowledgeDeleteResponse(status="deleted", batch_id=batch_id)
+        return TrainingKnowledgeDeleteResponse(
+            status="deleted",
+            batch_id=batch_id,
+            resource_results={
+                "qdrant": {"status": "deleted", "batch_id": batch_id},
+                "mysql": {"status": "deleted" if deleted_batch else "not_found", "deleted_batch": deleted_batch},
+            },
+        )
 
     def publish_batch(self, batch_id: str) -> TrainingKnowledgePublishResponse:
         """人工确认发布训练资料。"""

@@ -37,10 +37,11 @@ class KnowledgeAnswerService:
             history: list[dict] | None = None,
             model_mode: str | None = None,
             collection_name: str | None = None,
+            trace_id: str | None = None,
     ) -> str:
         """一次性生成知识库问答结果。"""
 
-        trace_id = self._new_trace_id()
+        trace_id = trace_id or self._new_trace_id()
         total_start_time = time.perf_counter()
         selected_model = get_chat_model(model_mode)
         selected_model_mode = normalize_chat_model_mode(model_mode)
@@ -85,10 +86,11 @@ class KnowledgeAnswerService:
             history: list[dict] | None = None,
             model_mode: str | None = None,
             collection_name: str | None = None,
+            trace_id: str | None = None,
     ) -> Iterator[str]:
         """流式生成知识库问答结果。"""
 
-        trace_id = self._new_trace_id()
+        trace_id = trace_id or self._new_trace_id()
         total_start_time = time.perf_counter()
         selected_model = get_chat_model(model_mode)
         selected_model_mode = normalize_chat_model_mode(model_mode)

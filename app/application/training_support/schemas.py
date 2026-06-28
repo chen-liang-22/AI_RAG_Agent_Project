@@ -80,8 +80,11 @@ class TrainingKnowledgePreviewResponse(BaseModel):
 class TrainingKnowledgeDeleteResponse(BaseModel):
     """训练资料删除响应。"""
 
-    status: str  # 固定返回 deleted。
+    status: str  # deleted/delete_failed/not_found。
     batch_id: str  # 被删除的训练资料批次 ID。
+    document_id: str | None = None  # 训练批次关联的 documents 文件 ID；历史批次可能为空。
+    resource_results: dict = Field(default_factory=dict)  # 各类资源删除结果：qdrant/minio/redis/mysql。
+    errors: list[dict[str, str]] = Field(default_factory=list)  # 失败资源和错误原因，供补偿删除排查。
 
 
 class TrainingKnowledgePublishResponse(BaseModel):

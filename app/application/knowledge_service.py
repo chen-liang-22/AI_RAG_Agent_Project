@@ -265,7 +265,12 @@ class KnowledgeApplicationService:
 
         logger.info("[V2知识资产] 删除文件资产 文档编号=%s", document_id)
         result = DocumentAssetService(document_repository=self.document_repository).delete_document_asset(document_id)
-        return KnowledgeDeleteResponse(status="deleted", document_id=result.document_id)
+        return KnowledgeDeleteResponse(
+            status=result.status,
+            document_id=result.document_id,
+            resource_results=result.resource_results,
+            errors=result.errors,
+        )
 
     def reindex_file(self, document_id: str) -> KnowledgeFileResponse:
         """重新解析并索引单个文件。"""

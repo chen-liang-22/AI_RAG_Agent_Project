@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from app.application.training.goal_stage_adapter import GoalStageAdapter
 from app.application.training.training_score_service import TrainingScoreService
 from app.application.training_support.repository import TrainingRepository
 from app.application.training_support.schemas import (
@@ -234,7 +235,10 @@ class TrainingPlanDomainService:
     def goal_response(self, row: dict[str, Any]) -> GoalSettingResponse:
         """把数据库训练设置行转换成 Pydantic 响应。"""
 
-        stages = [GoalStage(**item) for item in self.load_json(row.get("stages_json"), [])]
+        stages = [
+            GoalStage(**item)
+            for item in GoalStageAdapter.normalize_stages(self.load_json(row.get("stages_json"), []))
+        ]
         return GoalSettingResponse(
             setting_id=row["setting_id"],
             profile_id=row["profile_id"],

@@ -6,6 +6,7 @@
 
 import json
 import time
+import uuid
 from datetime import date, datetime
 from collections.abc import Iterator
 
@@ -102,12 +103,14 @@ class ChatApplicationService:
         """一次性聊天接口业务流程。"""
 
         request_start_time = time.perf_counter()
+        trace_id = self._new_trace_id()
         conversation_id, history = _prepare_chat_conversation(request)
         selected_model_mode = normalize_chat_model_mode(request.model_mode)
         selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
         selected_collection_name = normalize_qdrant_collection_name(request.collection_name)
         logger.info(
-            "[V2聊天] 非流式请求准备完成 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f 历史消息数=%s",
+            "[V2聊天] 非流式请求准备完成 追踪编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f 历史消息数=%s",
+            trace_id,
             conversation_id,
             selected_collection_name,
             selected_model_mode,
@@ -119,7 +122,8 @@ class ChatApplicationService:
         use_direct_rag, route_reason = _should_use_direct_rag(request.message)
         if use_direct_rag:
             logger.info(
-                "[V2聊天] 非流式路由=知识直答 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+                "[V2聊天] 非流式路由=知识直答 追踪编号=%s 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+                trace_id,
                 route_reason,
                 request.user_id,
                 conversation_id,
@@ -130,6 +134,7 @@ class ChatApplicationService:
                 history=history,
                 model_mode=request.model_mode,
                 collection_name=selected_collection_name,
+                trace_id=trace_id,
             )
             total_ms = self._elapsed_ms(request_start_time)
             _save_chat_exchange(
@@ -138,6 +143,7 @@ class ChatApplicationService:
                 answer=answer,
                 model_name=selected_model_name,
                 metadata={
+                    "trace_id": trace_id,
                     "mode": "direct_rag_once",
                     "model_mode": selected_model_mode,
                     "model_name": selected_model_name,
@@ -150,7 +156,8 @@ class ChatApplicationService:
             return ChatResponse(answer=answer, conversation_id=conversation_id, first_token_ms=total_ms, total_ms=total_ms)
 
         logger.info(
-            "[V2聊天] 非流式路由=Agent工具链 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+            "[V2聊天] 非流式路由=Agent工具链 追踪编号=%s 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+            trace_id,
             route_reason,
             request.user_id,
             conversation_id,
@@ -164,6 +171,7 @@ class ChatApplicationService:
             answer=answer,
             model_name=selected_model_name,
             metadata={
+                "trace_id": trace_id,
                 "mode": "agent_once",
                 "model_mode": selected_model_mode,
                 "model_name": selected_model_name,
@@ -178,12 +186,14 @@ class ChatApplicationService:
         """流式聊天接口业务流程。"""
 
         request_start_time = time.perf_counter()
+        trace_id = self._new_trace_id()
         conversation_id, history = _prepare_chat_conversation(request)
         selected_model_mode = normalize_chat_model_mode(request.model_mode)
         selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
         selected_collection_name = normalize_qdrant_collection_name(request.collection_name)
         logger.info(
-            "[V2聊天] 流式请求准备完成 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f 历史消息数=%s",
+            "[V2聊天] 流式请求准备完成 追踪编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f 历史消息数=%s",
+            trace_id,
             conversation_id,
             selected_collection_name,
             selected_model_mode,
@@ -195,7 +205,8 @@ class ChatApplicationService:
         use_direct_rag, route_reason = _should_use_direct_rag(request.message)
         if use_direct_rag:
             logger.info(
-                "[V2聊天] 流式路由=知识直答 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+                "[V2聊天] 流式路由=知识直答 追踪编号=%s 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+                trace_id,
                 route_reason,
                 request.user_id,
                 conversation_id,
@@ -208,17 +219,25 @@ class ChatApplicationService:
                 history=history,
                 model_mode=selected_model_mode,
                 collection_name=selected_collection_name,
+                trace_id=trace_id,
             )
         else:
             logger.info(
-                "[V2聊天] 流式路由=Agent工具链 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+                "[V2聊天] 流式路由=Agent工具链 追踪编号=%s 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+                trace_id,
                 route_reason,
                 request.user_id,
                 conversation_id,
                 request.message,
             )
             _get_agent()
-            stream = _stream_agent(request.message, user_id=request.user_id, conversation_id=conversation_id, history=history)
+            stream = _stream_agent(
+                request.message,
+                user_id=request.user_id,
+                conversation_id=conversation_id,
+                history=history,
+                trace_id=trace_id,
+            )
         return self._streaming_response(stream)
 
     def debug_retrieve(self, request: DebugRetrieveRequest) -> dict:
@@ -317,6 +336,12 @@ class ChatApplicationService:
         """计算耗时毫秒。"""
 
         return (time.perf_counter() - start_time) * 1000
+
+    @staticmethod
+    def _new_trace_id() -> str:
+        """生成接口层追踪编号，串联入口日志、RAG 日志和会话 metadata。"""
+
+        return f"chat_{uuid.uuid4().hex[:12]}"
 
     @staticmethod
     def _streaming_response(stream: Iterator[str]) -> StreamingResponse:

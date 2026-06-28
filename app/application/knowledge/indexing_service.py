@@ -111,6 +111,15 @@ def _index_document(
     if indexed_document is None:
         raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
 
+    logger.info(
+        "[可观测性] 知识库入库汇总 文档编号=%s Collection=%s 分片数量=%s 文档类型=%s 切分策略=%s 状态=%s",
+        document_id,
+        final_collection_name,
+        indexed_document.get("chunk_count"),
+        indexed_document.get("document_type"),
+        indexed_document.get("split_strategy"),
+        indexed_document["status"],
+    )
     logger.info("[知识库] 文件入库完成 文档编号=%s 状态=%s", document_id, indexed_document["status"])
     return indexed_document
 

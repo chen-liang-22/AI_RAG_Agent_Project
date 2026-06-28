@@ -57,6 +57,7 @@ from app.application.training.training_plan_domain_service import TrainingPlanDo
 from app.application.training.training_session_basic_service import TrainingSessionBasicService
 from app.application.training.training_session_prompt_service import TrainingSessionPromptService
 from app.application.training.training_session_scoring_service import TrainingSessionScoringService
+from app.application.training.training_session_service import TrainingSessionService
 from app.application.training.training_session_turn_service import TrainingSessionTurnService
 from core.utils.logger_handler import logger
 from core.utils.config_handler import training_conf
@@ -179,6 +180,12 @@ class V2SalesTrainingCoreService:
             repository=self.repository,
             query_service=self.query_service,
             session_prompt_service=self.session_prompt_service,
+        )
+        # 会话聚合服务统一协调开始训练、对话轮次、流式输出和最终评分。
+        self.training_session_service = TrainingSessionService(
+            basic_service=self.session_basic_service,
+            turn_service=self.session_turn_service,
+            scoring_service=self.session_scoring_service,
         )
         logger.info(
             "[销售训练] 核心服务初始化完成 正式Collection=%s 临时Collection=%s",
@@ -383,7 +390,7 @@ class V2SalesTrainingCoreService:
         所以创建会话后会立刻生成并保存 round_no=0 的客户开场白。
         """
 
-        return self.session_basic_service.start_session(request)
+        return self.training_session_service.start_session(request)
 
     def list_sessions(
             self,
@@ -394,7 +401,7 @@ class V2SalesTrainingCoreService:
     ) -> TrainingSessionListResponse:
         """分页查询训练历史。"""
 
-        return self.session_basic_service.list_sessions(page=page, page_size=page_size, trainee_id=trainee_id)
+        return self.training_session_service.list_sessions(page=page, page_size=page_size, trainee_id=trainee_id)
 
     def get_session_detail(self, session_id: str) -> TrainingSessionDetailResponse:
         """查询训练复盘详情。
@@ -407,12 +414,12 @@ class V2SalesTrainingCoreService:
         - score：已有评分报告。
         """
 
-        return self.session_basic_service.get_session_detail(session_id)
+        return self.training_session_service.get_session_detail(session_id)
 
     def submit_turn(self, session_id: str, request: TrainingTurnRequest) -> TrainingTurnResponse:
         """提交学员回复并一次性返回 AI 客户回复。"""
 
-        return self.session_turn_service.submit_turn(session_id, request)
+        return self.training_session_service.submit_turn(session_id, request)
 
     def stream_turn(self, session_id: str, request: TrainingTurnRequest) -> Iterator[str]:
         """提交学员回复并返回 SSE 流。
@@ -428,10 +435,10 @@ class V2SalesTrainingCoreService:
         - error：异常。
         """
 
-        yield from self.session_turn_service.stream_turn(session_id, request)
+        yield from self.training_session_service.stream_turn(session_id, request)
 
     def final_score(self, session_id: str, model_mode: str | None = None) -> TrainingScoreResponse:
         """结束训练并生成评分报告。"""
 
-        return self.session_scoring_service.final_score(session_id, model_mode=model_mode)
+        return self.training_session_service.final_score(session_id, model_mode=model_mode)
 

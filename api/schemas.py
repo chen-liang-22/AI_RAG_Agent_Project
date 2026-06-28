@@ -107,6 +107,24 @@ class HealthResponse(BaseModel):
     collection_points: dict[str, int] = Field(default_factory=dict)  # 每个 collection 在 Qdrant 中的向量点数量
 
 
+class DependencyHealthItem(BaseModel):
+    """单个外部依赖的健康检查结果。"""
+
+    name: str  # 依赖名称，例如 mysql/redis/minio/qdrant/chat_model/embedding_model
+    status: str  # ok/unavailable；ok 表示当前依赖可用
+    latency_ms: float | None = None  # 检查耗时，单位毫秒
+    message: str = ""  # 面向排查的中文说明
+    details: dict = Field(default_factory=dict)  # 依赖连接信息摘要，不包含密码和密钥
+
+
+class HealthDependenciesResponse(BaseModel):
+    """依赖健康检查明细响应体。"""
+
+    status: str  # 整体状态；ok 表示全部依赖可用，degraded 表示至少一个依赖不可用
+    summary: dict[str, int] = Field(default_factory=dict)  # 汇总数量，例如 total/ok/unavailable
+    dependencies: list[DependencyHealthItem] = Field(default_factory=list)  # 每个依赖的健康检查明细
+
+
 class DictionaryItemResponse(BaseModel):
     """字典项响应体，支持通过 children 表示多层级字典。"""
 
@@ -254,8 +272,10 @@ class KnowledgeUploadConfirmRequest(BaseModel):
 class KnowledgeDeleteResponse(BaseModel):
     """删除知识库文件的响应体。"""
 
-    status: str  # 固定返回 deleted
+    status: str  # deleted/delete_failed/not_found
     document_id: str  # 被删除的文件 ID
+    resource_results: dict = Field(default_factory=dict)  # 各类资源删除结果：qdrant/minio/redis/mysql
+    errors: list[dict[str, str]] = Field(default_factory=list)  # 失败资源和错误原因，供补偿删除排查
 
 
 class KnowledgeReindexResult(BaseModel):

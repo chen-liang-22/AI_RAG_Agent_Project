@@ -121,7 +121,27 @@ class FakeDocumentRepository:
         return None
 
 
-def _service(repository=None, vector_service=None, staging_vector_service=None) -> TrainingKnowledgeService:
+class FakeAssetResult:
+    """统一文件资产删除结果。"""
+
+    document_id = "doc_1"
+    status = "deleted"
+    resource_results = {"qdrant": {"status": "deleted"}, "mysql": {"status": "deleted"}}
+    errors = []
+
+
+class FakeAssetService:
+    """记录训练资料删除是否调用统一资产服务。"""
+
+    def __init__(self):
+        self.deleted_document_id = None
+
+    def delete_document_asset(self, document_id: str):
+        self.deleted_document_id = document_id
+        return FakeAssetResult()
+
+
+def _service(repository=None, vector_service=None, staging_vector_service=None, asset_service=None) -> TrainingKnowledgeService:
     """构造训练资料服务。"""
 
     return TrainingKnowledgeService(
@@ -129,6 +149,7 @@ def _service(repository=None, vector_service=None, staging_vector_service=None) 
         vector_service=vector_service or FakeVectorService(),
         staging_vector_service=staging_vector_service or FakeVectorService(),
         document_repository=FakeDocumentRepository(),
+        asset_service=asset_service,
     )
 
 
@@ -165,6 +186,20 @@ def test_delete_legacy_batch_cleans_both_vector_collections_and_repository():
     assert vector_service.deleted == [("batch_id", "legacy")]
     assert staging_vector_service.deleted == [("batch_id", "legacy")]
     assert repository.deleted_batch_id == "legacy"
+
+
+def test_delete_batch_returns_full_asset_resource_results():
+    """有关联 document_id 的训练资料删除应透传统一资产删除结果。"""
+
+    asset_service = FakeAssetService()
+    response = _service(asset_service=asset_service).delete_batch("batch_1")
+
+    assert response.status == "deleted"
+    assert response.batch_id == "batch_1"
+    assert response.document_id == "doc_1"
+    assert response.resource_results["qdrant"]["status"] == "deleted"
+    assert response.errors == []
+    assert asset_service.deleted_document_id == "doc_1"
 
 
 def test_list_versions_returns_version_group_batches():

@@ -2,6 +2,7 @@
 
 import json
 
+from app.application.training.training_goal_application_service import TrainingGoalApplicationService
 from app.application.training.training_goal_setting_service import TrainingGoalSettingService
 
 
@@ -54,3 +55,36 @@ def test_fallback_goal_uses_profile_complexity_and_default_scoring_rules():
     assert fallback["scoring_rules"]["general_score"] == 40
     assert fallback["scoring_rules"]["stage_score"] == 60
     assert len(fallback["scoring_rules"]["stage_dimensions"]) == 3
+
+
+def test_goal_response_converts_string_conditions_to_lists():
+    """目标响应应兼容模型把达成条件和失败条件返回成字符串的情况。"""
+
+    service = TrainingGoalApplicationService(repository=object(), goal_setting_service=TrainingGoalSettingService())
+    row = {
+        "setting_id": "setting_1",
+        "profile_id": "profile_1",
+        "training_mode": "open",
+        "training_purpose": "需求挖掘",
+        "round_limit": 8,
+        "status": "confirmed",
+        "stages_json": json.dumps(
+            [
+                {
+                    "stage_no": "1",
+                    "stage_name": "开放式需求挖掘",
+                    "core_goal": "让客户说出真实顾虑",
+                    "success_conditions": "客户明确表达预算范围",
+                    "failure_conditions": "学员连续回避价格异议",
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        "scoring_rules_json": json.dumps({"total_score": 100}, ensure_ascii=False),
+    }
+
+    response = service.goal_response(row)
+
+    assert response.stages[0].stage_no == 1
+    assert response.stages[0].success_conditions == ["客户明确表达预算范围"]
+    assert response.stages[0].failure_conditions == ["学员连续回避价格异议"]

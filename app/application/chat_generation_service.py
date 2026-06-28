@@ -134,6 +134,7 @@ def _stream_agent(
         user_id: str | None = None,
         conversation_id: str | None = None,
         history: list[dict] | None = None,
+        trace_id: str | None = None,
 ) -> Iterator[str]:
     """把 Agent token 流转换成浏览器能识别的 SSE 文本流。"""
 
@@ -143,7 +144,8 @@ def _stream_agent(
         selected_model_mode = normalize_chat_model_mode(None)
         selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
         logger.info(
-            "[接口] Agent流式输出开始 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s 问题=%s",
+            "[接口] Agent流式输出开始 追踪编号=%s 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s 问题=%s",
+            trace_id,
             user_id,
             conversation_id,
             selected_model_mode,
@@ -152,6 +154,7 @@ def _stream_agent(
         )
         meta_payload = json.dumps(
             {
+                "trace_id": trace_id,
                 "conversation_id": conversation_id,
                 "model_mode": selected_model_mode,
                 "model_name": selected_model_name,
@@ -185,6 +188,7 @@ def _stream_agent(
                 model_name=selected_model_name,
                 metadata={
                     "mode": "stream",
+                    "trace_id": trace_id,
                     "model_mode": selected_model_mode,
                     "model_name": selected_model_name,
                     "first_token_ms": first_token_ms,
@@ -193,7 +197,8 @@ def _stream_agent(
             )
 
         logger.info(
-            "[接口] Agent流式输出完成 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s",
+            "[接口] Agent流式输出完成 追踪编号=%s 用户编号=%s 会话编号=%s 模型模式=%s 模型名称=%s",
+            trace_id,
             user_id,
             conversation_id,
             selected_model_mode,
@@ -202,6 +207,7 @@ def _stream_agent(
         done_payload = json.dumps(
             {
                 "done": True,
+                "trace_id": trace_id,
                 "conversation_id": conversation_id,
                 "model_mode": selected_model_mode,
                 "model_name": selected_model_name,
@@ -224,6 +230,7 @@ def _stream_direct_rag(
         history: list[dict] | None = None,
         model_mode: str | None = None,
         collection_name: str | None = None,
+        trace_id: str | None = None,
 ) -> Iterator[str]:
     """把知识库直答 token 流转换成 SSE 文本流。"""
 
@@ -234,7 +241,8 @@ def _stream_direct_rag(
         selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
         selected_collection_name = normalize_qdrant_collection_name(collection_name)
         logger.info(
-            "[聊天路由] 流式接口进入知识库直答 用户编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 问题=%s",
+            "[聊天路由] 流式接口进入知识库直答 追踪编号=%s 用户编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 问题=%s",
+            trace_id,
             user_id,
             conversation_id,
             selected_collection_name,
@@ -245,6 +253,7 @@ def _stream_direct_rag(
 
         meta_payload = json.dumps(
             {
+                "trace_id": trace_id,
                 "conversation_id": conversation_id,
                 "mode": "direct_rag",
                 "collection_name": selected_collection_name,
@@ -261,6 +270,7 @@ def _stream_direct_rag(
             history=history or [],
             model_mode=selected_model_mode,
             collection_name=selected_collection_name,
+            trace_id=trace_id,
         ):
             if first_token_ms is None:
                 first_token_ms = _elapsed_ms(stream_start_time)
@@ -281,6 +291,7 @@ def _stream_direct_rag(
                 model_name=selected_model_name,
                 metadata={
                     "mode": "direct_rag_stream",
+                    "trace_id": trace_id,
                     "model_mode": selected_model_mode,
                     "model_name": selected_model_name,
                     "collection_name": selected_collection_name,
@@ -290,7 +301,8 @@ def _stream_direct_rag(
             )
 
         logger.info(
-            "[聊天路由] 知识直答流式完成 用户编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s",
+            "[聊天路由] 知识直答流式完成 追踪编号=%s 用户编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s",
+            trace_id,
             user_id,
             conversation_id,
             selected_collection_name,
@@ -301,6 +313,7 @@ def _stream_direct_rag(
         done_payload = json.dumps(
             {
                 "done": True,
+                "trace_id": trace_id,
                 "conversation_id": conversation_id,
                 "collection_name": selected_collection_name,
                 "model_mode": selected_model_mode,

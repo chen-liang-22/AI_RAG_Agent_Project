@@ -32,8 +32,8 @@ class FakePlanService:
         self.repository = repository
 
 
-class FakeSessionBasicService:
-    """记录核心外观是否把会话基础入口委托给会话基础服务。"""
+class FakeTrainingSessionService:
+    """记录核心外观是否把完整会话入口委托给训练会话聚合服务。"""
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -51,14 +51,6 @@ class FakeSessionBasicService:
         self.calls.append(("get_session_detail", session_id))
         return "detail-result"
 
-
-class FakeSessionTurnService:
-    """记录核心外观是否把训练对话入口委托给会话对话服务。"""
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.calls = []
-
     def submit_turn(self, session_id: str, request):
         self.calls.append(("submit_turn", session_id, request))
         return "submit-result"
@@ -66,14 +58,6 @@ class FakeSessionTurnService:
     def stream_turn(self, session_id: str, request):
         self.calls.append(("stream_turn", session_id, request))
         return iter(["event: done\ndata: {}\n\n"])
-
-
-class FakeSessionScoringService:
-    """记录核心外观是否把最终评分入口委托给会话评分服务。"""
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.calls = []
 
     def final_score(self, session_id: str, model_mode: str | None = None):
         self.calls.append(("final_score", session_id, model_mode))
@@ -88,53 +72,29 @@ def _patch_core_dependencies(monkeypatch):
     monkeypatch.setattr(sales_training_core, "DocumentRepository", lambda store=None: FakeDocumentRepository())
     monkeypatch.setattr(sales_training_core, "TrainingKnowledgeService", FakeKnowledgeService)
     monkeypatch.setattr(sales_training_core, "TrainingPlanDomainService", FakePlanService)
-    monkeypatch.setattr(sales_training_core, "TrainingSessionBasicService", FakeSessionBasicService)
-    monkeypatch.setattr(sales_training_core, "TrainingSessionTurnService", FakeSessionTurnService)
-    monkeypatch.setattr(sales_training_core, "TrainingSessionScoringService", FakeSessionScoringService)
+    monkeypatch.setattr(sales_training_core, "TrainingSessionService", FakeTrainingSessionService)
 
 
-def test_core_delegates_session_basic_methods(monkeypatch):
-    """开始会话、会话列表和会话详情入口应委托给 TrainingSessionBasicService。"""
+def test_core_delegates_session_methods(monkeypatch):
+    """训练会话入口应统一委托给 TrainingSessionService。"""
 
     _patch_core_dependencies(monkeypatch)
     start_request = object()
+    turn_request = object()
 
     core_service = sales_training_core.V2SalesTrainingCoreService()
 
     assert core_service.start_session(start_request) == "start-result"
     assert core_service.list_sessions(page=0, page_size=999, trainee_id="stu_1") == "list-result"
     assert core_service.get_session_detail("session_1") == "detail-result"
-    assert core_service.session_basic_service.calls == [
+    assert core_service.submit_turn("session_1", turn_request) == "submit-result"
+    assert list(core_service.stream_turn("session_1", turn_request)) == ["event: done\ndata: {}\n\n"]
+    assert core_service.final_score("session_1", model_mode="fast") == "score-result"
+    assert core_service.training_session_service.calls == [
         ("start_session", start_request),
         ("list_sessions", 0, 999, "stu_1"),
         ("get_session_detail", "session_1"),
-    ]
-
-
-def test_core_delegates_session_turn_methods(monkeypatch):
-    """一次性对话和流式对话入口应委托给 TrainingSessionTurnService。"""
-
-    _patch_core_dependencies(monkeypatch)
-    turn_request = object()
-
-    core_service = sales_training_core.V2SalesTrainingCoreService()
-
-    assert core_service.submit_turn("session_1", turn_request) == "submit-result"
-    assert list(core_service.stream_turn("session_1", turn_request)) == ["event: done\ndata: {}\n\n"]
-    assert core_service.session_turn_service.calls == [
         ("submit_turn", "session_1", turn_request),
         ("stream_turn", "session_1", turn_request),
-    ]
-
-
-def test_core_delegates_session_scoring_methods(monkeypatch):
-    """最终评分入口应委托给 TrainingSessionScoringService。"""
-
-    _patch_core_dependencies(monkeypatch)
-
-    core_service = sales_training_core.V2SalesTrainingCoreService()
-
-    assert core_service.final_score("session_1", model_mode="fast") == "score-result"
-    assert core_service.session_scoring_service.calls == [
         ("final_score", "session_1", "fast"),
     ]
