@@ -25,7 +25,6 @@ from fastapi import HTTPException, UploadFile
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.application.knowledge.document_asset_service import DocumentAssetService
 from app.infrastructure.repositories.document_repository import DocumentRepository
 from app.infrastructure.file_storage_service import get_file_storage_service
 from app.infrastructure.id_generator import new_id
@@ -63,7 +62,6 @@ from app.application.training_support.schemas import (
     TrainingSessionListResponse,
     TrainingSessionSummaryResponse,
     TrainingKnowledgeChunkListResponse,
-    TrainingKnowledgeChunkResponse,
     TrainingKnowledgePreviewResponse,
     TrainingKnowledgeUploadResponse,
     TrainingScoreResponse,
@@ -76,6 +74,7 @@ from app.application.training_support.schemas import (
 from app.application.training.training_query_service import TrainingQueryService
 from app.application.training.training_goal_setting_service import TrainingGoalSettingService
 from app.application.training.training_role_service import TrainingRoleService
+from app.application.training.training_knowledge_service import TrainingKnowledgeService
 from app.application.training.training_session_prompt_service import TrainingSessionPromptService
 from app.application.training.training_score_service import TrainingScoreService
 from core.utils.database_connection import DatabaseErrorTypes
@@ -165,6 +164,13 @@ class V2SalesTrainingCoreService:
         self.goal_setting_service = TrainingGoalSettingService()
         # 会话提示词和兜底话术拆到独立服务，核心外观继续负责仓库读写和流式编排。
         self.session_prompt_service = TrainingSessionPromptService()
+        # 资料管理查询、预览、删除等低风险能力拆到独立服务，核心外观只保留稳定入口。
+        self.knowledge_service = TrainingKnowledgeService(
+            repository=self.repository,
+            vector_service=self.vector_service,
+            staging_vector_service=self.staging_vector_service,
+            document_repository=self.document_repository,
+        )
         logger.info(
             "[销售训练] 核心服务初始化完成 正式Collection=%s 临时Collection=%s",
             self.training_collection_name,
@@ -370,15 +376,7 @@ class V2SalesTrainingCoreService:
     def list_batches(self, *, page: int = 1, page_size: int = 10) -> TrainingKnowledgeBatchListResponse:
         """分页查询已经上传过的训练资料。"""
 
-        safe_page = max(1, page)
-        safe_page_size = max(1, min(50, page_size))
-        rows, total = self.repository.list_batches(page=safe_page, page_size=safe_page_size)
-        return TrainingKnowledgeBatchListResponse(
-            items=[self._batch_response(row) for row in rows],
-            total=total,
-            page=safe_page,
-            page_size=safe_page_size,
-        )
+        return self.knowledge_service.list_batches(page=page, page_size=page_size)
 
     def preview_batch(self, batch_id: str, *, max_chars: int = 30000) -> TrainingKnowledgePreviewResponse:
         """返回训练资料上传文件的站内预览数据。
@@ -387,39 +385,12 @@ class V2SalesTrainingCoreService:
         DOCX/PDF 会解析为文本，避免浏览器把 Word 文件当成下载处理。
         """
 
-        batch = self._get_active_batch(batch_id)
-        file_info = self._batch_file_info(batch)
-        file_url = str(file_info.get("public_url") or "").strip()
-        if not file_url:
-            object_name = str(file_info.get("object_name") or "").strip()
-            if not object_name:
-                raise HTTPException(status_code=400, detail="训练资料缺少 MinIO 对象路径，请先完成历史文件迁移")
-            file_url = get_file_storage_service().client.get_public_url(
-                object_name,
-                bucket_name=file_info.get("bucket_name"),
-            )
-        preview = self._build_batch_preview(batch, max_chars=max_chars)
-
-        return TrainingKnowledgePreviewResponse(
-            batch=self._batch_response(batch),
-            preview_type=preview["preview_type"],
-            content=preview["content"],
-            truncated=preview["truncated"],
-            file_url=file_url,
-            charset=preview.get("charset"),
-        )
+        return self.knowledge_service.preview_batch(batch_id, max_chars=max_chars)
 
     def delete_batch(self, batch_id: str) -> TrainingKnowledgeDeleteResponse:
         """删除训练资料批次，并通过统一文件资产服务清理全链路数据。"""
 
-        batch = self._get_active_batch(batch_id)
-        document_id = str(batch.get("document_id") or "").strip()
-        if not document_id:
-            return self._delete_legacy_batch_without_document(batch_id)
-
-        DocumentAssetService().delete_document_asset(document_id)
-        logger.info("[销售训练] 训练资料已删除 批次编号=%s 文档编号=%s", batch_id, document_id)
-        return TrainingKnowledgeDeleteResponse(status="deleted", batch_id=batch_id)
+        return self.knowledge_service.delete_batch(batch_id)
 
     def _delete_legacy_batch_without_document(self, batch_id: str) -> TrainingKnowledgeDeleteResponse:
         """删除没有 document_id 的历史训练批次。
@@ -428,15 +399,7 @@ class V2SalesTrainingCoreService:
         因此这里按 batch_id 清理正式库、临时库和批次记录，保留历史数据兼容能力。
         """
 
-        self.vector_service.delete_by_metadata("batch_id", batch_id)
-        self.staging_vector_service.delete_by_metadata("batch_id", batch_id)
-        deleted_batch = self.repository.delete_batch(batch_id)
-        logger.warning(
-            "[销售训练] 已按历史批次兼容方式删除训练资料 批次编号=%s 批次已删除=%s",
-            batch_id,
-            deleted_batch,
-        )
-        return TrainingKnowledgeDeleteResponse(status="deleted", batch_id=batch_id)
+        return self.knowledge_service.delete_legacy_batch_without_document(batch_id)
 
     def publish_batch(self, batch_id: str) -> TrainingKnowledgePublishResponse:
         """人工确认发布训练资料。
@@ -647,33 +610,12 @@ class V2SalesTrainingCoreService:
     def list_batch_versions(self, batch_id: str) -> TrainingKnowledgeVersionListResponse:
         """查询指定训练资料所在版本组的版本链。"""
 
-        batch = self._get_active_batch(batch_id)
-        version_group_id = str(batch.get("version_group_id") or batch["batch_id"])
-        rows = self.repository.list_batches_in_version_group(version_group_id)
-        return TrainingKnowledgeVersionListResponse(
-            version_group_id=version_group_id,
-            items=[self._batch_response(row) for row in rows],
-        )
+        return self.knowledge_service.list_batch_versions(batch_id)
 
     def list_chunks(self, batch_id: str) -> TrainingKnowledgeChunkListResponse:
         """查询某个上传批次的训练知识切片。"""
 
-        batch = self._get_active_batch(batch_id)
-        chunks = []
-        chunk_rows = self._list_batch_chunk_rows(batch)
-        for row in chunk_rows:
-            metadata = self._load_json(row.get("metadata_json"), {})
-            chunks.append(
-                TrainingKnowledgeChunkResponse(
-                    chunk_id=row["chunk_id"],
-                    batch_id=row["batch_id"],
-                    case_part=row.get("case_part") or "",
-                    visibility=row.get("visibility") or "",
-                    chunk_text=row["chunk_text"],
-                    metadata=metadata,
-                )
-            )
-        return TrainingKnowledgeChunkListResponse(batch_id=batch_id, chunks=chunks)
+        return self.knowledge_service.list_chunks(batch_id)
 
     def create_plan(self, request: TrainingPlanCreateRequest) -> TrainingPlanDetailResponse:
         """创建训练方案。
