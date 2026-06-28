@@ -73,7 +73,7 @@ class TrainingKnowledgePreviewResponse(BaseModel):
     preview_type: str  # text/file_url，text 表示前端直接渲染 content，file_url 表示前端嵌入 file_url。
     content: str  # 文本文件或 DOCX/PDF 抽取出的预览文本。
     truncated: bool  # 文本内容是否因 max_chars 被截断。
-    file_url: str | None = None  # MinIO HTTP 访问地址，前端用它打开上传文件。
+    file_url: str | None = None  # MinIO HTTP 访问地址，前端用它做弹窗内嵌或新窗口兜底。
     charset: str | None = None  # 文本预览实际采用的字符集或解析器标识。
 
 

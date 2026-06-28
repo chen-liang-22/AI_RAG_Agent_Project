@@ -178,8 +178,8 @@ class KnowledgeFileResponse(BaseModel):
 class KnowledgeFilePreviewResponse(BaseModel):
     """已入库知识库文件的预览响应体。
 
-    当前预览以 MinIO HTTP 地址为主，前端拿到 file_url 后直接打开上传文件。
-    content 字段保留为空字符串，兼容旧前端结构。
+    当前预览优先返回后端解码后的文本内容；
+    浏览器可内嵌的文件继续返回 MinIO HTTP 地址，由前端在弹窗中展示。
     """
 
     document: KnowledgeFileResponse  # 被预览的文件元数据
@@ -187,7 +187,7 @@ class KnowledgeFilePreviewResponse(BaseModel):
     content: str  # 文本文件的解码内容；非文本文件为空字符串
     truncated: bool  # 文本内容是否因 max_chars 被截断
     page_count: int | None = None  # PDF 页数；TXT 文件为空
-    file_url: str | None = None  # MinIO HTTP 访问地址，前端用它打开上传文件
+    file_url: str | None = None  # MinIO HTTP 访问地址，前端用它做弹窗内嵌或新窗口兜底
     charset: str | None = None  # 文本预览实际采用的字符集，例如 utf-8/gb18030
 
 
