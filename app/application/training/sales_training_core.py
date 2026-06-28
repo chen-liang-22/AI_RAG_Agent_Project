@@ -37,7 +37,6 @@ from app.application.training_support.schemas import (
     TrainingPlanDeleteResponse,
     TrainingPlanDetailResponse,
     TrainingPlanListResponse,
-    TrainingPlanSummaryResponse,
     TrainingPlanUpdateRequest,
     TrainingKnowledgeDeleteResponse,
     TrainingKnowledgeBatchListResponse,
@@ -62,9 +61,9 @@ from app.application.training.training_query_service import TrainingQueryService
 from app.application.training.training_goal_setting_service import TrainingGoalSettingService
 from app.application.training.training_role_service import TrainingRoleService
 from app.application.training.training_knowledge_service import TrainingKnowledgeService
+from app.application.training.training_plan_domain_service import TrainingPlanDomainService
 from app.application.training.training_session_prompt_service import TrainingSessionPromptService
 from app.application.training.training_score_service import TrainingScoreService
-from core.utils.database_connection import DatabaseErrorTypes
 from core.utils.logger_handler import logger
 from core.utils.config_handler import training_conf
 from core.utils.prompt_manager import prompt_manager
@@ -158,6 +157,8 @@ class V2SalesTrainingCoreService:
             training_collection_name=self.training_collection_name,
             staging_collection_name=self.staging_collection_name,
         )
+        # 训练方案 CRUD 和状态联动拆到方案领域服务，核心外观保留同名入口。
+        self.plan_service = TrainingPlanDomainService(repository=self.repository)
         logger.info(
             "[销售训练] 核心服务初始化完成 正式Collection=%s 临时Collection=%s",
             self.training_collection_name,
@@ -271,35 +272,17 @@ class V2SalesTrainingCoreService:
         这样用户可以先命名、检查画像和场景，再按步骤生成后续内容。
         """
 
-        plan = self.repository.create_plan(
-            plan_name=request.plan_name.strip(),
-            trainee=request.trainee.model_dump(),
-            profile_type=request.profile_type,
-            selected_fields=request.selected_fields,
-            scenario_description=request.scenario_description.strip(),
-            extra_details=request.extra_details.strip(),
-            model_mode=request.model_mode,
-        )
-        logger.info("[销售训练] 训练方案创建完成 方案编号=%s 名称=%s", plan["plan_id"], plan["plan_name"])
-        return self._plan_detail_response(plan)
+        return self.plan_service.create_plan(request)
 
     def list_plans(self, *, page: int = 1, page_size: int = 10, keyword: str | None = None) -> TrainingPlanListResponse:
         """分页查询训练方案列表。"""
 
-        safe_page = max(1, page)
-        safe_page_size = max(1, min(50, page_size))
-        rows, total = self.repository.list_plans(page=safe_page, page_size=safe_page_size, keyword=keyword)
-        return TrainingPlanListResponse(
-            items=[self._plan_summary(row) for row in rows],
-            total=total,
-            page=safe_page,
-            page_size=safe_page_size,
-        )
+        return self.plan_service.list_plans(page=page, page_size=page_size, keyword=keyword)
 
     def get_plan_detail(self, plan_id: str) -> TrainingPlanDetailResponse:
         """查询训练方案完整详情。"""
 
-        return self._plan_detail_response(self._require_plan(plan_id))
+        return self.plan_service.get_plan_detail(plan_id)
 
     def delete_plan(self, plan_id: str) -> TrainingPlanDeleteResponse:
         """删除训练方案。
@@ -308,12 +291,7 @@ class V2SalesTrainingCoreService:
         不清理训练资料、向量库、MinIO 文件，也不删除历史训练会话依赖的角色和阶段配置。
         """
 
-        plan = self._require_plan(plan_id)
-        deleted = self.repository.delete_plan(plan_id)
-        if not deleted:
-            raise HTTPException(status_code=404, detail="训练方案不存在")
-        logger.info("[销售训练] 训练方案已删除 方案编号=%s 名称=%s", plan_id, plan.get("plan_name"))
-        return TrainingPlanDeleteResponse(status="deleted", plan_id=plan_id)
+        return self.plan_service.delete_plan(plan_id)
 
     def update_plan(self, plan_id: str, request: TrainingPlanUpdateRequest) -> TrainingPlanDetailResponse:
         """修改训练方案。
@@ -325,103 +303,7 @@ class V2SalesTrainingCoreService:
         - 只修改评分规则：不影响前面的角色和阶段。
         """
 
-        plan = self._require_plan(plan_id)
-        updates: dict[str, Any] = {}
-        role_input_changed = False
-        role_content_changed = False
-        goal_changed = False
-
-        if request.plan_name is not None and request.plan_name.strip() != plan["plan_name"]:
-            updates["plan_name"] = request.plan_name.strip()
-        if request.trainee is not None:
-            trainee_data = request.trainee.model_dump()
-            if self._json_changed(self._load_json(plan.get("trainee_json"), {}), trainee_data):
-                updates["trainee_json"] = self.repository._json(trainee_data)
-                updates["trainee_id"] = trainee_data["trainee_id"]
-                updates["trainee_name"] = trainee_data.get("trainee_name") or "销售学员"
-                role_input_changed = True
-        if request.profile_type is not None and request.profile_type != plan["profile_type"]:
-            updates["profile_type"] = request.profile_type
-            role_input_changed = True
-        if request.selected_fields is not None:
-            if self._json_changed(self._load_json(plan.get("selected_fields_json"), {}), request.selected_fields):
-                updates["selected_fields_json"] = self.repository._json(request.selected_fields)
-                role_input_changed = True
-        if request.scenario_description is not None:
-            scenario_description = request.scenario_description.strip()
-            if scenario_description != (plan.get("scenario_description") or ""):
-                updates["scenario_description"] = scenario_description
-                role_input_changed = True
-        if request.extra_details is not None:
-            extra_details = request.extra_details.strip()
-            if extra_details != (plan.get("extra_details") or ""):
-                updates["extra_details"] = extra_details
-                role_input_changed = True
-        if request.model_mode is not None:
-            updates["model_mode"] = request.model_mode
-
-        if role_input_changed:
-            updates.update({
-                "active_profile_id": None,
-                "active_setting_id": None,
-                "role_status": "stale",
-                "goal_status": "stale",
-                "score_status": "stale",
-            })
-
-        active_profile_id = updates.get("active_profile_id", plan.get("active_profile_id"))
-        if active_profile_id and any(value is not None for value in (
-                request.role_confirm_card,
-                request.visible_profile,
-                request.hidden_profile,
-                request.role_profile,
-        )):
-            self.repository.update_role_profile(
-                active_profile_id,
-                visible_profile=request.visible_profile,
-                hidden_profile=request.hidden_profile,
-                role_profile=request.role_profile,
-                role_confirm_card=request.role_confirm_card,
-            )
-            role_content_changed = request.hidden_profile is not None or request.role_profile is not None
-            if role_content_changed and not role_input_changed:
-                updates.update({
-                    "active_setting_id": None,
-                    "goal_status": "stale",
-                    "score_status": "stale",
-                })
-
-        active_setting_id = updates.get("active_setting_id", plan.get("active_setting_id"))
-        if active_setting_id and (
-                request.training_purpose is not None
-                or request.round_limit is not None
-                or request.stages is not None
-        ):
-            self.repository.update_goal_setting(
-                active_setting_id,
-                training_purpose=request.training_purpose.strip() if request.training_purpose is not None else None,
-                round_limit=request.round_limit,
-                stages=[item.model_dump() for item in request.stages] if request.stages is not None else None,
-            )
-            goal_changed = True
-        if active_setting_id and request.scoring_rules is not None:
-            self.repository.update_goal_setting(active_setting_id, scoring_rules=request.scoring_rules)
-        if goal_changed and not role_input_changed and not role_content_changed:
-            updates["score_status"] = "stale"
-
-        try:
-            updated = self.repository.update_plan(plan_id, **updates) if updates else self._require_plan(plan_id)
-        except DatabaseErrorTypes as exc:
-            logger.error("[销售训练] 训练方案保存数据库异常 方案编号=%s 错误=%s", plan_id, exc, exc_info=True)
-            raise
-        logger.info(
-            "[销售训练] 训练方案已修改 方案编号=%s 角色输入变化=%s 角色内容变化=%s 阶段变化=%s",
-            plan_id,
-            role_input_changed,
-            role_content_changed,
-            goal_changed,
-        )
-        return self._plan_detail_response(updated)
+        return self.plan_service.update_plan(plan_id, request)
 
     def generate_supplement_questions(self, request: RoleGenerateRequest) -> SupplementQuestionGenerateResponse:
         """生成 AI 陪练角色前的补充问答题。
@@ -1299,20 +1181,6 @@ class V2SalesTrainingCoreService:
             return default
 
     @staticmethod
-    def _json_changed(old_value: Any, new_value: Any) -> bool:
-        """比较两个 JSON 结构是否真正变化。
-
-        前端编辑页会提交完整快照，不能因为字段存在就认为内容变化。
-        这里先按中文稳定序列化再比较，避免字典顺序导致误判。
-        """
-
-        return json.dumps(old_value, ensure_ascii=False, sort_keys=True) != json.dumps(
-            new_value,
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-
-    @staticmethod
     def _normalize_response_mode(response_mode: str | None) -> str:
         """统一响应模式枚举。"""
 
@@ -1368,50 +1236,6 @@ class V2SalesTrainingCoreService:
         if session["status"] not in {"active", "scoring"}:
             raise HTTPException(status_code=400, detail=f"当前训练状态不允许继续对话：{session['status']}")
         return session
-
-    @staticmethod
-    def _plan_summary(row: dict[str, Any]) -> TrainingPlanSummaryResponse:
-        """把训练方案数据库行转换成列表摘要。"""
-
-        return TrainingPlanSummaryResponse(
-            plan_id=row["plan_id"],
-            plan_name=row["plan_name"],
-            trainee_id=row["trainee_id"],
-            trainee_name=row["trainee_name"],
-            profile_type=row["profile_type"],
-            model_mode=row.get("model_mode"),
-            role_status=row["role_status"],
-            goal_status=row["goal_status"],
-            score_status=row["score_status"],
-            active_profile_id=row.get("active_profile_id"),
-            active_setting_id=row.get("active_setting_id"),
-            created_at=_format_response_time(row["created_at"]),
-            updated_at=_format_response_time(row["updated_at"]),
-        )
-
-    def _plan_detail_response(self, row: dict[str, Any]) -> TrainingPlanDetailResponse:
-        """把训练方案数据库行转换成完整详情。"""
-
-        role_row = self.repository.get_role_profile(row["active_profile_id"]) if row.get("active_profile_id") else None
-        setting_row = self.repository.get_goal_setting(row["active_setting_id"]) if row.get("active_setting_id") else None
-        visible_profile = self._load_json(role_row.get("visible_profile_json"), {}) if role_row else {}
-        hidden_profile = self._load_json(role_row.get("hidden_profile_json"), {}) if role_row else {}
-        role_profile = self._load_json(role_row.get("role_profile_json"), {}) if role_row else {}
-        role_confirm_card = self._load_json(role_row.get("role_confirm_card_json"), {}) if role_row else {}
-        retrieved_cases = self._load_json(role_row.get("retrieved_evidence_json"), []) if role_row else []
-        return TrainingPlanDetailResponse(
-            plan=self._plan_summary(row),
-            trainee=self._load_json(row.get("trainee_json"), {}),
-            selected_fields=self._load_json(row.get("selected_fields_json"), {}),
-            scenario_description=row.get("scenario_description") or "",
-            extra_details=row.get("extra_details") or "",
-            visible_profile=visible_profile,
-            hidden_profile=hidden_profile,
-            role_profile=role_profile,
-            role_confirm_card=role_confirm_card,
-            retrieved_cases=retrieved_cases,
-            goal_setting=self._goal_response(setting_row) if setting_row else None,
-        )
 
     def _goal_response(self, row: dict[str, Any]) -> GoalSettingResponse:
         """把数据库训练设置行转换成 Pydantic 响应。"""
