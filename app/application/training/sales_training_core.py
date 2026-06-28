@@ -11,22 +11,17 @@
 """
 
 import json
-import re
-import time
 from collections.abc import Iterator
 from datetime import date, datetime
 from typing import Any
 
 from fastapi import HTTPException, UploadFile
-from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.infrastructure.repositories.document_repository import DocumentRepository
 from app.infrastructure.vector_store_service import VectorStoreService
-from core.model.factory import get_chat_model
 from app.application.training_support.repository import TrainingRepository
 from app.application.training_support.schemas import (
     GoalSettingResponse,
-    GoalStage,
     RoleGenerateRequest,
     RoleGenerateResponse,
     ScenarioPolishRequest,
@@ -57,6 +52,7 @@ from app.application.training_support.schemas import (
     TrainingTurnResponse,
 )
 from app.application.training.training_query_service import TrainingQueryService
+from app.application.training.training_goal_application_service import TrainingGoalApplicationService
 from app.application.training.training_goal_setting_service import TrainingGoalSettingService
 from app.application.training.training_role_application_service import TrainingRoleApplicationService
 from app.application.training.training_role_service import TrainingRoleService
@@ -66,10 +62,8 @@ from app.application.training.training_session_basic_service import TrainingSess
 from app.application.training.training_session_prompt_service import TrainingSessionPromptService
 from app.application.training.training_session_scoring_service import TrainingSessionScoringService
 from app.application.training.training_session_turn_service import TrainingSessionTurnService
-from app.application.training.training_score_service import TrainingScoreService
 from core.utils.logger_handler import logger
 from core.utils.config_handler import training_conf
-from core.utils.prompt_manager import prompt_manager
 
 
 DEFAULT_TRAINING_COLLECTION_NAME = "sales_training_cases"
@@ -155,6 +149,11 @@ class V2SalesTrainingCoreService:
         )
         # 训练目标生成同样拆成纯逻辑服务，避免核心编排类继续堆积提示词和兜底模板。
         self.goal_setting_service = TrainingGoalSettingService()
+        # 训练目标生成应用流程拆到独立服务，核心外观只保留同名入口。
+        self.goal_application_service = TrainingGoalApplicationService(
+            repository=self.repository,
+            goal_setting_service=self.goal_setting_service,
+        )
         # 会话提示词和兜底话术拆到独立服务，核心外观继续负责仓库读写和流式编排。
         self.session_prompt_service = TrainingSessionPromptService()
         # 训练资料上传、预览、发布、回滚、重切和删除拆到独立服务，核心外观只保留稳定入口。
@@ -373,55 +372,13 @@ class V2SalesTrainingCoreService:
         round_limit 由 LLM 根据角色复杂度动态给出，后端再做 5-100 的安全边界。
         """
 
-        if training_mode != "open":
-            raise HTTPException(status_code=400, detail="流程式训练二期支持，一期只支持开放式")
-
-        if plan_id:
-            self._require_plan(plan_id)
-        profile = self._require_role_profile(profile_id)
-        prompt = self._goal_prompt(profile)
-        logger.info(
-            "[销售训练][训练设置] 开始生成 方案编号=%s 角色编号=%s 学员=%s 模式=%s 模型档位=%s",
-            plan_id or "-",
-            profile_id,
-            trainee_id,
-            training_mode,
-            model_mode or "默认",
-        )
-        result = self._invoke_json(
-            prompt,
-            model_mode=model_mode,
-            fallback=self._fallback_goal(profile),
-            task_name="训练阶段和评分规则生成",
-        )
-        round_limit = self._normalize_round_limit(result.get("round_limit"))
-        stages = result.get("stages") or []
-        if not stages:
-            stages = self._fallback_goal(profile)["stages"]
-        scoring_rules = self._normalize_scoring_rules(result.get("scoring_rules"), stages[:1], profile)
-
-        saved = self.repository.save_goal_setting(
+        return self.goal_application_service.generate_goal_setting(
             profile_id=profile_id,
             trainee_id=trainee_id,
-            training_mode="open",
-            training_purpose=str(result.get("training_purpose") or "开放式销售训练")[:20],
-            round_limit=round_limit,
-            stages=stages[:1],
-            scoring_rules=scoring_rules,
+            training_mode=training_mode,
             plan_id=plan_id,
-            status="confirmed",
+            model_mode=model_mode,
         )
-        if plan_id:
-            self._require_plan(plan_id)
-            self.repository.attach_goal_to_plan(plan_id, saved["setting_id"])
-        logger.info(
-            "[销售训练][训练设置] 生成完成 设置编号=%s 轮数=%s 阶段数量=%s 评分维度=%s",
-            saved["setting_id"],
-            round_limit,
-            len(stages[:1]),
-            len(scoring_rules.get("dimensions") or []),
-        )
-        return self._goal_response(saved)
 
     def start_session(self, request: TrainingSessionStartRequest) -> TrainingSessionResponse:
         """开始一次开放式训练。
@@ -483,96 +440,6 @@ class V2SalesTrainingCoreService:
         return self.session_scoring_service.final_score(session_id, model_mode=model_mode)
 
     @staticmethod
-    def _messages(system: str, human: str) -> list:
-        """构造 LangChain 聊天消息。
-
-        Java 里常见做法是 new SystemMessage(...) + new HumanMessage(...)；
-        Python 这里直接返回 list，交给模型 invoke/stream。
-        """
-
-        return [SystemMessage(content=system), HumanMessage(content=human)]
-
-    @staticmethod
-    def _content_text(content: Any) -> str:
-        """把不同模型返回格式统一转成字符串。
-
-        有些模型返回 str，有些模型返回 [{"text": "..."}] 这种结构。
-        这里做兼容，避免上层业务关心模型供应商差异。
-        """
-
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "".join(str(item.get("text") if isinstance(item, dict) else item) for item in content)
-        return str(content)
-
-    @staticmethod
-    def _dict_key_text(value: Any) -> str:
-        """只打印字典字段名，不打印完整内容，避免日志泄露隐藏画像细节。"""
-
-        if not isinstance(value, dict) or not value:
-            return "-"
-        return "、".join(str(key) for key in value.keys())
-
-    def _invoke_json(self, prompt: str, *, model_mode: str | None, fallback: dict, task_name: str = "JSON生成") -> dict:
-        """调用 LLM 并解析 JSON，失败时使用可解释兜底。
-
-        LLM 不一定总是严格输出 JSON，所以这里统一 try/except：
-        - 成功：解析模型 JSON；
-        - 失败：记录中文日志，并返回 fallback，保证页面流程不中断。
-        """
-
-        start_perf = time.perf_counter()
-        logger.info(
-            "[销售训练][AI调用开始] 任务=%s 模型档位=%s 提示词长度=%s 兜底字段=%s",
-            task_name,
-            model_mode or "默认",
-            len(prompt),
-            self._dict_key_text(fallback),
-        )
-        try:
-            response = get_chat_model(model_mode).invoke(
-                self._messages(prompt_manager.get("training.json_only_system"), prompt)
-            )
-            text = self._content_text(response.content)
-            parsed = self._parse_json_object(text)
-            logger.info(
-                "[销售训练][AI调用完成] 任务=%s 模型档位=%s 返回长度=%s JSON字段=%s 耗时秒=%s",
-                task_name,
-                model_mode or "默认",
-                len(text),
-                self._dict_key_text(parsed),
-                round(max(0.0, time.perf_counter() - start_perf), 3),
-            )
-            return parsed
-        except Exception as exc:
-            logger.warning(
-                "[销售训练] LLM JSON生成失败，使用兜底结构 任务=%s 模型档位=%s 提示词长度=%s 耗时秒=%s 错误=%s",
-                task_name,
-                model_mode or "默认",
-                len(prompt),
-                round(max(0.0, time.perf_counter() - start_perf), 3),
-                exc,
-            )
-            return fallback
-
-    @staticmethod
-    def _parse_json_object(text: str) -> dict:
-        """从模型输出文本中提取 JSON 对象。
-
-        re.DOTALL 让正则里的 . 可以匹配换行。
-        这样模型即使输出多行 JSON，也能被提取。
-        """
-
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            raise ValueError("模型没有输出 JSON 对象")
-        parsed = json.loads(match.group(0))
-        if not isinstance(parsed, dict):
-            raise ValueError("模型输出不是 JSON 对象")
-        return parsed
-
-    @staticmethod
     def _load_json(value: Any, default: Any) -> Any:
         """安全读取 JSON 字段。
 
@@ -590,20 +457,6 @@ class V2SalesTrainingCoreService:
             return json.loads(value)
         except json.JSONDecodeError:
             return default
-
-    @staticmethod
-    def _normalize_round_limit(value: Any) -> int:
-        """把模型返回的轮数限制在合理范围。
-
-        LLM 可能返回字符串、空值甚至异常内容，所以先 int() 尝试转换，
-        再用 max/min 做 5-100 的边界保护。
-        """
-
-        try:
-            round_limit = int(value)
-        except (TypeError, ValueError):
-            round_limit = 8
-        return max(5, min(100, round_limit))
 
     def _require_role_profile(self, profile_id: str) -> dict[str, Any]:
         """查询 AI 角色画像，不存在时直接抛出 404。"""
@@ -628,24 +481,6 @@ class V2SalesTrainingCoreService:
         if not plan:
             raise HTTPException(status_code=404, detail="训练方案不存在")
         return plan
-
-    def _goal_response(self, row: dict[str, Any]) -> GoalSettingResponse:
-        """把数据库训练设置行转换成 Pydantic 响应。"""
-
-        # GoalStage(**item) 是关键字参数解包：
-        # item={"stage_no":1,"stage_name":"开放式",...}
-        # 等价于 GoalStage(stage_no=1, stage_name="开放式", ...)
-        stages = [GoalStage(**item) for item in self._load_json(row.get("stages_json"), [])]
-        return GoalSettingResponse(
-            setting_id=row["setting_id"],
-            profile_id=row["profile_id"],
-            training_mode=row["training_mode"],
-            training_purpose=row["training_purpose"],
-            round_limit=int(row["round_limit"]),
-            stages=stages,
-            scoring_rules=self._load_json(row.get("scoring_rules_json"), self._default_scoring_rules()),
-            status=row["status"],
-        )
 
     @staticmethod
     def _session_response(row: dict[str, Any], opening_message: str | None = None) -> TrainingSessionResponse:
@@ -700,54 +535,4 @@ class V2SalesTrainingCoreService:
             coach_analysis=self._load_json(row.get("coach_analysis_json"), {}),
             created_at=_format_response_time(row["created_at"]),
         )
-
-    def _normalize_scoring_rules(
-            self,
-            raw_rules: Any,
-            stages: list[dict[str, Any]],
-            profile: dict[str, Any],
-    ) -> dict[str, Any]:
-        """归一化评分规则，保证总分始终是 100。
-
-        规则结构：
-        - 通用能力固定 40 分，不能被 LLM 改坏；
-        - 阶段能力固定 60 分，但考核点由 LLM 根据角色和目标生成；
-        - 如果 LLM 输出不完整，就用后端兜底规则。
-        """
-
-        return TrainingScoreService.normalize_scoring_rules(raw_rules, stages, profile)
-
-    @classmethod
-    def _default_scoring_rules(
-            cls,
-            *,
-            stages: list[dict[str, Any]] | None = None,
-            profile: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """默认评分规则。
-
-        通用能力严格固定 40 分；阶段能力 60 分在 LLM 失败时按开放式训练兜底拆分。
-        """
-
-        return TrainingScoreService.default_scoring_rules(stages=stages, profile=profile)
-
-    @staticmethod
-    def _normalize_dimension_scores(dimensions: list[Any], *, total_score: int) -> list[dict[str, Any]]:
-        """按总分归一化评分维度。
-
-        LLM 可能给出 55 或 63 分，这里统一按比例缩放到目标总分。
-        """
-
-        return TrainingScoreService.normalize_dimension_scores(dimensions, total_score=total_score)
-
-    def _goal_prompt(self, profile: dict[str, Any]) -> str:
-        """构造开放式训练目标和评分规则生成提示词。"""
-
-        return self.goal_setting_service.goal_prompt(profile)
-
-    @staticmethod
-    def _fallback_goal(profile: dict[str, Any]) -> dict:
-        """训练目标生成失败时的本地兜底结果。"""
-
-        return TrainingGoalSettingService.fallback_goal(profile)
 

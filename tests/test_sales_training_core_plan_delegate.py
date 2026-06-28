@@ -73,6 +73,18 @@ class FakeRoleApplicationService:
         return "role-result"
 
 
+class FakeGoalApplicationService:
+    """记录核心外观是否把训练目标入口委托给目标应用服务。"""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.calls = []
+
+    def generate_goal_setting(self, **kwargs):
+        self.calls.append(("generate_goal_setting", kwargs))
+        return "goal-result"
+
+
 def _patch_core_dependencies(monkeypatch):
     """替换核心外观的重依赖，专注验证委托边界。"""
 
@@ -82,6 +94,7 @@ def _patch_core_dependencies(monkeypatch):
     monkeypatch.setattr(sales_training_core, "TrainingKnowledgeService", FakeKnowledgeService)
     monkeypatch.setattr(sales_training_core, "TrainingPlanDomainService", FakePlanService)
     monkeypatch.setattr(sales_training_core, "TrainingRoleApplicationService", FakeRoleApplicationService)
+    monkeypatch.setattr(sales_training_core, "TrainingGoalApplicationService", FakeGoalApplicationService)
 
 
 def test_core_delegates_plan_methods(monkeypatch):
@@ -122,4 +135,32 @@ def test_core_delegates_role_methods(monkeypatch):
         ("generate_supplement_questions", request),
         ("polish_scenario", request),
         ("generate_role", request),
+    ]
+
+
+def test_core_delegates_goal_methods(monkeypatch):
+    """训练目标生成入口应委托给 TrainingGoalApplicationService。"""
+
+    _patch_core_dependencies(monkeypatch)
+
+    core_service = sales_training_core.V2SalesTrainingCoreService()
+
+    assert core_service.generate_goal_setting(
+        profile_id="profile_1",
+        trainee_id="trainee_1",
+        training_mode="open",
+        plan_id="plan_1",
+        model_mode="fast",
+    ) == "goal-result"
+    assert core_service.goal_application_service.calls == [
+        (
+            "generate_goal_setting",
+            {
+                "profile_id": "profile_1",
+                "trainee_id": "trainee_1",
+                "training_mode": "open",
+                "plan_id": "plan_1",
+                "model_mode": "fast",
+            },
+        ),
     ]
