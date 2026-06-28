@@ -73,6 +73,8 @@ from app.application.training_support.schemas import (
     TrainingTurnRequest,
     TrainingTurnResponse,
 )
+from app.application.training.training_query_service import TrainingQueryService
+from app.application.training.training_score_service import TrainingScoreService
 from core.utils.database_connection import DatabaseErrorTypes
 from core.utils.logger_handler import logger
 from core.utils.config_handler import training_conf
@@ -148,6 +150,12 @@ class V2SalesTrainingCoreService:
         self.vector_service = VectorStoreService(collection_name=self.training_collection_name)
         # 待人工审核的上传切片写入临时 collection，发布成功后再清理，避免关系型数据库保存正文切片。
         self.staging_vector_service = VectorStoreService(collection_name=self.staging_collection_name)
+        # 训练证据召回独立成查询服务，核心服务只负责业务编排。
+        self.query_service = TrainingQueryService(
+            repository=self.repository,
+            vector_service=self.vector_service,
+            collection_name=self.training_collection_name,
+        )
         logger.info(
             "[销售训练] 核心服务初始化完成 正式Collection=%s 临时Collection=%s",
             self.training_collection_name,
@@ -1443,52 +1451,7 @@ class V2SalesTrainingCoreService:
     def _search_training_evidence(self, query: str, *, visibility: tuple[str, ...], k: int) -> list[dict[str, Any]]:
         """检索训练证据库，并过滤学员不可直接看到的内容。"""
 
-        start_perf = time.perf_counter()
-        logger.info(
-            "[销售训练][训练证据检索] 开始检索 collection=%s 可见性=%s 返回数量=%s 查询长度=%s 查询预览=%s",
-            self.training_collection_name,
-            self._join_values(visibility),
-            k,
-            len(query or ""),
-            self._short_text(query),
-        )
-        current_batch_ids = self.repository.list_current_published_batch_ids()
-        if not current_batch_ids:
-            logger.info(
-                "[销售训练][训练证据检索] 没有当前发布版本，跳过向量检索 collection=%s 耗时秒=%s",
-                self.training_collection_name,
-                round(max(0.0, time.perf_counter() - start_perf), 3),
-            )
-            return []
-        search_filters = {"batch_id": current_batch_ids}
-        documents = self.vector_service.search_documents(query, k=k, filters=search_filters)
-        evidence: list[dict[str, Any]] = []
-        for document in documents:
-            metadata = dict(document.metadata)
-            item_visibility = str(metadata.get("visibility") or "visible")
-            if item_visibility not in visibility:
-                continue
-            # 只截取前 800 字交给 LLM，避免单条证据过长挤占上下文窗口。
-            evidence.append(
-                {
-                    "chunk_id": str(metadata.get("chunk_id") or metadata.get("batch_id") or ""),
-                    "case_part": str(metadata.get("case_part") or ""),
-                    "visibility": item_visibility,
-                    "score": metadata.get("_vector_score"),
-                    "content": document.page_content[:800],
-                    "source_file": metadata.get("source_file"),
-                }
-            )
-        logger.info(
-            "[销售训练][训练证据检索] 检索完成 collection=%s 原始文档数=%s 过滤后证据数=%s 来源文件=%s 案例部分=%s 耗时秒=%s",
-            self.training_collection_name,
-            len(documents),
-            len(evidence),
-            self._join_values(item.get("source_file") for item in evidence),
-            self._join_values(item.get("case_part") for item in evidence),
-            round(max(0.0, time.perf_counter() - start_perf), 3),
-        )
-        return evidence
+        return self.query_service.search_training_evidence(query, visibility=visibility, k=k)
 
     def _generate_customer_reply(
             self,
@@ -2434,32 +2397,7 @@ class V2SalesTrainingCoreService:
         - 如果 LLM 输出不完整，就用后端兜底规则。
         """
 
-        rules = raw_rules if isinstance(raw_rules, dict) else {}
-        default_rules = self._default_scoring_rules(stages=stages, profile=profile)
-        stage_dimensions = rules.get("stage_dimensions")
-        if not isinstance(stage_dimensions, list) or not stage_dimensions:
-            stage_dimensions = default_rules["stage_dimensions"]
-        else:
-            # 阶段能力要像通用能力一样有多个评分维度。
-            # 如果 LLM 只给了 1 个大维度，页面会显得太单薄，这里直接回退到三维度兜底规则。
-            valid_dimensions = [item for item in stage_dimensions if isinstance(item, dict)]
-            has_enough_dimensions = len(valid_dimensions) >= 3
-            has_enough_points = all(
-                isinstance(item.get("points"), list) and len(item.get("points") or []) >= 3
-                for item in valid_dimensions
-            )
-            if not has_enough_dimensions or not has_enough_points:
-                stage_dimensions = default_rules["stage_dimensions"]
-        normalized_stage_dimensions = self._normalize_dimension_scores(stage_dimensions, total_score=60)
-        return {
-            "total_score": 100,
-            "general_score": 40,
-            "stage_score": 60,
-            "general_dimensions": default_rules["general_dimensions"],
-            "stage_dimensions": normalized_stage_dimensions,
-            "review_mode": "ai_auto",
-            "formula": "总分 = 通用能力得分 + 阶段能力得分 - 扣分；一期暂不启用违规词扣分",
-        }
+        return TrainingScoreService.normalize_scoring_rules(raw_rules, stages, profile)
 
     @classmethod
     def _default_scoring_rules(
@@ -2473,80 +2411,7 @@ class V2SalesTrainingCoreService:
         通用能力严格固定 40 分；阶段能力 60 分在 LLM 失败时按开放式训练兜底拆分。
         """
 
-        role_profile = cls._load_json((profile or {}).get("role_profile_json"), {}) if profile else {}
-        stage = (stages or [{}])[0] if stages else {}
-        stage_name = str(stage.get("stage_name") or "开放式沟通目标")
-        core_goal = str(stage.get("core_goal") or "围绕客户痛点推进有效沟通")
-        customer_focus = role_profile.get("业务痛点") or role_profile.get("business_pain_points") or []
-        focus_text = "、".join(str(item) for item in customer_focus[:2]) if isinstance(customer_focus, list) else str(customer_focus)
-        return {
-            "total_score": 100,
-            "general_score": 40,
-            "stage_score": 60,
-            "general_dimensions": [
-                {
-                    "dimension_name": "内容质量",
-                    "score": 20,
-                    "points": [
-                        {"point_name": "信息准确性", "score": 10, "description": "回答不编造事实，能基于已知客户信息和训练知识表达。"},
-                        {"point_name": "需求理解与回应", "score": 5, "description": "能承接客户问题，不答非所问。"},
-                        {"point_name": "价值传递", "score": 5, "description": "能把方案价值和客户痛点连接起来。"},
-                    ],
-                },
-                {
-                    "dimension_name": "语言表达",
-                    "score": 10,
-                    "points": [
-                        {"point_name": "流利度", "score": 4, "description": "表达自然顺畅。"},
-                        {"point_name": "专业术语使用", "score": 3, "description": "术语准确，不过度堆砌。"},
-                        {"point_name": "逻辑清晰度", "score": 3, "description": "先回应问题，再给理由和下一步。"},
-                    ],
-                },
-                {
-                    "dimension_name": "互动与态度",
-                    "score": 10,
-                    "points": [
-                        {"point_name": "倾听与承接", "score": 4, "description": "能接住客户情绪和顾虑。"},
-                        {"point_name": "礼貌与亲和力", "score": 3, "description": "沟通态度专业、尊重客户。"},
-                        {"point_name": "主动引导", "score": 3, "description": "能用问题推进下一步沟通。"},
-                    ],
-                },
-            ],
-            "stage_dimensions": [
-                {
-                    "dimension_name": "需求挖掘与痛点确认",
-                    "score": 20,
-                    "core_goal": core_goal,
-                    "points": [
-                        {"point_name": "背景追问", "score": 7, "description": "能围绕行业、规模、现有流程等背景连续追问，而不是直接讲方案。"},
-                        {"point_name": "痛点定位", "score": 7, "description": f"能识别并复述客户真实痛点，重点关注：{focus_text or '投入产出、风险和落地成本'}。"},
-                        {"point_name": "需求确认", "score": 6, "description": "能向客户确认优先级、影响范围和是否愿意继续沟通。"},
-                    ],
-                },
-                {
-                    "dimension_name": "价值呈现与证据支撑",
-                    "score": 20,
-                    "core_goal": core_goal,
-                    "points": [
-                        {"point_name": "价值匹配", "score": 7, "description": "能把方案价值与客户已经表达的痛点建立清晰连接。"},
-                        {"point_name": "证据提供", "score": 7, "description": "能引用案例、数据、流程或知识库事实支撑表达，避免空泛承诺。"},
-                        {"point_name": "风险降低", "score": 6, "description": "能解释落地方式、验证路径或试点方式，降低客户决策顾虑。"},
-                    ],
-                },
-                {
-                    "dimension_name": "异议处理与推进动作",
-                    "score": 20,
-                    "core_goal": core_goal,
-                    "points": [
-                        {"point_name": "异议承接", "score": 7, "description": "面对价格、风险、交付等异议时先承接再回应，不回避客户质疑。"},
-                        {"point_name": "针对回应", "score": 7, "description": "能根据客户具体异议给出对应解释，不使用模板化套话。"},
-                        {"point_name": "下一步推进", "score": 6, "description": "能争取客户继续沟通、试点、提供资料或约定下一次联系。"},
-                    ],
-                },
-            ],
-            "review_mode": "ai_auto",
-            "formula": "总分 = 通用能力得分 + 阶段能力得分 - 扣分；一期暂不启用违规词扣分",
-        }
+        return TrainingScoreService.default_scoring_rules(stages=stages, profile=profile)
 
     @staticmethod
     def _normalize_dimension_scores(dimensions: list[Any], *, total_score: int) -> list[dict[str, Any]]:
@@ -2555,25 +2420,7 @@ class V2SalesTrainingCoreService:
         LLM 可能给出 55 或 63 分，这里统一按比例缩放到目标总分。
         """
 
-        normalized: list[dict[str, Any]] = []
-        source_dimensions = [item for item in dimensions if isinstance(item, dict)]
-        if not source_dimensions:
-            return []
-        raw_total = sum(max(0, int(item.get("score") or 0)) for item in source_dimensions) or total_score
-        allocated = 0
-        for index, item in enumerate(source_dimensions):
-            score = int(round(max(0, int(item.get("score") or 0)) * total_score / raw_total))
-            if index == len(source_dimensions) - 1:
-                score = total_score - allocated
-            allocated += score
-            points = item.get("points") if isinstance(item.get("points"), list) else []
-            normalized.append({
-                "dimension_name": str(item.get("dimension_name") or item.get("stage_name") or "阶段评分"),
-                "score": max(0, score),
-                "core_goal": item.get("core_goal") or "",
-                "points": points,
-            })
-        return normalized
+        return TrainingScoreService.normalize_dimension_scores(dimensions, total_score=total_score)
 
     def _build_turn_coach_analysis(
             self,
@@ -3052,33 +2899,11 @@ class V2SalesTrainingCoreService:
         兜底分只用于保证流程闭环，真实评分仍应优先使用 LLM 按评分规则判断。
         """
 
-        trainee_turns = [item for item in turns if item["role"] == "trainee"]
-        base_score = 72 + min(10, len(trainee_turns) * 2)
-        return {
-            "total_score": min(88, base_score),
-            "general_score": 32,
-            "stage_score": max(0, min(56, base_score - 32)),
-            "penalty_score": 0,
-            "hit_points": ["完成了基本沟通", "能围绕客户问题继续回应"],
-            "missing_points": ["需要更多追问客户真实顾虑", "需要引用更具体案例"],
-            "wrong_points": [],
-            "evidence_refs": [{"type": "dialogue", "round_no": item["round_no"]} for item in trainee_turns[:3]],
-            "improvement_advice": "下一次训练重点加强需求挖掘和案例化表达。",
-            "reference_script": "可以先确认客户当前卡点，再用同类客户案例降低风险感。",
-            "next_training_plan": ["需求挖掘专项", "异议处理专项"],
-        }
+        return TrainingScoreService.fallback_score(turns, evidence)
 
     @staticmethod
     def _score_level(score: int) -> str:
         """把最终得分转换成中文等级。"""
 
-        if score > 90:
-            return "优秀"
-        if score > 80:
-            return "良好"
-        if score >= 75:
-            return "及格"
-        if score >= 60:
-            return "待观察"
-        return "不及格"
+        return TrainingScoreService.score_level(score)
 
