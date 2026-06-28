@@ -73,6 +73,7 @@ from app.application.training_support.schemas import (
     TrainingTurnResponse,
 )
 from app.application.training.training_query_service import TrainingQueryService
+from app.application.training.training_goal_setting_service import TrainingGoalSettingService
 from app.application.training.training_role_service import TrainingRoleService
 from app.application.training.training_score_service import TrainingScoreService
 from core.utils.database_connection import DatabaseErrorTypes
@@ -158,6 +159,8 @@ class V2SalesTrainingCoreService:
         )
         # 角色生成相关的纯逻辑拆到独立服务，核心外观只负责编排数据库、向量库和 LLM 调用。
         self.role_service = TrainingRoleService()
+        # 训练目标生成同样拆成纯逻辑服务，避免核心编排类继续堆积提示词和兜底模板。
+        self.goal_setting_service = TrainingGoalSettingService()
         logger.info(
             "[销售训练] 核心服务初始化完成 正式Collection=%s 临时Collection=%s",
             self.training_collection_name,
@@ -2507,13 +2510,7 @@ class V2SalesTrainingCoreService:
     def _goal_prompt(self, profile: dict[str, Any]) -> str:
         """构造开放式训练目标和评分规则生成提示词。"""
 
-        role_profile = self._load_json(profile.get("role_profile_json"), {})
-        hidden_profile = self._load_json(profile.get("hidden_profile_json"), {})
-        return prompt_manager.render(
-            "training.goal_setting.user",
-            role_profile_json=json.dumps(role_profile, ensure_ascii=False, indent=2),
-            hidden_profile_json=json.dumps(hidden_profile, ensure_ascii=False, indent=2),
-        )
+        return self.goal_setting_service.goal_prompt(profile)
 
     def _opening_prompt(self, session: dict[str, Any]) -> str:
         """构造 AI 客户开场白提示词。"""
@@ -2609,37 +2606,7 @@ class V2SalesTrainingCoreService:
     def _fallback_goal(profile: dict[str, Any]) -> dict:
         """训练目标生成失败时的本地兜底结果。"""
 
-        role_profile = V2SalesTrainingCoreService._load_json(profile.get("role_profile_json"), {})
-        hidden_profile = V2SalesTrainingCoreService._load_json(profile.get("hidden_profile_json"), {})
-        evidence = V2SalesTrainingCoreService._load_json(profile.get("retrieved_evidence_json"), [])
-        scenario_text = str(profile.get("scenario_description") or "")
-        role_complexity = len(role_profile.get("business_pain_points") or []) + len(role_profile.get("challenge_strategy") or [])
-        concern_complexity = len(hidden_profile.get("real_concerns") or [])
-        # LLM 正常时会直接给出 round_limit；兜底时按场景复杂度估算，避免一期训练轮数退化成固定值。
-        estimated_round_limit = 6 + min(8, role_complexity + concern_complexity + len(evidence) // 2 + len(scenario_text) // 120)
-        return {
-            "training_purpose": "需求挖掘",
-            "round_limit": estimated_round_limit,
-            "stages": [
-                {
-                    "stage_no": 1,
-                    "stage_name": "开放式需求挖掘",
-                    "core_goal": "通过自然沟通获取客户痛点、顾虑和下一步意向。",
-                    "success_conditions": ["客户说出至少一个具体痛点", "客户愿意继续了解方案"],
-                    "failure_conditions": ["客户明确拒绝继续沟通", "学员连续多轮没有回应客户关切"],
-                }
-            ],
-            "scoring_rules": V2SalesTrainingCoreService._default_scoring_rules(
-                stages=[
-                    {
-                        "stage_no": 1,
-                        "stage_name": "开放式需求挖掘",
-                        "core_goal": "通过自然沟通获取客户痛点、顾虑和下一步意向。",
-                    }
-                ],
-                profile=profile,
-            ),
-        }
+        return TrainingGoalSettingService.fallback_goal(profile)
 
     @staticmethod
     def _fallback_customer_reply(evidence: list[dict[str, Any]]) -> str:
