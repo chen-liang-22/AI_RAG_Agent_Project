@@ -62,6 +62,7 @@ from app.application.training.training_goal_setting_service import TrainingGoalS
 from app.application.training.training_role_service import TrainingRoleService
 from app.application.training.training_knowledge_service import TrainingKnowledgeService
 from app.application.training.training_plan_domain_service import TrainingPlanDomainService
+from app.application.training.training_session_basic_service import TrainingSessionBasicService
 from app.application.training.training_session_prompt_service import TrainingSessionPromptService
 from app.application.training.training_score_service import TrainingScoreService
 from core.utils.logger_handler import logger
@@ -159,6 +160,11 @@ class V2SalesTrainingCoreService:
         )
         # 训练方案 CRUD 和状态联动拆到方案领域服务，核心外观保留同名入口。
         self.plan_service = TrainingPlanDomainService(repository=self.repository)
+        # 会话创建、历史列表和复盘详情拆到会话基础服务；对话流和评分后续单独拆。
+        self.session_basic_service = TrainingSessionBasicService(
+            repository=self.repository,
+            session_prompt_service=self.session_prompt_service,
+        )
         logger.info(
             "[销售训练] 核心服务初始化完成 正式Collection=%s 临时Collection=%s",
             self.training_collection_name,
@@ -522,41 +528,7 @@ class V2SalesTrainingCoreService:
         所以创建会话后会立刻生成并保存 round_no=0 的客户开场白。
         """
 
-        setting = self._require_goal_setting(request.setting_id)
-        if setting["profile_id"] != request.profile_id:
-            raise HTTPException(status_code=400, detail="训练设置和陪练角色不匹配")
-        response_mode = self._normalize_response_mode(request.response_mode)
-        logger.info(
-            "[销售训练] 创建训练会话开始 角色编号=%s 设置编号=%s 学员编号=%s 回复模式=%s 轮数上限=%s",
-            request.profile_id,
-            request.setting_id,
-            request.trainee_id,
-            response_mode,
-            setting["round_limit"],
-        )
-        session = self.repository.create_session(
-            profile_id=request.profile_id,
-            setting_id=request.setting_id,
-            trainee_id=request.trainee_id,
-            training_mode="open",
-            response_mode=response_mode,
-            round_limit=int(setting["round_limit"]),
-            status="active",
-        )
-        opening_message = self._generate_opening_message(session, model_mode=request.model_mode)
-        self.repository.add_turn(
-            session_id=session["session_id"],
-            role="customer",
-            content=opening_message,
-            round_no=0,
-            response_mode=response_mode,
-            stage_no=1,
-            started_at=session["started_at"],
-            submitted_at=utc_now_text(),
-            metadata={"turn_type": "opening"},
-        )
-        logger.info("[销售训练] 训练会话开始 会话编号=%s 回复模式=%s 已生成开场白", session["session_id"], response_mode)
-        return self._session_response(session, opening_message=opening_message)
+        return self.session_basic_service.start_session(request)
 
     def list_sessions(
             self,
@@ -567,15 +539,7 @@ class V2SalesTrainingCoreService:
     ) -> TrainingSessionListResponse:
         """分页查询训练历史。"""
 
-        safe_page = max(1, page)
-        safe_page_size = max(1, min(50, page_size))
-        rows, total = self.repository.list_sessions(page=safe_page, page_size=safe_page_size, trainee_id=trainee_id)
-        return TrainingSessionListResponse(
-            items=[self._session_summary(row) for row in rows],
-            total=total,
-            page=safe_page,
-            page_size=safe_page_size,
-        )
+        return self.session_basic_service.list_sessions(page=page, page_size=page_size, trainee_id=trainee_id)
 
     def get_session_detail(self, session_id: str) -> TrainingSessionDetailResponse:
         """查询训练复盘详情。
@@ -588,39 +552,7 @@ class V2SalesTrainingCoreService:
         - score：已有评分报告。
         """
 
-        session = self.repository.get_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="训练会话不存在")
-
-        turns = self.repository.list_turns(session_id)
-        profile = self._require_role_profile(session["profile_id"])
-        setting = self._require_goal_setting(session["setting_id"])
-        score = self.repository.get_latest_score_by_session(session_id)
-        visible_profile = self._load_json(profile.get("visible_profile_json"), {})
-        hidden_profile = self._load_json(profile.get("hidden_profile_json"), {})
-        role_profile = self._load_json(profile.get("role_profile_json"), {})
-        role_confirm_card = self._load_json(profile.get("role_confirm_card_json"), {})
-        retrieved_evidence = self._load_json(profile.get("retrieved_evidence_json"), [])
-        # {**session, "answered_count": ...} 是字典合并写法：
-        # 先复制 session，再覆盖/新增 answered_count 字段。
-        summary = self._session_summary({**session, "answered_count": sum(1 for item in turns if item["role"] == "trainee")})
-        return TrainingSessionDetailResponse(
-            session=summary,
-            turns=[self._turn_record(item) for item in turns],
-            visible_profile=visible_profile,
-            hidden_profile=hidden_profile,
-            role_profile=role_profile,
-            role_confirm_card=role_confirm_card,
-            goal_setting={
-                "setting_id": setting["setting_id"],
-                "training_purpose": setting["training_purpose"],
-                "round_limit": int(setting["round_limit"]),
-                "stages": self._load_json(setting.get("stages_json"), []),
-                "scoring_rules": self._load_json(setting.get("scoring_rules_json"), self._default_scoring_rules()),
-            },
-            knowledge_facts=[item["content"][:160] for item in retrieved_evidence if item.get("content")],
-            score=self._score_response(score) if score else None,
-        )
+        return self.session_basic_service.get_session_detail(session_id)
 
     def submit_turn(self, session_id: str, request: TrainingTurnRequest) -> TrainingTurnResponse:
         """提交学员回复并一次性返回 AI 客户回复。"""
@@ -1006,42 +938,6 @@ class V2SalesTrainingCoreService:
                 exc,
             )
             yield self._fallback_customer_reply(evidence)
-
-    def _generate_opening_message(self, session: dict[str, Any], *, model_mode: str | None) -> str:
-        """生成 AI 客户开场白，让训练会话一开始就像真实客户在场。"""
-
-        prompt = self._opening_prompt(session)
-        start_perf = time.perf_counter()
-        logger.info(
-            "[销售训练][AI客户开场白] 调用开始 会话编号=%s 模型档位=%s 提示词长度=%s",
-            session["session_id"],
-            model_mode or "默认",
-            len(prompt),
-        )
-        try:
-            response = get_chat_model(model_mode).invoke(
-                self._messages(prompt_manager.get("training.ai_customer_system"), prompt)
-            )
-            text = self._content_text(response.content).strip()
-            if text:
-                logger.info(
-                    "[销售训练][AI客户开场白] 调用完成 会话编号=%s 回复长度=%s 耗时秒=%s 回复预览=%s",
-                    session["session_id"],
-                    len(text),
-                    round(max(0.0, time.perf_counter() - start_perf), 3),
-                    self._short_text(text),
-                )
-                return text
-            logger.warning("[销售训练][AI客户开场白] 模型返回为空，使用兜底开场白 会话编号=%s", session["session_id"])
-            return self._fallback_opening_message(session)
-        except Exception as exc:
-            logger.warning(
-                "[销售训练] AI客户开场白生成失败，使用兜底开场白 会话编号=%s 耗时秒=%s 错误=%s",
-                session["session_id"],
-                round(max(0.0, time.perf_counter() - start_perf), 3),
-                exc,
-            )
-            return self._fallback_opening_message(session)
 
     @staticmethod
     def _messages(system: str, human: str) -> list:
@@ -1448,13 +1344,6 @@ class V2SalesTrainingCoreService:
 
         return self.goal_setting_service.goal_prompt(profile)
 
-    def _opening_prompt(self, session: dict[str, Any]) -> str:
-        """构造 AI 客户开场白提示词。"""
-
-        profile = self._require_role_profile(session["profile_id"])
-        setting = self._require_goal_setting(session["setting_id"])
-        return self.session_prompt_service.opening_prompt(profile, setting)
-
     def _customer_prompt(self, session: dict[str, Any], trainee_message: str, evidence: list[dict[str, Any]]) -> str:
         """构造每轮 AI 客户回复提示词。"""
 
@@ -1520,12 +1409,6 @@ class V2SalesTrainingCoreService:
         """AI 客户回复失败时的兜底话术。"""
 
         return TrainingSessionPromptService.fallback_customer_reply(evidence)
-
-    def _fallback_opening_message(self, session: dict[str, Any]) -> str:
-        """AI 客户开场白失败时的兜底话术。"""
-
-        profile = self._require_role_profile(session["profile_id"])
-        return self.session_prompt_service.fallback_opening_message(profile)
 
     @staticmethod
     def _fallback_score(turns: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> dict:
