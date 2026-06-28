@@ -18,6 +18,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, UploadFile
@@ -380,49 +381,32 @@ class V2SalesTrainingCoreService:
         )
 
     def preview_batch(self, batch_id: str, *, max_chars: int = 30000) -> TrainingKnowledgePreviewResponse:
-        """预览训练资料原文件。
+        """返回训练资料上传文件的站内预览数据。
 
-        预览读的是上传保存下来的原始文件，不读 Qdrant 分片。
-        这样用户能确认“我到底上传了哪份资料”。
+        查看切片已经有独立入口，所以这里优先预览原文件文本；
+        DOCX/PDF 会解析为文本，避免浏览器把 Word 文件当成下载处理。
         """
 
         batch = self._get_active_batch(batch_id)
-        source_file = str(self._batch_file_info(batch).get("source_file") or batch.get("source_file") or "")
-        file_type = source_file.rsplit(".", 1)[-1].lower() if "." in source_file else ""
-        safe_max_chars = max(500, min(100000, max_chars))
-
-        stored_preview = self._saved_chunk_preview(batch, safe_max_chars=safe_max_chars)
-        if stored_preview["content"]:
-            content = stored_preview["content"]
-            truncated = stored_preview["truncated"]
-            preview_type = "saved_chunks"
-        else:
-            with self._download_batch_file(batch) as file_path:
-                if file_type == "txt":
-                    with open(file_path, "r", encoding="utf-8", errors="replace") as file:
-                        content = file.read(safe_max_chars + 1)
-                    truncated = len(content) > safe_max_chars
-                    preview_type = "text"
-                elif file_type in ALLOWED_TRAINING_FILE_TYPES:
-                    # 如果数据库没有切片，再临时解析原文件做只读预览。
-                    strategy = KnowledgeIngestStrategyFactory.create(batch.get("source_type") or "lms_case")
-                    chunks = strategy.parse_chunks(file_path, {
-                        "batch_id": batch_id,
-                        "source_file": source_file,
-                        "source_type": batch.get("source_type"),
-                        "visibility_default": batch.get("visibility_default") or DEFAULT_TRAINING_VISIBILITY,
-                    })
-                    content = "\n\n".join(f"{chunk.case_part}\n{chunk.text.strip()}" for chunk in chunks)[:safe_max_chars]
-                    truncated = len(content) >= safe_max_chars
-                    preview_type = "document_text"
-                else:
-                    raise HTTPException(status_code=400, detail=f"当前训练资料类型不支持预览：{file_type}")
+        file_info = self._batch_file_info(batch)
+        file_url = str(file_info.get("public_url") or "").strip()
+        if not file_url:
+            object_name = str(file_info.get("object_name") or "").strip()
+            if not object_name:
+                raise HTTPException(status_code=400, detail="训练资料缺少 MinIO 对象路径，请先完成历史文件迁移")
+            file_url = get_file_storage_service().client.get_public_url(
+                object_name,
+                bucket_name=file_info.get("bucket_name"),
+            )
+        preview = self._build_batch_preview(batch, max_chars=max_chars)
 
         return TrainingKnowledgePreviewResponse(
             batch=self._batch_response(batch),
-            preview_type=preview_type,
-            content=content,
-            truncated=truncated,
+            preview_type=preview["preview_type"],
+            content=preview["content"],
+            truncated=preview["truncated"],
+            file_url=file_url,
+            charset=preview.get("charset"),
         )
 
     def delete_batch(self, batch_id: str) -> TrainingKnowledgeDeleteResponse:
@@ -2223,6 +2207,55 @@ class V2SalesTrainingCoreService:
 
         documents = FileProcessorFactory.load_documents(file_path)
         return "\n\n".join(document.page_content for document in documents).strip()
+
+    @staticmethod
+    def _looks_mojibake(text: str) -> bool:
+        """粗略判断文本是否存在明显乱码。"""
+
+        if not text:
+            return False
+        bad_chars = text.count("\ufffd") + text.count("�")
+        suspicious_chars = sum(1 for char in text if "\ue000" <= char <= "\uf8ff")
+        return (bad_chars + suspicious_chars) / max(len(text), 1) > 0.01
+
+    @classmethod
+    def _decode_text_bytes(cls, raw_data: bytes) -> tuple[str, str]:
+        """按常见中文编码解码 TXT，避免浏览器直连 MinIO 时乱码。"""
+
+        for charset in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+            try:
+                text = raw_data.decode(charset)
+            except UnicodeDecodeError:
+                continue
+            if not cls._looks_mojibake(text):
+                return text, charset
+        return raw_data.decode("utf-8", errors="replace"), "utf-8-replace"
+
+    def _build_batch_preview(self, batch: dict[str, Any], *, max_chars: int) -> dict[str, Any]:
+        """根据训练资料文件类型生成站内弹窗预览数据。"""
+
+        file_info = self._batch_file_info(batch)
+        source_file = str(file_info.get("source_file") or batch.get("source_file") or "")
+        file_type = source_file.rsplit(".", 1)[-1].lower() if "." in source_file else ""
+        if file_type not in ALLOWED_TRAINING_FILE_TYPES:
+            return {"preview_type": "file_url", "content": "", "truncated": False, "charset": None}
+
+        with self._download_batch_file(batch) as file_path:
+            if file_type == "txt":
+                content, charset = self._decode_text_bytes(Path(file_path).read_bytes())
+            else:
+                documents = FileProcessorFactory.load_documents(file_path)
+                content = "\n\n".join(document.page_content.strip() for document in documents if document.page_content.strip())
+                charset = "document-parser"
+
+        safe_max_chars = max(500, min(100000, max_chars))
+        truncated = len(content) > safe_max_chars
+        return {
+            "preview_type": "text",
+            "content": content[:safe_max_chars],
+            "truncated": truncated,
+            "charset": charset,
+        }
 
     def _batch_file_info(self, row: dict[str, Any]) -> dict[str, Any]:
         """读取训练资料关联的文件基础信息。

@@ -6,6 +6,7 @@
 
 import json
 import uuid
+from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
 
@@ -36,12 +37,12 @@ from app.application.knowledge.upload_preview_service import (
 )
 from app.infrastructure.adapters.file_storage_adapter import FileStorageAdapter
 from app.infrastructure.adapters.vector_store_adapter import VectorStoreAdapter
+from app.infrastructure.file_storage_service import get_file_storage_service
 from app.infrastructure.repositories.dictionary_repository import DictionaryRepository
 from app.infrastructure.repositories.document_repository import DocumentRepository
 from app.shared.document_response import DictionaryCodeSnapshot, document_to_response
 from app.infrastructure.id_generator import new_id
 from core.rag.file_processors import FileProcessorFactory
-from core.utils.file_handler import pdf_loader
 from core.utils.logger_handler import logger
 from core.utils.qdrant_options import get_qdrant_collection_name, normalize_qdrant_collection_name
 
@@ -232,23 +233,31 @@ class KnowledgeApplicationService:
         return document_to_response(document, self._document_dictionary_snapshot())
 
     def preview_file(self, document_id: str, max_chars: int) -> KnowledgeFilePreviewResponse:
-        """预览已入库文件的原始文本内容。"""
+        """返回已入库文件预览数据。
 
-        logger.info("[V2知识资产] 预览文件 文档编号=%s 最大字符数=%s", document_id, max_chars)
+        文本类文件由后端解码后返回 content，避免浏览器直接打开 MinIO TXT 时乱码；
+        其他浏览器可直接展示的类型返回 file_url，前端在弹窗内嵌入预览。
+        """
+
+        logger.info("[V2知识资产] 预览文件开始 文档编号=%s 最大字符数=%s", document_id, max_chars)
         document = self._active_document_or_404(document_id)
-        try:
-            preview = self._read_knowledge_file_preview(document, max_chars)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.error("[V2知识资产] 预览文件失败 文档编号=%s 错误=%s", document_id, exc, exc_info=True)
-            raise HTTPException(status_code=500, detail=f"文件预览失败：{exc}") from exc
+        file_url = self._document_file_url(document)
+        preview = self._build_file_preview(document, max_chars=max_chars)
+        logger.info(
+            "[V2知识资产] 预览文件完成 文档编号=%s 预览类型=%s 字符集=%s 是否截断=%s",
+            document_id,
+            preview["preview_type"],
+            preview.get("charset") or "无",
+            preview["truncated"],
+        )
         return KnowledgeFilePreviewResponse(
             document=document_to_response(document, self._document_dictionary_snapshot()),
             preview_type=preview["preview_type"],
             content=preview["content"],
             truncated=preview["truncated"],
-            page_count=preview["page_count"],
+            page_count=preview.get("page_count"),
+            file_url=file_url,
+            charset=preview.get("charset"),
         )
 
     def delete_file(self, document_id: str) -> KnowledgeDeleteResponse:
@@ -371,10 +380,57 @@ class KnowledgeApplicationService:
             raise HTTPException(status_code=404, detail=f"文件不存在：{document_id}")
         return document
 
-    def _read_knowledge_file_preview(self, document: dict, max_chars: int) -> dict:
-        """从 MinIO 下载原文件并按文件类型读取预览文本。"""
+    @staticmethod
+    def _is_text_like_file(file_type: str) -> bool:
+        """判断文件是否适合在后端解析为文本后展示。"""
 
-        file_type = str(document["file_type"]).lower().lstrip(".")
+        return file_type.lower().lstrip(".") in {"txt", "md", "csv", "json", "log", "docx", "pdf"}
+
+    @staticmethod
+    def _looks_mojibake(text: str) -> bool:
+        """粗略判断文本是否存在明显乱码。"""
+
+        if not text:
+            return False
+        bad_chars = text.count("\ufffd") + text.count("�")
+        suspicious_chars = sum(1 for char in text if "\ue000" <= char <= "\uf8ff")
+        return (bad_chars + suspicious_chars) / max(len(text), 1) > 0.01
+
+    @classmethod
+    def _decode_text_bytes(cls, raw_data: bytes) -> tuple[str, str]:
+        """按常见中文编码解码 TXT，避免浏览器直开 MinIO 时乱码。"""
+
+        for charset in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+            try:
+                text = raw_data.decode(charset)
+            except UnicodeDecodeError:
+                continue
+            if not cls._looks_mojibake(text):
+                return text, charset
+        return raw_data.decode("utf-8", errors="replace"), "utf-8-replace"
+
+    def _document_file_url(self, document: dict) -> str:
+        """读取或补全 MinIO HTTP 文件地址。"""
+
+        file_url = str(document.get("public_url") or "").strip()
+        if file_url:
+            return file_url
+
+        object_name = str(document.get("object_name") or "").strip()
+        if not object_name:
+            raise HTTPException(status_code=400, detail="文件缺少 MinIO 对象路径，请先完成历史文件迁移")
+        return get_file_storage_service().client.get_public_url(
+            object_name,
+            bucket_name=document.get("bucket_name"),
+        )
+
+    def _build_file_preview(self, document: dict, *, max_chars: int) -> dict:
+        """根据文件类型生成弹窗预览数据。"""
+
+        file_type = str(document.get("file_type") or Path(str(document.get("filename") or "")).suffix).lower().lstrip(".")
+        if not self._is_text_like_file(file_type):
+            return {"preview_type": "file_url", "content": "", "truncated": False, "page_count": None, "charset": None}
+
         object_name = str(document.get("object_name") or "").strip()
         if not object_name:
             raise HTTPException(status_code=400, detail="文件缺少 MinIO 对象路径，请先完成历史文件迁移")
@@ -382,61 +438,22 @@ class KnowledgeApplicationService:
         with self.file_storage.downloaded_temp_file(
             bucket_name=document.get("bucket_name"),
             object_name=object_name,
-            filename=document["filename"],
+            filename=str(document.get("filename") or "preview_file"),
         ) as file_path:
-            if file_type == "txt":
-                content, truncated = self._read_text_file_preview(file_path, max_chars)
-                return {"preview_type": "text", "content": content, "truncated": truncated, "page_count": None}
-            if file_type == "pdf":
-                content, truncated, page_count = self._read_pdf_file_preview(file_path, max_chars)
-                return {"preview_type": "pdf_text", "content": content, "truncated": truncated, "page_count": page_count}
-            if file_type == "docx":
-                content, truncated = self._read_document_file_preview(file_path, max_chars)
-                return {"preview_type": "document_text", "content": content, "truncated": truncated, "page_count": None}
-        raise HTTPException(status_code=400, detail=f"当前文件类型不支持预览：{file_type}")
+            if file_type in {"txt", "md", "csv", "json", "log"}:
+                raw_data = Path(file_path).read_bytes()
+                content, charset = self._decode_text_bytes(raw_data)
+            else:
+                documents = FileProcessorFactory.load_documents(file_path)
+                content = "\n\n".join(item.page_content.strip() for item in documents if item.page_content.strip())
+                charset = "document-parser"
 
-    @staticmethod
-    def _read_text_file_preview(file_path: str, max_chars: int) -> tuple[str, bool]:
-        """读取 TXT 文件预览内容。"""
-
-        with open(file_path, "r", encoding="utf-8", errors="replace") as file:
-            content = file.read(max_chars + 1)
-        return content[:max_chars], len(content) > max_chars
-
-    @staticmethod
-    def _append_preview_page(parts: list[str], total_chars: int, page_title: str, page_content: str, max_chars: int) -> tuple[int, bool]:
-        """把一页 PDF 文本追加到预览内容中。"""
-
-        if not page_content.strip():
-            return total_chars, False
-        page_text = f"{page_title}\n{page_content.strip()}"
-        candidate = f"\n\n{page_text}" if parts else page_text
-        remaining_chars = max_chars - total_chars
-        if len(candidate) > remaining_chars:
-            parts.append(candidate[:remaining_chars])
-            return max_chars, True
-        parts.append(candidate)
-        return total_chars + len(candidate), False
-
-    @classmethod
-    def _read_pdf_file_preview(cls, file_path: str, max_chars: int) -> tuple[str, bool, int]:
-        """读取 PDF 文件的文本预览。"""
-
-        documents = pdf_loader(file_path)
-        parts: list[str] = []
-        total_chars = 0
-        truncated = False
-        for page_index, document in enumerate(documents, start=1):
-            page_no = int(document.metadata.get("page", page_index - 1)) + 1
-            total_chars, truncated = cls._append_preview_page(parts, total_chars, f"第 {page_no} 页", document.page_content, max_chars)
-            if truncated:
-                break
-        return "".join(parts), truncated, len(documents)
-
-    @staticmethod
-    def _read_document_file_preview(file_path: str, max_chars: int) -> tuple[str, bool]:
-        """读取 DOCX 等文档类文件的文本预览。"""
-
-        documents = FileProcessorFactory.load_documents(file_path)
-        content = "\n\n".join(document.page_content.strip() for document in documents if document.page_content.strip())
-        return content[:max_chars], len(content) > max_chars
+        safe_max_chars = max(1000, min(MAX_PREVIEW_CHAR_LIMIT, max_chars))
+        truncated = len(content) > safe_max_chars
+        return {
+            "preview_type": "text",
+            "content": content[:safe_max_chars],
+            "truncated": truncated,
+            "page_count": None,
+            "charset": charset,
+        }

@@ -108,7 +108,7 @@ def list_training_batches(page: int = Query(1, ge=1), page_size: int = Query(10,
 
 @router.get("/knowledge/batches/{batch_id}/preview", response_model=TrainingKnowledgePreviewResponse)
 def preview_training_batch(batch_id: str, max_chars: int = Query(30000, ge=500, le=100000)) -> TrainingKnowledgePreviewResponse:
-    """预览训练资料原文件内容。"""
+    """返回训练资料原文件的 MinIO HTTP 预览地址。"""
 
     return _materials().preview_batch(batch_id, max_chars=max_chars)
 

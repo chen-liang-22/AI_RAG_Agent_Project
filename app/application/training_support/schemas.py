@@ -67,12 +67,14 @@ class TrainingKnowledgeBatchListResponse(BaseModel):
 
 
 class TrainingKnowledgePreviewResponse(BaseModel):
-    """训练资料原文件预览响应。"""
+    """训练资料上传文件预览响应。"""
 
     batch: TrainingKnowledgeBatchResponse  # 被预览的训练资料批次。
-    preview_type: str  # text / document_text，表示当前采用的预览方式。
-    content: str  # 从原文件抽取出的预览文本。
-    truncated: bool  # 是否因为内容过长被截断。
+    preview_type: str  # text/file_url，text 表示前端直接渲染 content，file_url 表示前端嵌入 file_url。
+    content: str  # 文本文件或 DOCX/PDF 抽取出的预览文本。
+    truncated: bool  # 文本内容是否因 max_chars 被截断。
+    file_url: str | None = None  # MinIO HTTP 访问地址，前端用它打开上传文件。
+    charset: str | None = None  # 文本预览实际采用的字符集或解析器标识。
 
 
 class TrainingKnowledgeDeleteResponse(BaseModel):

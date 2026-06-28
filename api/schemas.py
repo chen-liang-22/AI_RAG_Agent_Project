@@ -178,15 +178,17 @@ class KnowledgeFileResponse(BaseModel):
 class KnowledgeFilePreviewResponse(BaseModel):
     """已入库知识库文件的预览响应体。
 
-    这个模型用于知识库管理页面查看原始文件内容。
-    它从 documents.object_name 对应的 MinIO 对象读取原文件，不参与 Qdrant 检索，也不改变索引数据。
+    当前预览以 MinIO HTTP 地址为主，前端拿到 file_url 后直接打开上传文件。
+    content 字段保留为空字符串，兼容旧前端结构。
     """
 
     document: KnowledgeFileResponse  # 被预览的文件元数据
-    preview_type: str  # text/pdf_text/unsupported，表示本次预览内容的来源类型
-    content: str  # 预览文本内容；大文件会按 max_chars 截断
-    truncated: bool  # 是否因为超过 max_chars 被截断
+    preview_type: str  # text/file_url，text 表示前端直接渲染 content，file_url 表示前端嵌入 file_url
+    content: str  # 文本文件的解码内容；非文本文件为空字符串
+    truncated: bool  # 文本内容是否因 max_chars 被截断
     page_count: int | None = None  # PDF 页数；TXT 文件为空
+    file_url: str | None = None  # MinIO HTTP 访问地址，前端用它打开上传文件
+    charset: str | None = None  # 文本预览实际采用的字符集，例如 utf-8/gb18030
 
 
 class KnowledgeUploadResponse(BaseModel):

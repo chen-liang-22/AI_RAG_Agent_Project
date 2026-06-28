@@ -70,10 +70,10 @@ def preview_indexed_knowledge_file(
         DEFAULT_PREVIEW_CHAR_LIMIT,
         ge=1000,
         le=MAX_PREVIEW_CHAR_LIMIT,
-        description="最多返回的预览字符数，避免大文件一次性返回过多内容。",
+        description="兼容旧前端参数；当前预览直接返回 MinIO HTTP 地址。",
     ),
 ) -> KnowledgeFilePreviewResponse:
-    """预览已入库知识资产文件的原始文本内容。"""
+    """返回已入库知识资产文件的 MinIO HTTP 预览地址。"""
 
     return _service().preview_file(document_id, max_chars)
 
