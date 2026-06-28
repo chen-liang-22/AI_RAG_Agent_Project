@@ -53,6 +53,26 @@ class FakePlanService:
         return "update-result"
 
 
+class FakeRoleApplicationService:
+    """记录核心外观是否把角色生成入口委托给角色应用服务。"""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.calls = []
+
+    def generate_supplement_questions(self, request):
+        self.calls.append(("generate_supplement_questions", request))
+        return "questions-result"
+
+    def polish_scenario(self, request):
+        self.calls.append(("polish_scenario", request))
+        return "polish-result"
+
+    def generate_role(self, request):
+        self.calls.append(("generate_role", request))
+        return "role-result"
+
+
 def _patch_core_dependencies(monkeypatch):
     """替换核心外观的重依赖，专注验证委托边界。"""
 
@@ -61,6 +81,7 @@ def _patch_core_dependencies(monkeypatch):
     monkeypatch.setattr(sales_training_core, "DocumentRepository", lambda store=None: FakeDocumentRepository())
     monkeypatch.setattr(sales_training_core, "TrainingKnowledgeService", FakeKnowledgeService)
     monkeypatch.setattr(sales_training_core, "TrainingPlanDomainService", FakePlanService)
+    monkeypatch.setattr(sales_training_core, "TrainingRoleApplicationService", FakeRoleApplicationService)
 
 
 def test_core_delegates_plan_methods(monkeypatch):
@@ -83,4 +104,22 @@ def test_core_delegates_plan_methods(monkeypatch):
         ("get_plan_detail", "plan_1"),
         ("delete_plan", "plan_1"),
         ("update_plan", "plan_1", update_request),
+    ]
+
+
+def test_core_delegates_role_methods(monkeypatch):
+    """补充问题、场景润色和角色生成入口应委托给 TrainingRoleApplicationService。"""
+
+    _patch_core_dependencies(monkeypatch)
+    request = object()
+
+    core_service = sales_training_core.V2SalesTrainingCoreService()
+
+    assert core_service.generate_supplement_questions(request) == "questions-result"
+    assert core_service.polish_scenario(request) == "polish-result"
+    assert core_service.generate_role(request) == "role-result"
+    assert core_service.role_application_service.calls == [
+        ("generate_supplement_questions", request),
+        ("polish_scenario", request),
+        ("generate_role", request),
     ]

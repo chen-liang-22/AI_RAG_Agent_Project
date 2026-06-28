@@ -31,7 +31,6 @@ from app.application.training_support.schemas import (
     RoleGenerateResponse,
     ScenarioPolishRequest,
     ScenarioPolishResponse,
-    SupplementQuestion,
     SupplementQuestionGenerateResponse,
     TrainingPlanCreateRequest,
     TrainingPlanDeleteResponse,
@@ -59,6 +58,7 @@ from app.application.training_support.schemas import (
 )
 from app.application.training.training_query_service import TrainingQueryService
 from app.application.training.training_goal_setting_service import TrainingGoalSettingService
+from app.application.training.training_role_application_service import TrainingRoleApplicationService
 from app.application.training.training_role_service import TrainingRoleService
 from app.application.training.training_knowledge_service import TrainingKnowledgeService
 from app.application.training.training_plan_domain_service import TrainingPlanDomainService
@@ -147,6 +147,12 @@ class V2SalesTrainingCoreService:
         )
         # 角色生成相关的纯逻辑拆到独立服务，核心外观只负责编排数据库、向量库和 LLM 调用。
         self.role_service = TrainingRoleService()
+        # 角色生成应用流程拆到独立服务，核心外观只保留补充问题、场景润色和生成角色入口。
+        self.role_application_service = TrainingRoleApplicationService(
+            repository=self.repository,
+            query_service=self.query_service,
+            role_service=self.role_service,
+        )
         # 训练目标生成同样拆成纯逻辑服务，避免核心编排类继续堆积提示词和兜底模板。
         self.goal_setting_service = TrainingGoalSettingService()
         # 会话提示词和兜底话术拆到独立服务，核心外观继续负责仓库读写和流式编排。
@@ -332,31 +338,7 @@ class V2SalesTrainingCoreService:
         业务痛点等细节，再把答案并入 extra_details 生成更稳定的角色。
         """
 
-        query = self._build_role_query(request)
-        logger.info(
-            "[销售训练][补充问答题] 开始生成 方案编号=%s 学员=%s 模型档位=%s 查询预览=%s",
-            request.plan_id or "-",
-            request.trainee.trainee_id,
-            request.model_mode or "默认",
-            self._short_text(query),
-        )
-        evidence = self._search_training_evidence(query, visibility=("visible", "hidden"), k=4)
-        prompt = self._supplement_questions_prompt(request, evidence)
-        fallback = {"questions": self._fallback_supplement_questions(request)}
-        result = self._invoke_json(
-            prompt,
-            model_mode=request.model_mode,
-            fallback=fallback,
-            task_name="补充问答题生成",
-        )
-        questions = self._normalize_supplement_questions(result.get("questions"), request)
-        logger.info(
-            "[销售训练][补充问答题] 生成完成 题目数=%s 学员=%s 证据数量=%s",
-            len(questions),
-            request.trainee.trainee_id,
-            len(evidence),
-        )
-        return SupplementQuestionGenerateResponse(questions=questions)
+        return self.role_application_service.generate_supplement_questions(request)
 
     def polish_scenario(self, request: ScenarioPolishRequest) -> ScenarioPolishResponse:
         """根据客户画像字段润色训练场景描述。
@@ -365,34 +347,7 @@ class V2SalesTrainingCoreService:
         具体调用哪个模型、如何兜底，都收敛在服务层。
         """
 
-        prompt = self._scenario_polish_prompt(request)
-        fallback = {"polished_scenario": self._fallback_polished_scenario(request)}
-        logger.info(
-            "[销售训练][场景润色] 开始润色 画像类型=%s 模型档位=%s 原始长度=%s 选择字段数=%s",
-            request.profile_type,
-            request.model_mode or "默认",
-            len(request.scenario_description),
-            len(request.selected_fields or {}),
-        )
-        result = self._invoke_json(
-            prompt,
-            model_mode=request.model_mode,
-            fallback=fallback,
-            task_name="场景描述润色",
-        )
-        polished_scenario = str(result.get("polished_scenario") or "").strip()
-        if not polished_scenario:
-            polished_scenario = self._fallback_polished_scenario(request)
-        logger.info(
-            "[销售训练] 场景描述AI润色完成 画像类型=%s 原始长度=%s 润色后长度=%s",
-            request.profile_type,
-            len(request.scenario_description),
-            len(polished_scenario),
-        )
-        return ScenarioPolishResponse(
-            polished_scenario=polished_scenario,
-            original_scenario=request.scenario_description,
-        )
+        return self.role_application_service.polish_scenario(request)
 
     def generate_role(self, request: RoleGenerateRequest) -> RoleGenerateResponse:
         """生成 AI 陪练角色。
@@ -401,74 +356,7 @@ class V2SalesTrainingCoreService:
         再把“学员画像 + 客户字段 + 场景 + 证据”一起交给模型。
         """
 
-        if request.plan_id:
-            self._require_plan(request.plan_id)
-        query = self._build_role_query(request)
-        logger.info(
-            "[销售训练][角色生成] 开始生成 方案编号=%s 学员=%s 画像类型=%s 模型档位=%s 选择字段数=%s 场景长度=%s",
-            request.plan_id or "-",
-            request.trainee.trainee_id,
-            request.profile_type,
-            request.model_mode or "默认",
-            len(request.selected_fields or {}),
-            len(request.scenario_description or ""),
-        )
-        # 角色生成阶段允许使用 visible 和 hidden 知识：
-        # - visible：学员也能看到的显性案例；
-        # - hidden：只给 AI 客户使用的底层顾虑/隐性心理。
-        evidence = self._search_training_evidence(query, visibility=("visible", "hidden"), k=6)
-        logger.info(
-            "[销售训练][角色生成] 证据召回完成 方案编号=%s 证据数量=%s 命中切片=%s",
-            request.plan_id or "-",
-            len(evidence),
-            self._join_values(item.get("chunk_id") for item in evidence),
-        )
-        prompt = self._role_prompt(request, evidence)
-        result = self._invoke_json(
-            prompt,
-            model_mode=request.model_mode,
-            fallback=self._fallback_role(request, evidence),
-            task_name="AI客户角色生成",
-        )
-
-        visible_profile = result.get("visible_profile") or {}
-        hidden_profile = result.get("hidden_profile") or {}
-        role_profile = result.get("role_profile") or {}
-        role_confirm_card = result.get("role_confirm_card") or visible_profile
-
-        saved = self.repository.save_role_profile(
-            plan_id=request.plan_id,
-            trainee_id=request.trainee.trainee_id,
-            profile_type=request.profile_type,
-            visible_profile=visible_profile,
-            hidden_profile=hidden_profile,
-            role_profile=role_profile,
-            role_confirm_card=role_confirm_card,
-            selected_fields=request.selected_fields,
-            scenario_description=request.scenario_description,
-            extra_details=request.extra_details,
-            retrieved_evidence=evidence,
-            status="confirmed",
-        )
-        if request.plan_id:
-            self.repository.attach_role_to_plan(request.plan_id, saved["profile_id"])
-        logger.info(
-            "[销售训练][角色生成] 生成完成 角色编号=%s 学员=%s 证据数量=%s 角色字段=%s",
-            saved["profile_id"],
-            request.trainee.trainee_id,
-            len(evidence),
-            self._dict_key_text(role_profile),
-        )
-        return RoleGenerateResponse(
-            profile_id=saved["profile_id"],
-            visible_profile=visible_profile,
-            hidden_profile=hidden_profile,
-            role_profile=role_profile,
-            role_confirm_card=role_confirm_card,
-            hidden_summary="已生成隐藏心理画像，学员不可见",
-            retrieved_cases=evidence,
-            knowledge_facts=[item["content"][:160] for item in evidence],
-        )
+        return self.role_application_service.generate_role(request)
 
     def generate_goal_setting(
             self,
@@ -594,11 +482,6 @@ class V2SalesTrainingCoreService:
 
         return self.session_scoring_service.final_score(session_id, model_mode=model_mode)
 
-    def _search_training_evidence(self, query: str, *, visibility: tuple[str, ...], k: int) -> list[dict[str, Any]]:
-        """检索训练证据库，并过滤学员不可直接看到的内容。"""
-
-        return self.query_service.search_training_evidence(query, visibility=visibility, k=k)
-
     @staticmethod
     def _messages(system: str, human: str) -> list:
         """构造 LangChain 聊天消息。
@@ -622,34 +505,6 @@ class V2SalesTrainingCoreService:
         if isinstance(content, list):
             return "".join(str(item.get("text") if isinstance(item, dict) else item) for item in content)
         return str(content)
-
-    @staticmethod
-    def _short_text(value: Any, limit: int = 120) -> str:
-        """把长文本压缩成日志预览，避免 PyCharm 控制台被完整提示词刷屏。"""
-
-        text = str(value or "").replace("\n", " ").strip()
-        if len(text) <= limit:
-            return text or "-"
-        return f"{text[:limit]}..."
-
-    @staticmethod
-    def _join_values(values: Any, limit: int = 6) -> str:
-        """把列表、元组或生成器压成一行日志文本，方便查看命中的来源。"""
-
-        if values is None:
-            return "-"
-        if isinstance(values, (str, int, float)):
-            return str(values)
-        result: list[str] = []
-        for value in values:
-            if value is None or value == "":
-                continue
-            text = str(value)
-            if text not in result:
-                result.append(text)
-            if len(result) >= limit:
-                break
-        return "、".join(result) if result else "-"
 
     @staticmethod
     def _dict_key_text(value: Any) -> str:
@@ -885,58 +740,10 @@ class V2SalesTrainingCoreService:
 
         return TrainingScoreService.normalize_dimension_scores(dimensions, total_score=total_score)
 
-    def _build_role_query(self, request: RoleGenerateRequest) -> str:
-        """构造角色生成前的向量检索查询文本。"""
-
-        return self.role_service.build_role_query(request)
-
-    def _role_prompt(self, request: RoleGenerateRequest, evidence: list[dict[str, Any]]) -> str:
-        """构造 AI 客户角色生成提示词。"""
-
-        return self.role_service.role_prompt(request, evidence)
-
-    def _scenario_polish_prompt(self, request: ScenarioPolishRequest) -> str:
-        """构造场景描述润色提示词。"""
-
-        return self.role_service.scenario_polish_prompt(request)
-
-    def _supplement_questions_prompt(self, request: RoleGenerateRequest, evidence: list[dict[str, Any]]) -> str:
-        """构造补充问答生成提示词。"""
-
-        return self.role_service.supplement_questions_prompt(request, evidence)
-
-    def _normalize_supplement_questions(self, raw_questions: Any, request: RoleGenerateRequest) -> list[SupplementQuestion]:
-        """把 LLM 输出规整成前端稳定可渲染的 1-5 道题。"""
-
-        return self.role_service.normalize_supplement_questions(raw_questions, request)
-
     def _goal_prompt(self, profile: dict[str, Any]) -> str:
         """构造开放式训练目标和评分规则生成提示词。"""
 
         return self.goal_setting_service.goal_prompt(profile)
-
-    @staticmethod
-    def _fallback_polished_scenario(request: ScenarioPolishRequest) -> str:
-        """模型润色失败时的本地兜底文案。
-
-        兜底逻辑只做安全拼接，不虚构业务事实；这样即使 LLM 报错，
-        前端也能得到一段可用的场景描述。
-        """
-
-        return TrainingRoleService.fallback_polished_scenario(request)
-
-    def _fallback_supplement_questions(self, request: RoleGenerateRequest) -> list[dict[str, Any]]:
-        """补充问题兜底模板，保证模型不可用时流程仍可继续。"""
-
-        return self.role_service.fallback_supplement_questions(request)
-
-    def _fallback_role(self, request: RoleGenerateRequest, evidence: list[dict[str, Any]]) -> dict:
-        """角色生成失败时的本地兜底结果。
-
-        兜底只使用用户选择的画像字段和已召回证据，不凭空扩展业务事实。
-        """
-
-        return self.role_service.fallback_role(request, evidence)
 
     @staticmethod
     def _fallback_goal(profile: dict[str, Any]) -> dict:
