@@ -49,7 +49,7 @@ DEFAULT_TRAINING_COLLECTION_NAME = "sales_training_cases"
 DEFAULT_TRAINING_STAGING_COLLECTION_NAME = "sales_training_cases_staging"
 ALLOWED_TRAINING_FILE_TYPES = {"txt", "pdf", "docx"}
 DEFAULT_TRAINING_VISIBILITY = "visible"
-RUNNING_INGEST_TASK_STATUSES = {"running"}
+RUNNING_INGEST_TASK_STATUSES = {"queued", "running"}
 BLOCKING_INGEST_STEPS = {"running", "parsing", "chunking", "llm_chunking", "scoring", "indexing", "indexing_staging"}
 
 

@@ -161,7 +161,7 @@ class IngestTaskService:
         task = self.task_repository.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"入库任务不存在：{task_id}")
-        if task.get("status") not in {"failed", "queued"}:
+        if task.get("status") != "failed":
             raise HTTPException(status_code=409, detail=f"当前任务状态不允许重试：{task.get('status')}")
         self.task_repository.reset_for_retry(task_id)
         self._submit_if_needed(task_id, auto_run=True)

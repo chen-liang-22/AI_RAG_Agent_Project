@@ -1,5 +1,8 @@
 """异步入库任务服务测试。"""
 
+import pytest
+from fastapi import HTTPException
+
 from app.application.ingest_task_service import IngestTaskService
 
 
@@ -145,6 +148,20 @@ def test_run_task_marks_failed_when_processor_raises():
     assert result["task_status"] == "failed"
     assert result["current_step"] == "failed"
     assert result["error_message"] == "解析失败"
+
+
+def test_retry_task_rejects_queued_task():
+    """手动重试只允许失败任务，排队任务不能重复提交后台线程。"""
+
+    repository = FakeTaskRepository()
+    task = repository.create_task(task_id="task_queued", task_type="document_ingest", business_scene="knowledge")
+    service = IngestTaskService(task_repository=repository, auto_run=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.retry_task(task["task_id"])
+
+    assert exc_info.value.status_code == 409
+    assert repository.tasks["task_queued"]["status"] == "queued"
 
 
 def test_resume_pending_tasks_marks_orphan_running_failed_and_submits_queued(monkeypatch):

@@ -352,6 +352,32 @@ def test_delete_batch_rejects_running_ingest_task():
     assert asset_service.deleted_document_id is None
 
 
+def test_delete_batch_rejects_queued_ingest_task():
+    """排队中的异步入库任务同样不能被删除，避免后台线程稍后处理已删除批次。"""
+
+    asset_service = FakeAssetService()
+    task_service = FakeTaskService({
+        "task_id": "task_queued",
+        "status": "queued",
+        "current_step": "queued",
+        "progress": 5,
+    })
+    service = TrainingKnowledgeService(
+        repository=FakeTrainingRepository(),
+        vector_service=FakeVectorService(),
+        staging_vector_service=FakeVectorService(),
+        document_repository=FakeDocumentRepository(),
+        asset_service=asset_service,
+        ingest_task_service=task_service,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.delete_batch("batch_1")
+
+    assert exc_info.value.status_code == 409
+    assert asset_service.deleted_document_id is None
+
+
 def test_list_versions_returns_version_group_batches():
     """版本列表需要按当前批次所在 version_group_id 查询。"""
 
