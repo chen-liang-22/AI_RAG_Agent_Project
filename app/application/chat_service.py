@@ -185,59 +185,107 @@ class ChatApplicationService:
     def chat_stream(self, request: ChatRequest) -> StreamingResponse:
         """流式聊天接口业务流程。"""
 
+        # 记录请求开始时间，用于后续计算接口准备阶段耗时。
         request_start_time = time.perf_counter()
+        # 生成本次聊天请求的追踪编号，方便串联日志和排查问题。
         trace_id = self._new_trace_id()
+        # 根据请求准备会话编号和历史消息，保证后续流式回答带上上下文。
         conversation_id, history = _prepare_chat_conversation(request)
+        # 规范化前端传入的模型模式，避免空值或非法值影响模型选择。
         selected_model_mode = normalize_chat_model_mode(request.model_mode)
+        # 根据模型模式取得实际使用的模型名称，用于日志记录和排障。
         selected_model_name = get_chat_model_name_for_mode(selected_model_mode)
+        # 规范化知识库 Collection 名称，确保 RAG 检索使用有效集合。
         selected_collection_name = normalize_qdrant_collection_name(request.collection_name)
+        # 输出流式请求准备完成日志，记录路由前的核心上下文信息。
         logger.info(
+            # 日志模板保留对外协议字段名 Collection，其他状态描述使用中文。
             "[V2聊天] 流式请求准备完成 追踪编号=%s 会话编号=%s Collection=%s 模型模式=%s 模型名称=%s 耗时毫秒=%.2f 历史消息数=%s",
+            # 写入本次请求追踪编号。
             trace_id,
+            # 写入本次会话编号。
             conversation_id,
+            # 写入本次选择的知识库集合名称。
             selected_collection_name,
+            # 写入本次选择的模型模式。
             selected_model_mode,
+            # 写入本次实际使用的模型名称。
             selected_model_name,
+            # 写入从请求开始到准备完成的耗时毫秒数。
             self._elapsed_ms(request_start_time),
+            # 写入参与本轮对话的历史消息数量。
             len(history),
         )
 
+        # 根据用户问题判断是否走知识直答链路，并返回路由原因。
         use_direct_rag, route_reason = _should_use_direct_rag(request.message)
+        # 命中知识直答时，直接调用 RAG 流式生成，跳过 Agent 工具编排。
         if use_direct_rag:
+            # 记录知识直答路由日志，便于确认本次请求没有进入 Agent 工具链。
             logger.info(
+                # 日志模板记录路由结果、路由原因和用户原始问题。
                 "[V2聊天] 流式路由=知识直答 追踪编号=%s 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+                # 写入本次请求追踪编号。
                 trace_id,
+                # 写入命中知识直答的判断原因。
                 route_reason,
+                # 写入发起请求的用户编号。
                 request.user_id,
+                # 写入本次会话编号。
                 conversation_id,
+                # 写入用户原始问题内容。
                 request.message,
             )
+            # 创建知识直答的流式响应生成器。
             stream = _stream_direct_rag(
+                # 传入用户原始问题作为 RAG 检索和生成输入。
                 request.message,
+                # 传入用户编号，用于会话归属和业务审计。
                 user_id=request.user_id,
+                # 传入会话编号，用于持续对话上下文维护。
                 conversation_id=conversation_id,
+                # 传入历史消息，让 RAG 回答能结合上下文。
                 history=history,
+                # 传入已规范化的模型模式，控制生成模型选择。
                 model_mode=selected_model_mode,
+                # 传入已规范化的知识库集合名称，控制检索范围。
                 collection_name=selected_collection_name,
+                # 传入追踪编号，保持下游日志可串联。
                 trace_id=trace_id,
             )
+        # 未命中知识直答时，走 Agent 工具链进行任务规划和工具调用。
         else:
+            # 记录 Agent 工具链路由日志，便于定位复杂任务的执行入口。
             logger.info(
+                # 日志模板记录路由结果、路由原因和用户原始问题。
                 "[V2聊天] 流式路由=Agent工具链 追踪编号=%s 原因=%s 用户编号=%s 会话编号=%s 问题=%s",
+                # 写入本次请求追踪编号。
                 trace_id,
+                # 写入进入 Agent 工具链的判断原因。
                 route_reason,
+                # 写入发起请求的用户编号。
                 request.user_id,
+                # 写入本次会话编号。
                 conversation_id,
+                # 写入用户原始问题内容。
                 request.message,
             )
+            # 预加载或校验 Agent 实例，确保后续流式执行前依赖可用。
             _get_agent()
+            # 创建 Agent 工具链的流式响应生成器。
             stream = _stream_agent(
+                # 传入用户原始问题作为 Agent 任务输入。
                 request.message,
+                # 传入用户编号，用于会话归属和业务审计。
                 user_id=request.user_id,
+                # 传入会话编号，用于持续对话上下文维护。
                 conversation_id=conversation_id,
+                # 传入历史消息，让 Agent 能结合上下文规划回答。
                 history=history,
+                # 传入追踪编号，保持下游日志可串联。
                 trace_id=trace_id,
             )
+        # 将生成器包装成 FastAPI StreamingResponse 返回给调用方。
         return self._streaming_response(stream)
 
     def debug_retrieve(self, request: DebugRetrieveRequest) -> dict:

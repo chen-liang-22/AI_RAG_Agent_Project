@@ -278,6 +278,41 @@ def _normalize_recommendation(value: dict) -> dict:
         "confidence": confidence,
         "reasons": reasons[:5] or ["模型根据文档结构样本给出推荐"],
     }
+def _outline_from_documents(documents: list) -> list[dict]:
+    """从文件 Document 元数据中读取 PDF 书签目录。"""
+
+    for document in documents:
+        outline = document.metadata.get("_pdf_outline")
+        if isinstance(outline, list):
+            return outline
+    return []
+
+
+def _deterministic_recommendation(filename: str, sample_text: str, documents: list) -> dict | None:
+    """先用可解释规则推荐结构类型，避免模型把明显 QA 文件误判成普通文本。"""
+
+    from app.infrastructure.vector_store_service import VectorStoreService
+
+    parser = VectorStoreService().document_parser
+    detection = parser.detect_document_type(filename, sample_text, outline=_outline_from_documents(documents))
+    if detection.split_strategy == "recursive" and detection.document_type == "text":
+        return None
+    logger.info(
+        "[知识库] 规则推荐切分方式命中 文件名=%s 文档类型=%s 切分策略=%s 置信度=%s 原因=%s",
+        filename,
+        detection.document_type,
+        detection.split_strategy,
+        detection.confidence,
+        detection.reasons,
+    )
+    return {
+        "document_type": detection.document_type,
+        "split_strategy": detection.split_strategy,
+        "confidence": detection.confidence,
+        "reasons": detection.reasons,
+        "sample_chars": len(sample_text),
+        "model_name": "",
+    }
 
 
 def _dictionary_options_text(dictionary_code: str) -> str:
@@ -321,6 +356,10 @@ def _recommend_upload_split_strategy(upload_id: str) -> dict:
     sample_text = _build_structure_sample(full_text, max_chars=preview_config.recommendation_sample_chars)
     if not sample_text:
         raise HTTPException(status_code=400, detail="文件没有可用于模型推荐的文本内容")
+
+    deterministic_recommendation = _deterministic_recommendation(filename, sample_text, documents)
+    if deterministic_recommendation is not None:
+        return deterministic_recommendation
 
     structure = _analyze_structure_text(sample_text)
     selected_model_mode = _get_recommendation_model_mode()

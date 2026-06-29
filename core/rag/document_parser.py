@@ -208,6 +208,30 @@ class DocumentParser:
     ) -> DocumentTypeDetection:
         """用轻量规则给出默认结构建议，模型推荐由上传推荐接口单独完成。"""
 
+        if self.is_outline_qa(outline or [], sample_text=sample_text):
+            return DocumentTypeDetection(
+                document_type="qa",
+                split_strategy="outline_qa",
+                confidence=0.9,
+                reasons=["PDF 书签目录符合“一级目录 -> 二级问题”的问答结构，推荐目录问答切分"],
+            )
+
+        if self._looks_like_numbered_qa(sample_text):
+            return DocumentTypeDetection(
+                document_type="qa",
+                split_strategy="numbered_qa",
+                confidence=0.8,
+                reasons=["文本中存在连续编号问题和答案内容，推荐编号问答切分"],
+            )
+
+        if self._looks_like_numbered_segments(sample_text):
+            return DocumentTypeDetection(
+                document_type="numbered",
+                split_strategy="numbered_segments",
+                confidence=0.7,
+                reasons=["文本中存在连续编号条目，推荐编号条目切分"],
+            )
+
         return DocumentTypeDetection(
             document_type="text",
             split_strategy="recursive",
@@ -376,6 +400,7 @@ class DocumentParser:
             category = item["category"]
             source_page = item.get("page")
             section_path = f"{category} / {item['raw_title']}" if category else item["raw_title"]
+            section_first_level = category or item["raw_title"]
             question_id = f"{document_id}_outline_q_{item_index:04d}"
             content_parts = self._split_outline_qa_content(question, answer)
 
@@ -390,6 +415,7 @@ class DocumentParser:
                     "question_id": question_id,
                     "section_title": category,
                     "section_path": section_path,
+                    "section_first_level": section_first_level,
                     "structure_source": "pdf_outline",
                     "outline_match_method": item.get("match_method"),
                     "part_index": part_index,
@@ -419,6 +445,7 @@ class DocumentParser:
                             "source_page": source_page,
                             "question_id": question_id,
                             "section_path": section_path,
+                            "section_first_level": section_first_level,
                             "outline_match_method": item.get("match_method"),
                             "part_index": part_index,
                             "part_count": len(content_parts),
@@ -929,6 +956,25 @@ class DocumentParser:
         if cls.default_rules.has_question_mark(clean_title):
             return True
         return False
+
+    def _looks_like_numbered_qa(self, sample_text: str) -> bool:
+        """判断样本文本是否像编号问答资料。"""
+
+        blocks = self._split_numbered_blocks(sample_text or "")
+        valid_blocks = 0
+        for _, _, block in blocks:
+            question, answer = self._parse_question_answer(block)
+            if question and answer and not self.parse_rules.is_invalid_answer(answer):
+                valid_blocks += 1
+            if valid_blocks >= 3:
+                return True
+        return False
+
+    def _looks_like_numbered_segments(self, sample_text: str) -> bool:
+        """判断样本文本是否像编号条目资料。"""
+
+        blocks = self._split_numbered_blocks(sample_text or "")
+        return len(blocks) >= 3
 
     @staticmethod
     def _plan_value(plan: object, key: str) -> object:

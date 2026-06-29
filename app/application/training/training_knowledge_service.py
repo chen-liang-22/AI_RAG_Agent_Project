@@ -133,16 +133,17 @@ class TrainingKnowledgeService:
         )
 
         file_md5 = stored_file.file_md5
-        existing_batch = self.repository.get_published_batch_by_md5(file_md5)
+        existing_batch = self.repository.get_existing_batch_by_md5(file_md5)
         if existing_batch:
             get_file_storage_service().delete_object(
                 bucket_name=stored_file.bucket_name,
                 object_name=stored_file.object_name,
             )
             logger.info(
-                "[销售训练] 训练知识命中重复文件 已复用批次=%s 文件名=%s",
+                "[销售训练] 训练知识命中重复文件 已复用批次=%s 文件名=%s 批次状态=%s",
                 existing_batch["batch_id"],
                 filename,
+                existing_batch.get("status"),
             )
             return TrainingKnowledgeUploadResponse(
                 batch_id=existing_batch["batch_id"],

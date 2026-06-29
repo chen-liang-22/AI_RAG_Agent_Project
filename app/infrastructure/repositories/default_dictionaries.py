@@ -163,7 +163,7 @@ DEFAULT_DICTIONARY_ITEMS = [
             ("parsing_failed", "解析失败", None, 6, "文件解析或临时向量库写入失败，需要查看错误信息", {"tag_type": "danger"}),
             ("publish_failed", "发布失败", None, 7, "从临时向量库发布到正式向量库失败，可重试发布", {"tag_type": "danger"}),
             ("deleted", "已删除", None, 8, "批次已从 MySQL、Qdrant 和 MinIO 全链路删除", {"tag_type": "info"}),
-            ("duplicated", "重复复用", None, 9, "上传响应状态，表示文件 MD5 命中已发布批次并复用历史数据", {"tag_type": "info"}),
+            ("duplicated", "重复复用", None, 9, "上传响应状态，表示文件 MD5 命中未删除批次并复用已有数据", {"tag_type": "info"}),
         ],
     },
 ] + PROFILE_DICTIONARY_ITEMS

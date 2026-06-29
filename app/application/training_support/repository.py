@@ -342,6 +342,30 @@ class TrainingRepository:
             return None
         return self._enrich_batch_with_document(row[0], row[1])
 
+    def get_existing_batch_by_md5(self, file_md5: str) -> TrainingKnowledgeBatchEntity | None:
+        """按文件 MD5 查询任意未删除训练资料批次，用于上传前去重。"""
+
+        statement = (
+            self._batch_select_statement()
+            .where(
+                TrainingKnowledgeBatchEntity.status != "deleted",
+                or_(
+                    DocumentEntity.file_md5 == file_md5,
+                    TrainingKnowledgeBatchEntity.file_md5 == file_md5,
+                ),
+            )
+            .order_by(
+                TrainingKnowledgeBatchEntity.updated_at.desc(),
+                TrainingKnowledgeBatchEntity.created_at.desc(),
+            )
+            .limit(1)
+        )
+        with orm_session_context() as session:
+            row = session.execute(statement).one_or_none()
+        if row is None:
+            return None
+        return self._enrich_batch_with_document(row[0], row[1])
+
     def list_batches(self, *, page: int, page_size: int) -> tuple[list[TrainingKnowledgeBatchEntity], int]:
         """分页查询训练资料上传批次。"""
 

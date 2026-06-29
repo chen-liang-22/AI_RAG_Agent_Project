@@ -13,6 +13,40 @@
 
 统一密码：`1234qwer`。
 
+## 当前 Docker Desktop 已启动四件套
+
+下面是 2026-06-29 按 Docker Desktop 截图和 `docker ps` 确认的当前本机运行态。截图里的 `lms-admin`
+不是运行态，不纳入本项目本地中间件四件套。
+
+| 容器名 | 镜像 | 当前端口映射 | 账号 | 密码 | 状态 | 用途 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `minio` | `quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z` | `9000-9001 -> 9000-9001/tcp` | `admin` | `1234qwer` | 运行中 | 文件对象存储，`9000` 为 API，`9001` 为控制台 |
+| `redis7` | `redis:7-alpine` | `6379 -> 6379/tcp` | 无账号 | `1234qwer` | 运行中 | 缓存、上传预览状态、分布式锁 |
+| `mysql8` | `mysql:8.4` | `3306 -> 3306/tcp` | `root` | `1234qwer` | 运行中 | 业务 MySQL 数据库，当前容器初始化库为 `rag_db` |
+| `qdrant-local` | `qdrant/qdrant` | `6333-6334 -> 6333-6334/tcp` | 无 | 无 | 运行中 | 向量数据库，`6333` 为 HTTP，`6334` 为 gRPC |
+
+当前连接信息：
+
+```text
+MinIO 控制台：http://localhost:9001
+MinIO API：http://localhost:9000
+MySQL：127.0.0.1:3306，root / 1234qwer，数据库 rag_db
+Redis：127.0.0.1:6379，密码 1234qwer
+Qdrant：http://localhost:6333，无账号密码
+```
+
+按当前本机容器名启动已存在容器：
+
+```powershell
+docker start minio redis7 mysql8 qdrant-local
+```
+
+按当前本机容器名停止容器：
+
+```powershell
+docker stop minio redis7 mysql8 qdrant-local
+```
+
 ## 一键创建本地网络
 
 如果各容器需要通过容器名互相访问，建议先创建一个网络。

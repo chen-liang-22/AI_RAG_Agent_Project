@@ -85,6 +85,11 @@ class FakeTrainingRepository:
 
         return None
 
+    def get_existing_batch_by_md5(self, file_md5: str):
+        """测试默认没有任意未删除重复文件。"""
+
+        return None
+
     def get_latest_batch_for_version(self, *, source_type: str, source_file: str):
         """测试默认按新版本组创建。"""
 
@@ -235,6 +240,23 @@ class FakeStoredFile:
     bucket_name = "pub"
     object_name = "training/doc_1/case.txt"
     public_url = "http://localhost:9000/pub/training/doc_1/case.txt"
+
+
+class FakeStorageService:
+    """模拟文件存储服务，记录重复上传时是否删除新对象。"""
+
+    def __init__(self):
+        self.deleted_objects = []
+
+    def save_upload_file(self, **kwargs):
+        """返回固定 MD5 的已保存文件。"""
+
+        return FakeStoredFile()
+
+    def delete_object(self, *, bucket_name: str, object_name: str):
+        """记录被删除的 MinIO 对象。"""
+
+        self.deleted_objects.append((bucket_name, object_name))
 
 
 class FakeUploadFile:
@@ -434,3 +456,55 @@ def test_upload_training_knowledge_returns_task_without_writing_staging(monkeypa
     assert repository.created_batches[0]["status"] == "parsing"
     assert staging_vector_service.added_documents == []
     assert task_service.created[0]["batch_id"] == repository.created_batches[0]["batch_id"]
+
+
+def test_upload_training_knowledge_reuses_unpublished_duplicate_batch(monkeypatch):
+    """未发布训练资料命中相同 MD5 时，不应继续创建新的上传批次。"""
+
+    class RepositoryWithUnpublishedDuplicate(FakeTrainingRepository):
+        """返回一个未发布但未删除的重复批次。"""
+
+        def get_existing_batch_by_md5(self, file_md5: str):
+            """按 MD5 返回待发布批次。"""
+
+            if file_md5 == "md5_new":
+                return _batch(
+                    batch_id="pending_batch",
+                    document_id="pending_doc",
+                    status="pending_review",
+                    document_file_md5="md5_new",
+                    chunk_count=3,
+                    point_count=0,
+                )
+            return None
+
+    repository = RepositoryWithUnpublishedDuplicate()
+    storage_service = FakeStorageService()
+    task_service = FakeTaskService()
+    service = TrainingKnowledgeService(
+        repository=repository,
+        vector_service=FakeVectorService(),
+        staging_vector_service=FakeVectorService(),
+        document_repository=FakeDocumentRepository(),
+        ingest_task_service=task_service,
+    )
+    monkeypatch.setattr(
+        "app.application.training.training_knowledge_service.get_file_storage_service",
+        lambda: storage_service,
+    )
+
+    response = service.upload_knowledge(
+        file=FakeUploadFile(),
+        source_type="lms_case",
+        created_by="tester",
+        model_mode="fast",
+    )
+
+    assert response.status == "duplicated"
+    assert response.batch_id == "pending_batch"
+    assert response.document_id == "pending_doc"
+    assert response.duplicate_of == "pending_batch"
+    assert response.chunk_count == 3
+    assert repository.created_batches == []
+    assert task_service.created == []
+    assert storage_service.deleted_objects == [("pub", "training/doc_1/case.txt")]

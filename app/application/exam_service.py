@@ -135,6 +135,15 @@ def _metadata_section_path(metadata: dict[str, Any]) -> str:
     return str(metadata.get("section_path") or metadata.get("heading_path") or metadata.get("category") or "").strip()
 
 
+def _metadata_first_level_section(metadata: dict[str, Any]) -> str:
+    """从题目 metadata 中读取一级目录，兼容旧数据没有 section_first_level 的情况。"""
+
+    first_level = str(metadata.get("section_first_level") or metadata.get("section_title") or "").strip()
+    if first_level:
+        return first_level
+    return _first_level_section_path(_metadata_section_path(metadata))
+
+
 def _first_level_section_path(section_path: str | None) -> str:
     """把完整目录路径压缩为第一层目录，用于前端下拉展示。"""
 
@@ -160,7 +169,12 @@ def _match_section(metadata: dict[str, Any], section_path: str | None) -> bool:
         return True
     expected = section_path.strip()
     actual = _metadata_section_path(metadata)
-    return actual == expected or actual.startswith(f"{expected}{SECTION_PATH_SEPARATOR}")
+    actual_first_level = _metadata_first_level_section(metadata)
+    return (
+        actual == expected
+        or actual.startswith(f"{expected}{SECTION_PATH_SEPARATOR}")
+        or actual_first_level == expected
+    )
 
 
 def _build_exam_filter(document_id: str | None) -> models.Filter:
@@ -1166,7 +1180,7 @@ def list_exam_sections(
     for item in candidates:
         metadata = item["metadata"]
         # 前端目录只展示第一层，完整子目录仍保留在题目来源里。
-        section = _first_level_section_path(_metadata_section_path(metadata))
+        section = _metadata_first_level_section(metadata)
         if not section:
             continue
         section_counts[section] = section_counts.get(section, 0) + 1

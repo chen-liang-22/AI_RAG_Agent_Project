@@ -679,7 +679,7 @@ class RagSummarizeService(object):
         注意这里不是最终回答。
         它只是把检索到的资料整理成上下文，交给 Agent 再生成自然语言答案。
         """
-
+        logger.info("[Agent工具] rag_summarize入参 query=%s", query)
         start_time = time.perf_counter()
         context_docs = self.retriever_docs(
             query,
