@@ -18,6 +18,10 @@ class TrainingKnowledgeUploadResponse(BaseModel):
 
     batch_id: str  # 上传批次 ID，用于后续查询本次文件拆出的切片。
     document_id: str | None = None  # 关联的 documents 文件 ID，文件基础信息统一保存在 documents 表。
+    task_id: str | None = None  # 异步入库任务 ID，前端可用它轮询处理进度。
+    task_status: str | None = None  # 异步任务状态：queued/running/succeeded/failed。
+    current_step: str | None = None  # 当前处理步骤，例如 queued/chunking/scoring。
+    progress: int | None = None  # 入库进度，0 到 100。
     status: str  # 批次状态，例如 pending_review / duplicated。
     chunk_count: int  # 本次上传解析出的切片数量。
     point_count: int  # 写入 Qdrant 的向量点数量；预览阶段通常为 0。
@@ -34,6 +38,10 @@ class TrainingKnowledgeBatchResponse(BaseModel):
 
     batch_id: str  # 批次 ID，用于点击后查询切片。
     document_id: str | None = None  # 关联的 documents 文件 ID。
+    task_id: str | None = None  # 最近一次异步入库任务 ID。
+    task_status: str | None = None  # 最近一次异步任务状态。
+    current_step: str | None = None  # 最近一次任务处理步骤。
+    progress: int | None = None  # 最近一次任务进度。
     source_type: str  # 来源类型，例如 lms_case。
     source_file: str  # 上传文件名。
     file_path: str | None = None  # 文件存储 URI，MinIO 模式下格式为 minio://桶名/对象路径。
@@ -113,6 +121,10 @@ class TrainingKnowledgeReparseResponse(BaseModel):
     """训练资料重新切分响应。"""
 
     batch_id: str  # 被重新切分的批次 ID。
+    task_id: str | None = None  # 重新切分任务 ID。
+    task_status: str | None = None  # 重新切分任务状态。
+    current_step: str | None = None  # 当前处理步骤。
+    progress: int | None = None  # 任务进度。
     status: str  # 重新切分后的状态，通常为 pending_review。
     chunk_count: int  # 重新生成的切片数量。
     point_count: int  # 预览阶段固定为 0。

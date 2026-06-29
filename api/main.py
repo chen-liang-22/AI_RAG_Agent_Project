@@ -1,4 +1,4 @@
-"""FastAPI 应用入口。
+﻿"""FastAPI 应用入口。
 
 V2 重构后，这里只负责创建应用、启动预热和挂载路由。
 业务流程放到 `app` 的应用服务层，避免入口文件继续变成大杂烩。
@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from api.warmup import run_startup_warmup
-from app.api.routes import internal_jobs
 from app.api.router import router as v2_router
 
 
@@ -33,6 +32,3 @@ app = FastAPI(
 
 # V2 业务接口统一挂载到 /api/v2，前端也只调用这套协议。
 app.include_router(v2_router)
-
-# 内部定时任务保留原 URL，但实现已经迁入 V2 路由模块。
-app.include_router(internal_jobs.router)

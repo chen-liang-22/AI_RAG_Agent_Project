@@ -1,4 +1,4 @@
-# Docker 本地中间件启动命令
+﻿# Docker 本地中间件启动命令
 
 本文档记录本项目在 Win11 Docker Desktop 本地开发时使用的中间件容器命令。
 
@@ -10,7 +10,6 @@
 | `mysql8` | `mysql:8.0` | 业务 MySQL 数据库 | `3306` |
 | `redis7` | `redis:7.2` | 缓存、上传预览状态、分布式锁 | `6379` |
 | `minio` | `minio/minio:RELEASE.2023-07-11T21-29-34Z` | 文件对象存储 | `9000` API，`9001` 控制台 |
-| `xxl-job-admin` | `xuxueli/xxl-job-admin:2.4.1` | 定时任务调度中心 | `8080` |
 
 统一密码：`1234qwer`。
 
@@ -173,46 +172,11 @@ docker run --rm `
   minio/mc sh -c "mc alias set local http://minio:9000 admin 1234qwer && mc mb --ignore-existing local/pub && mc anonymous set download local/pub"
 ```
 
-## 启动 XXL-JOB Admin
+## 异步入库说明
 
-XXL-JOB Admin 需要 MySQL 中存在 `xxl_job` 数据库和对应表。
+当前项目已放弃 XXL-JOB，文件入库改为 FastAPI 内部异步任务。
 
-先创建数据库：
-
-```powershell
-docker exec -it mysql8 mysql -uroot -p1234qwer -e "CREATE DATABASE IF NOT EXISTS xxl_job DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-```
-
-启动容器：
-
-```powershell
-docker run -d `
-  --name xxl-job-admin `
-  --network ai-rag-net `
-  -p 8080:8080 `
-  -e TZ=Asia/Shanghai `
-  -e PARAMS="--spring.datasource.url=jdbc:mysql://host.docker.internal:3306/xxl_job?Unicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai --spring.datasource.username=root --spring.datasource.password=1234qwer" `
-  xuxueli/xxl-job-admin:2.4.1
-```
-
-访问地址：
-
-```text
-http://localhost:8080/xxl-job-admin
-```
-
-XXL-JOB 默认账号通常是：
-
-```text
-用户名：admin
-密码：123456
-```
-
-如果使用 Docker 网络内的 MySQL 容器名访问，可以把 JDBC 地址改成：
-
-```text
-jdbc:mysql://mysql8:3306/xxl_job?Unicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
-```
+本地开发只需要启动 MySQL、Redis、MinIO 和 Qdrant。
 
 ## 查看当前容器
 
@@ -227,7 +191,6 @@ docker ps --filter "name=qdrant"
 docker ps --filter "name=mysql8"
 docker ps --filter "name=redis7"
 docker ps --filter "name=minio"
-docker ps --filter "name=xxl-job-admin"
 ```
 
 ## 查看日志
@@ -237,13 +200,12 @@ docker logs -f qdrant
 docker logs -f mysql8
 docker logs -f redis7
 docker logs -f minio
-docker logs -f xxl-job-admin
 ```
 
 ## 停止容器
 
 ```powershell
-docker stop qdrant mysql8 redis7 minio xxl-job-admin
+docker stop qdrant mysql8 redis7 minio
 ```
 
 ## 启动已存在容器
@@ -251,7 +213,7 @@ docker stop qdrant mysql8 redis7 minio xxl-job-admin
 容器已经创建过，只是停止了，用下面命令启动即可。
 
 ```powershell
-docker start qdrant mysql8 redis7 minio xxl-job-admin
+docker start qdrant mysql8 redis7 minio
 ```
 
 ## 删除容器但保留数据卷
@@ -259,7 +221,7 @@ docker start qdrant mysql8 redis7 minio xxl-job-admin
 只删除容器，不删除数据。
 
 ```powershell
-docker rm -f qdrant mysql8 redis7 minio xxl-job-admin
+docker rm -f qdrant mysql8 redis7 minio
 ```
 
 ## 删除容器和数据卷
@@ -267,7 +229,7 @@ docker rm -f qdrant mysql8 redis7 minio xxl-job-admin
 这个操作会清空本地数据，包括 MySQL 数据、Redis 数据、Qdrant 向量、MinIO 文件。
 
 ```powershell
-docker rm -f qdrant mysql8 redis7 minio xxl-job-admin
+docker rm -f qdrant mysql8 redis7 minio
 
 docker volume rm qdrant_storage
 docker volume rm mysql8_data
@@ -305,10 +267,10 @@ docker exec -it redis7 redis-cli -a 1234qwer ping
 curl http://localhost:9000/minio/health/live
 ```
 
-检查 XXL-JOB：
+检查 FastAPI：
 
 ```powershell
-curl http://localhost:8080/xxl-job-admin
+curl http://localhost:8000/api/v2/health
 ```
 
 ## 当前项目后端本地启动命令

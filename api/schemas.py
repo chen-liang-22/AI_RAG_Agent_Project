@@ -125,6 +125,28 @@ class HealthDependenciesResponse(BaseModel):
     dependencies: list[DependencyHealthItem] = Field(default_factory=list)  # 每个依赖的健康检查明细
 
 
+class IngestTaskResponse(BaseModel):
+    """异步入库任务响应体。"""
+
+    task_id: str  # 入库任务编号
+    task_type: str  # 任务类型：document_ingest/training_ingest/training_reparse
+    business_scene: str | None = None  # 业务场景：knowledge/training
+    document_id: str | None = None  # 关联文件编号
+    batch_id: str | None = None  # 关联销售训练批次编号
+    task_status: str  # 任务状态：queued/running/succeeded/failed
+    status: str  # 与 task_status 相同，兼容前端通用状态字段
+    current_step: str  # 当前步骤
+    progress: int  # 进度，0 到 100
+    attempt_count: int = 0  # 已尝试次数
+    max_attempts: int = 3  # 最大尝试次数
+    error_message: str | None = None  # 失败原因
+    metadata: dict = Field(default_factory=dict)  # 扩展参数
+    created_at: str | None = None  # 创建时间
+    updated_at: str | None = None  # 更新时间
+    started_at: str | None = None  # 开始时间
+    finished_at: str | None = None  # 完成时间
+
+
 class DictionaryItemResponse(BaseModel):
     """字典项响应体，支持通过 children 表示多层级字典。"""
 
@@ -220,6 +242,10 @@ class KnowledgeUploadResponse(BaseModel):
     status: str  # indexed 或 duplicate
     message: str  # 面向调用方的简短说明
     document: KnowledgeFileResponse  # 成功入库或已存在的文件记录
+    task_id: str | None = None  # 异步入库任务 ID；重复文件时为空
+    task_status: str | None = None  # 异步任务状态：queued/running/succeeded/failed
+    current_step: str | None = None  # 当前处理步骤
+    progress: int | None = None  # 入库进度，0 到 100
 
 
 class KnowledgeUploadPreviewResponse(BaseModel):

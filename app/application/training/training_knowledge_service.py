@@ -18,6 +18,7 @@ from typing import Any, Protocol
 from fastapi import HTTPException, UploadFile
 from langchain_core.documents import Document
 
+from app.application.ingest_task_service import IngestTaskService
 from app.application.knowledge.document_asset_service import DocumentAssetService
 from app.application.training_support.factories.knowledge_ingest_strategy_factory import KnowledgeIngestStrategyFactory
 from app.application.training_support.llm_ingest import TrainingLlmFallbackSplitter
@@ -48,6 +49,8 @@ DEFAULT_TRAINING_COLLECTION_NAME = "sales_training_cases"
 DEFAULT_TRAINING_STAGING_COLLECTION_NAME = "sales_training_cases_staging"
 ALLOWED_TRAINING_FILE_TYPES = {"txt", "pdf", "docx"}
 DEFAULT_TRAINING_VISIBILITY = "visible"
+RUNNING_INGEST_TASK_STATUSES = {"running"}
+BLOCKING_INGEST_STEPS = {"running", "parsing", "chunking", "llm_chunking", "scoring", "indexing", "indexing_staging"}
 
 
 class TrainingVectorPort(Protocol):
@@ -86,6 +89,7 @@ class TrainingKnowledgeService:
             staging_vector_service: TrainingVectorPort,
             document_repository: DocumentRepository,
             asset_service: DocumentAssetService | None = None,
+            ingest_task_service: IngestTaskService | None = None,
             training_collection_name: str = DEFAULT_TRAINING_COLLECTION_NAME,
             staging_collection_name: str = DEFAULT_TRAINING_STAGING_COLLECTION_NAME,
     ):
@@ -100,6 +104,7 @@ class TrainingKnowledgeService:
         self.staging_vector_service = staging_vector_service
         self.document_repository = document_repository
         self.asset_service = asset_service or DocumentAssetService()
+        self.ingest_task_service = ingest_task_service or IngestTaskService()
         self.training_collection_name = training_collection_name
         self.staging_collection_name = staging_collection_name
 
@@ -162,7 +167,7 @@ class TrainingKnowledgeService:
             bucket_name=stored_file.bucket_name,
             object_name=stored_file.object_name,
             public_url=stored_file.public_url,
-            status="indexing",
+            status="uploaded",
             collection_name=self.training_collection_name,
             document_type="text",
             split_strategy="recursive",
@@ -183,83 +188,37 @@ class TrainingKnowledgeService:
             created_by=created_by,
         )
         logger.info(
-            "[销售训练] 训练知识上传开始 批次编号=%s 文件名=%s 类型=%s 版本组=%s 版本号=%s",
+            "[销售训练] 训练知识上传任务创建开始 批次编号=%s 文件名=%s 类型=%s 版本组=%s 版本号=%s",
             batch_id,
             filename,
             source_type,
             version_info["version_group_id"],
             version_info["version_no"],
         )
-
-        try:
-            with self.download_batch_file(batch) as file_path:
-                logger.info("[销售训练] 训练知识解析开始 批次编号=%s 临时文件=%s", batch_id, file_path)
-                chunks = self.parse_training_chunks(
-                    file_path=file_path,
-                    batch_id=batch_id,
-                    source_file=filename,
-                    source_type=source_type,
-                )
-                if not chunks:
-                    raise ValueError("文件没有切出有效训练知识")
-                logger.info("[销售训练] 训练知识规则切片完成 批次编号=%s 切片数量=%s", batch_id, len(chunks))
-
-                chunks, quality_report = self.improve_training_chunks_if_needed(
-                    chunks=chunks,
-                    file_path=file_path,
-                    batch_id=batch_id,
-                    source_file=filename,
-                    source_type=source_type,
-                    model_mode=model_mode,
-                )
-            logger.info("[销售训练] 训练知识写入临时向量库开始 批次编号=%s 临时Collection=%s", batch_id, self.staging_collection_name)
-            point_count = self.write_staging_chunks(batch=batch, chunks=chunks, source_type=source_type)
-            self.repository.update_batch_status(
-                batch_id,
-                status="pending_review",
-                chunk_count=len(chunks),
-                point_count=point_count,
-                quality_report=quality_report,
-            )
-            self.document_repository.update_document_status(
-                document_id,
-                "indexed",
-                chunk_count=len(chunks),
-                error_message=None,
-                collection_name=self.training_collection_name,
-                document_type="text",
-                split_strategy="recursive",
-            )
-            logger.info(
-                "[销售训练] 训练知识预览生成完成 批次编号=%s 临时向量库=%s 切片数量=%s 向量点数量=%s 质量分=%s 切分方式=%s",
-                batch_id,
-                self.staging_collection_name,
-                len(chunks),
-                point_count,
-                quality_report.get("score"),
-                quality_report.get("selected_splitter"),
-            )
-            return TrainingKnowledgeUploadResponse(
-                batch_id=batch["batch_id"],
-                document_id=document_id,
-                status="pending_review",
-                chunk_count=len(chunks),
-                point_count=point_count,
-                source_file=filename,
-                quality_report=quality_report,
-            )
-        except Exception as exc:
-            self.document_repository.update_document_status(
-                document_id,
-                "failed",
-                error_message=str(exc),
-                collection_name=self.training_collection_name,
-                document_type="text",
-                split_strategy="recursive",
-            )
-            self.repository.update_batch_status(batch_id, status="parsing_failed", error_message=str(exc))
-            logger.error("[销售训练] 训练知识预览生成失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
-            raise HTTPException(status_code=500, detail=f"训练知识预览生成失败：{exc}") from exc
+        task = self.ingest_task_service.create_training_ingest_task(
+            document_id=document_id,
+            batch_id=batch_id,
+            source_type=source_type,
+            model_mode=model_mode,
+        )
+        logger.info(
+            "[销售训练] 训练知识上传任务创建完成 批次编号=%s 任务编号=%s",
+            batch_id,
+            task["task_id"],
+        )
+        return TrainingKnowledgeUploadResponse(
+            batch_id=batch["batch_id"],
+            document_id=document_id,
+            task_id=task["task_id"],
+            task_status=task["task_status"],
+            current_step=task["current_step"],
+            progress=task["progress"],
+            status="parsing",
+            chunk_count=0,
+            point_count=0,
+            source_file=filename,
+            quality_report={},
+        )
 
     def list_batches(self, *, page: int = 1, page_size: int = 10) -> TrainingKnowledgeBatchListResponse:
         """分页查询已经上传过的训练资料。"""
@@ -303,6 +262,7 @@ class TrainingKnowledgeService:
         """删除训练资料批次，并通过统一文件资产服务清理全链路数据。"""
 
         batch = self.get_active_batch(batch_id)
+        self.ensure_batch_not_processing(batch_id)
         document_id = str(batch.get("document_id") or "").strip()
         if not document_id:
             return self.delete_legacy_batch_without_document(batch_id)
@@ -321,6 +281,24 @@ class TrainingKnowledgeService:
             resource_results=result.resource_results,
             errors=result.errors,
         )
+
+    def ensure_batch_not_processing(self, batch_id: str) -> None:
+        """阻止删除正在后台入库的训练资料批次。"""
+
+        task = None
+        if hasattr(self.ingest_task_service.task_repository, "get_latest_task_for_batch"):
+            task = self.ingest_task_service.task_repository.get_latest_task_for_batch(batch_id)
+        if not task:
+            return
+
+        snapshot = self.ingest_task_service.task_snapshot(task)
+        task_status = str(snapshot.get("task_status") or snapshot.get("status") or "")
+        current_step = str(snapshot.get("current_step") or "")
+        if task_status in RUNNING_INGEST_TASK_STATUSES or current_step in BLOCKING_INGEST_STEPS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"训练资料正在入库处理中，暂不能删除：{current_step or task_status}",
+            )
 
     def delete_legacy_batch_without_document(self, batch_id: str) -> TrainingKnowledgeDeleteResponse:
         """删除没有 document_id 的历史训练批次。"""
@@ -479,62 +457,33 @@ class TrainingKnowledgeService:
             raise HTTPException(status_code=400, detail=f"当前状态不允许重新切分：{batch['status']}")
 
         source_type = str(batch.get("source_type") or "lms_case")
-        source_file = str(batch.get("source_file") or "")
-        try:
-            with self.download_batch_file(batch) as file_path:
-                rule_chunks = self.parse_training_chunks(
-                    file_path=file_path,
-                    batch_id=batch_id,
-                    source_file=source_file,
-                    source_type=source_type,
-                )
-                if use_llm_fallback:
-                    chunks, quality_report = self.force_llm_reparse_chunks(
-                        rule_chunks=rule_chunks,
-                        file_path=file_path,
-                        batch_id=batch_id,
-                        source_file=source_file,
-                        source_type=source_type,
-                        model_mode=model_mode,
-                    )
-                else:
-                    evaluator = TrainingIngestQualityEvaluator()
-                    chunks = rule_chunks
-                    quality_report = evaluator.evaluate(chunks).to_dict()
-                    quality_report["selected_splitter"] = "rule_config"
-                    quality_report["llm_fallback_used"] = False
-                    quality_report["rule_score"] = quality_report.get("score")
-
-            if not chunks:
-                raise ValueError("重新切分没有生成有效训练切片")
-            point_count = self.write_staging_chunks(batch=batch, chunks=chunks, source_type=source_type)
-            self.repository.update_batch_status(
-                batch_id,
-                status="pending_review",
-                chunk_count=len(chunks),
-                point_count=point_count,
-                quality_report=quality_report,
-                is_current=False,
-            )
-        except Exception as exc:
-            self.repository.update_batch_status(batch_id, status="parsing_failed", error_message=str(exc))
-            logger.error("[销售训练] 训练资料重新切分失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
-            raise HTTPException(status_code=500, detail=f"训练资料重新切分失败：{exc}") from exc
-
+        document_id = str(batch.get("document_id") or "")
+        if not document_id:
+            raise HTTPException(status_code=400, detail="历史训练资料缺少 document_id，不能异步重新切分")
+        self.repository.update_batch_status(batch_id, status="parsing", error_message=None, is_current=False)
+        task = self.ingest_task_service.create_training_reparse_task(
+            document_id=document_id,
+            batch_id=batch_id,
+            source_type=source_type,
+            use_llm_fallback=use_llm_fallback,
+            model_mode=model_mode,
+        )
         logger.info(
-            "[销售训练] 训练资料重新切分完成 批次编号=%s 切片数量=%s 质量分=%s 切分方式=%s",
+            "[销售训练] 训练资料重新切分任务创建完成 批次编号=%s 任务编号=%s",
             batch_id,
-            len(chunks),
-            quality_report.get("score"),
-            quality_report.get("selected_splitter"),
+            task["task_id"],
         )
         return TrainingKnowledgeReparseResponse(
             batch_id=batch_id,
-            status="pending_review",
-            chunk_count=len(chunks),
-            point_count=point_count,
-            source_file=source_file,
-            quality_report=quality_report,
+            task_id=task["task_id"],
+            task_status=task["task_status"],
+            current_step=task["current_step"],
+            progress=task["progress"],
+            status="parsing",
+            chunk_count=0,
+            point_count=0,
+            source_file=str(batch.get("source_file") or ""),
+            quality_report={},
         )
 
     def list_batch_versions(self, batch_id: str) -> TrainingKnowledgeVersionListResponse:
@@ -594,6 +543,101 @@ class TrainingKnowledgeService:
             len(documents),
         )
         return len(documents)
+
+    def process_training_ingest_task(
+            self,
+            *,
+            task: dict[str, Any],
+            reporter,
+            force_llm: bool = False,
+    ) -> None:
+        """执行销售训练资料异步入库任务。"""
+
+        batch_id = str(task.get("batch_id") or "")
+        batch = self.get_active_batch(batch_id)
+        metadata = task.get("metadata") or {}
+        source_type = str(batch.get("source_type") or metadata.get("source_type") or "lms_case")
+        source_file = str(batch.get("source_file") or "")
+        model_mode = metadata.get("model_mode")
+        use_llm_fallback = bool(metadata.get("use_llm_fallback", True))
+        document_id = str(batch.get("document_id") or task.get("document_id") or "")
+
+        reporter("parsing", 25)
+        try:
+            with self.download_batch_file(batch) as file_path:
+                logger.info("[销售训练] 异步解析开始 批次编号=%s 临时文件=%s", batch_id, file_path)
+                reporter("chunking", 45)
+                rule_chunks = self.parse_training_chunks(
+                    file_path=file_path,
+                    batch_id=batch_id,
+                    source_file=source_file,
+                    source_type=source_type,
+                )
+                if not rule_chunks:
+                    raise ValueError("文件没有切出有效训练知识")
+
+                reporter("scoring", 75)
+                if force_llm:
+                    reporter("llm_chunking", 60)
+                    chunks, quality_report = self.force_llm_reparse_chunks(
+                        rule_chunks=rule_chunks,
+                        file_path=file_path,
+                        batch_id=batch_id,
+                        source_file=source_file,
+                        source_type=source_type,
+                        model_mode=model_mode,
+                    )
+                elif use_llm_fallback:
+                    chunks, quality_report = self.improve_training_chunks_if_needed(
+                        chunks=rule_chunks,
+                        file_path=file_path,
+                        batch_id=batch_id,
+                        source_file=source_file,
+                        source_type=source_type,
+                        model_mode=model_mode,
+                    )
+                else:
+                    evaluator = TrainingIngestQualityEvaluator()
+                    chunks = rule_chunks
+                    quality_report = evaluator.evaluate(chunks).to_dict()
+                    quality_report["selected_splitter"] = "rule_config"
+                    quality_report["llm_fallback_used"] = False
+                    quality_report["rule_score"] = quality_report.get("score")
+
+            reporter("indexing_staging", 90)
+            point_count = self.write_staging_chunks(batch=batch, chunks=chunks, source_type=source_type)
+            self.repository.update_batch_status(
+                batch_id,
+                status="pending_review",
+                chunk_count=len(chunks),
+                point_count=point_count,
+                quality_report=quality_report,
+                is_current=False,
+            )
+            if document_id:
+                self.document_repository.update_document_status(
+                    document_id,
+                    "indexed",
+                    chunk_count=len(chunks),
+                    error_message=None,
+                    collection_name=self.training_collection_name,
+                    document_type="text",
+                    split_strategy="recursive",
+                )
+            logger.info("[销售训练] 异步入库完成 批次编号=%s 切片数量=%s 向量点数量=%s", batch_id, len(chunks), point_count)
+        except Exception as exc:
+            if document_id:
+                self.document_repository.update_document_status(
+                    document_id,
+                    "failed",
+                    error_message=str(exc),
+                    collection_name=self.training_collection_name,
+                    document_type="text",
+                    split_strategy="recursive",
+                )
+            self.repository.update_batch_status(batch_id, status="parsing_failed", error_message=str(exc))
+            logger.error("[销售训练] 异步入库失败 批次编号=%s 错误=%s", batch_id, exc, exc_info=True)
+            raise
 
     def publish_staging_vectors(self, *, batch: dict[str, Any]) -> int:
         """把临时向量库中的待审核切片复制到正式向量库。"""
@@ -924,9 +968,17 @@ class TrainingKnowledgeService:
         """把训练资料批次数据库行转换成前端响应。"""
 
         file_info = self.batch_file_info(row)
+        task = None
+        if hasattr(self.ingest_task_service.task_repository, "get_latest_task_for_batch"):
+            task = self.ingest_task_service.task_repository.get_latest_task_for_batch(str(row["batch_id"]))
+        task_snapshot = self.ingest_task_service.task_snapshot(task) if task else {}
         return TrainingKnowledgeBatchResponse(
             batch_id=row["batch_id"],
             document_id=file_info.get("document_id"),
+            task_id=task_snapshot.get("task_id"),
+            task_status=task_snapshot.get("task_status"),
+            current_step=task_snapshot.get("current_step"),
+            progress=task_snapshot.get("progress"),
             source_type=row["source_type"],
             source_file=file_info.get("source_file") or row["source_file"],
             file_path=file_info.get("file_path"),

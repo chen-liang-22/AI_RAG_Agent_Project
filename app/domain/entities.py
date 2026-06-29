@@ -168,6 +168,29 @@ class DictionaryItemEntity(BaseOrmModel, DictMixin):
     updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
 
 
+class IngestTaskEntity(BaseOrmModel, DictMixin):
+    """ingest_tasks 表实体，记录文件异步入库任务。"""
+
+    __tablename__ = "ingest_tasks"
+
+    task_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="入库任务编号")
+    task_type: Mapped[str] = mapped_column(String(64), nullable=False, comment="任务类型")
+    business_scene: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="业务场景")
+    document_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="关联 documents.document_id")
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="关联训练资料批次编号")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, comment="任务状态")
+    current_step: Mapped[str] = mapped_column(String(64), nullable=False, comment="当前处理步骤")
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=5, comment="处理进度，0到100")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="已尝试次数")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3, comment="最大尝试次数")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True, comment="失败原因")
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="任务扩展参数 JSON")
+    started_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="开始处理时间")
+    finished_at: Mapped[datetime | str | None] = mapped_column(DateTime, nullable=True, comment="处理完成时间")
+    created_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="创建时间")
+    updated_at: Mapped[datetime | str] = mapped_column(DateTime, nullable=False, comment="更新时间")
+
+
 class SystemUserEntity(BaseOrmModel, DictMixin):
     """system_users 表实体，记录系统登录用户。"""
 

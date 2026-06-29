@@ -10,6 +10,7 @@ from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
 
+from app.application.ingest_task_service import IngestTaskService
 from api.schemas import (
     KnowledgeBulkReindexResponse,
     KnowledgeDeleteResponse,
@@ -60,7 +61,8 @@ class KnowledgeApplicationService:
         file_storage: FileStorageAdapter | None = None,
         vector_adapter_factory=None,
         document_repository: DocumentRepository | None = None,
-        dictionary_repository: DictionaryRepository | None = None,
+            dictionary_repository: DictionaryRepository | None = None,
+            ingest_task_service: IngestTaskService | None = None,
     ):
         """初始化知识库应用服务。
 
@@ -74,6 +76,7 @@ class KnowledgeApplicationService:
         self.document_repository = document_repository or DocumentRepository(store=store)
         # 文档列表响应需要用字典做编码归一化；这里改走 V2 字典仓储，逐步移除旧 KnowledgeStore。
         self.dictionary_repository = dictionary_repository or DictionaryRepository()
+        self.ingest_task_service = ingest_task_service or IngestTaskService()
         self._cached_document_dictionary_snapshot: DictionaryCodeSnapshot | None = None
 
     def preview_upload(self, file: UploadFile) -> KnowledgeUploadPreviewResponse:
@@ -202,17 +205,20 @@ class KnowledgeApplicationService:
             split_strategy=request.split_strategy,
         )
         logger.info("[V2知识资产] 文档资产记录创建完成 文档编号=%s 文件名=%s", document_id, filename)
-        indexed_document = _index_document(
-            self.document_repository,
-            document,
+        task = self.ingest_task_service.create_document_ingest_task(
+            document_id=document_id,
+            collection_name=collection_name,
             document_type=request.document_type,
             split_strategy=request.split_strategy,
-            collection_name=collection_name,
         )
         return KnowledgeUploadResponse(
-            status=self._dictionary_status("knowledge_result_status", "indexed"),
-            message="文件已按确认配置写入知识库。",
-            document=document_to_response(indexed_document, self._document_dictionary_snapshot()),
+            status=self._dictionary_status("knowledge_result_status", "queued"),
+            message="文件已保存，正在后台入库。",
+            document=document_to_response(document, self._document_dictionary_snapshot()),
+            task_id=task["task_id"],
+            task_status=task["task_status"],
+            current_step=task["current_step"],
+            progress=task["progress"],
         )
 
     def list_files(self, *, include_training: bool = False) -> list[KnowledgeFileResponse]:

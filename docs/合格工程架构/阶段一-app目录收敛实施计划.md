@@ -217,7 +217,6 @@ api/main.py
 Expected import:
 
 ```python
-from app.api.routes import internal_jobs
 from app.api.router import router as v2_router
 ```
 

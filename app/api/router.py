@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from app.api.routes import auth, chat, dashboard, dictionaries, exam, health, knowledge, system, training
+from app.api.routes import auth, chat, dashboard, dictionaries, exam, health, ingest_tasks, knowledge, system, training
 
 router = APIRouter(prefix="/api/v2")
 
@@ -13,5 +13,6 @@ router.include_router(dictionaries.router)
 router.include_router(chat.router)
 router.include_router(knowledge.router)
 router.include_router(exam.router)
+router.include_router(ingest_tasks.router)
 router.include_router(training.router)
 router.include_router(system.router)

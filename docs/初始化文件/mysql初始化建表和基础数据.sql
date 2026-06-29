@@ -57,6 +57,32 @@ CREATE TABLE `conversations` (
   KEY `idx_conversations_status` (`status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='聊天会话表';
 /*!40101 SET character_set_client = @saved_cs_client */;
+DROP TABLE IF EXISTS `ingest_tasks`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `ingest_tasks` (
+  `task_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '入库任务编号',
+  `task_type` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '任务类型：document_ingest/training_ingest/training_reparse',
+  `business_scene` varchar(64) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '业务场景：knowledge/training',
+  `document_id` varchar(64) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '关联 documents.document_id',
+  `batch_id` varchar(64) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '关联训练资料批次编号',
+  `status` varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '任务状态：queued/running/succeeded/failed',
+  `current_step` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '当前处理步骤',
+  `progress` int NOT NULL DEFAULT '5' COMMENT '处理进度，0到100',
+  `attempt_count` int NOT NULL DEFAULT '0' COMMENT '已尝试次数',
+  `max_attempts` int NOT NULL DEFAULT '3' COMMENT '最大尝试次数',
+  `error_message` text COLLATE utf8mb4_unicode_ci COMMENT '失败原因',
+  `metadata_json` json DEFAULT NULL COMMENT '任务扩展参数 JSON',
+  `started_at` datetime DEFAULT NULL COMMENT '开始处理时间',
+  `finished_at` datetime DEFAULT NULL COMMENT '处理完成时间',
+  `created_at` datetime NOT NULL COMMENT '创建时间',
+  `updated_at` datetime NOT NULL COMMENT '更新时间',
+  PRIMARY KEY (`task_id`),
+  KEY `idx_ingest_tasks_document` (`document_id`,`created_at`),
+  KEY `idx_ingest_tasks_batch` (`batch_id`,`created_at`),
+  KEY `idx_ingest_tasks_status` (`status`,`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='异步入库任务表';
+/*!40101 SET character_set_client = @saved_cs_client */;
 DROP TABLE IF EXISTS `dictionary_items`;
 /*!40101 SET @saved_cs_client     = @@character_set_client */;
 /*!50503 SET character_set_client = utf8mb4 */;
@@ -897,6 +923,3 @@ UNLOCK TABLES;
 /*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
 /*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
-
-
-

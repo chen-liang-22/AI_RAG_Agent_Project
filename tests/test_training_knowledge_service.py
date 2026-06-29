@@ -3,6 +3,8 @@
 import json
 from datetime import datetime
 
+import pytest
+from fastapi import HTTPException
 from langchain_core.documents import Document
 
 from app.application.training.training_knowledge_service import TrainingKnowledgeService
@@ -53,6 +55,8 @@ class FakeTrainingRepository:
         self.deleted_batch_id = None
         self.list_page = None
         self.list_page_size = None
+        self.created_batches = []
+        self.status_updates = []
 
     def list_batches(self, *, page: int, page_size: int):
         """记录分页参数并返回固定批次。"""
@@ -76,6 +80,37 @@ class FakeTrainingRepository:
         self.deleted_batch_id = batch_id
         return True
 
+    def get_published_batch_by_md5(self, file_md5: str):
+        """测试默认没有重复文件。"""
+
+        return None
+
+    def get_latest_batch_for_version(self, *, source_type: str, source_file: str):
+        """测试默认按新版本组创建。"""
+
+        return None
+
+    def create_batch(self, **values):
+        """记录创建的批次。"""
+
+        batch = _batch(
+            batch_id=values["batch_id"],
+            document_id=values["document_id"],
+            source_type=values["source_type"],
+            source_file=values["source_file"],
+            status=values["status"],
+            chunk_count=0,
+            point_count=0,
+            quality_report_json=None,
+        )
+        self.created_batches.append(batch)
+        return batch
+
+    def update_batch_status(self, batch_id: str, **values):
+        """记录状态更新。"""
+
+        self.status_updates.append((batch_id, values))
+
     def list_batches_in_version_group(self, version_group_id: str):
         """返回同一版本组的批次。"""
 
@@ -88,6 +123,7 @@ class FakeVectorService:
     def __init__(self):
         self.deleted = []
         self.listed_metadata = []
+        self.added_documents = []
 
     def delete_by_metadata(self, key: str, value: str):
         """记录按元数据删除的参数。"""
@@ -111,14 +147,51 @@ class FakeVectorService:
             )
         ]
 
+    @property
+    def vector_store(self):
+        """模拟 LangChain 向量库写入接口。"""
+
+        return self
+
+    def add_documents(self, documents):
+        """记录写入的切片。"""
+
+        self.added_documents.extend(documents)
+
 
 class FakeDocumentRepository:
     """测试用文档仓储。"""
 
+    def __init__(self):
+        self.created_documents = []
+        self.status_updates = []
+
     def get_document(self, document_id: str):
         """测试批次已经带有联表字段，不需要额外查文档。"""
 
+        for document in self.created_documents:
+            if document["document_id"] == document_id:
+                return document
         return None
+
+    def create_document(self, **values):
+        """记录文档资产。"""
+
+        document = {
+            **values,
+            "version": 1,
+            "chunk_count": 0,
+            "created_at": datetime(2026, 1, 1, 10, 0, 0),
+            "updated_at": datetime(2026, 1, 1, 10, 0, 0),
+            "error_message": None,
+        }
+        self.created_documents.append(document)
+        return document
+
+    def update_document_status(self, document_id: str, status: str, **values):
+        """记录文件状态更新。"""
+
+        self.status_updates.append((document_id, status, values))
 
 
 class FakeAssetResult:
@@ -151,6 +224,56 @@ def _service(repository=None, vector_service=None, staging_vector_service=None, 
         document_repository=FakeDocumentRepository(),
         asset_service=asset_service,
     )
+
+
+class FakeStoredFile:
+    """模拟 MinIO 保存结果。"""
+
+    file_md5 = "md5_new"
+    file_path = "minio://pub/training/doc_1/case.txt"
+    file_size = 12
+    bucket_name = "pub"
+    object_name = "training/doc_1/case.txt"
+    public_url = "http://localhost:9000/pub/training/doc_1/case.txt"
+
+
+class FakeUploadFile:
+    """模拟上传文件。"""
+
+    filename = "case.txt"
+
+
+class FakeTaskService:
+    """记录是否创建训练入库任务。"""
+
+    def __init__(self, latest_task=None):
+        self.created = []
+        self.latest_task = latest_task
+
+    def create_training_ingest_task(self, **values):
+        self.created.append(values)
+        return {
+            "task_id": "task_1",
+            "task_status": "queued",
+            "current_step": "queued",
+            "progress": 5,
+        }
+
+    def task_snapshot(self, task):
+        return {
+            "task_id": task["task_id"],
+            "task_status": task["status"],
+            "status": task["status"],
+            "current_step": task["current_step"],
+            "progress": task["progress"],
+        }
+
+    @property
+    def task_repository(self):
+        return self
+
+    def get_latest_task_for_batch(self, batch_id: str):
+        return self.latest_task
 
 
 def test_list_batches_normalizes_page_and_page_size():
@@ -202,6 +325,33 @@ def test_delete_batch_returns_full_asset_resource_results():
     assert asset_service.deleted_document_id == "doc_1"
 
 
+def test_delete_batch_rejects_running_ingest_task():
+    """运行中的异步入库任务不能被删除，避免后台线程继续写 Qdrant。"""
+
+    asset_service = FakeAssetService()
+    task_service = FakeTaskService({
+        "task_id": "task_running",
+        "status": "running",
+        "current_step": "chunking",
+        "progress": 45,
+    })
+    service = TrainingKnowledgeService(
+        repository=FakeTrainingRepository(),
+        vector_service=FakeVectorService(),
+        staging_vector_service=FakeVectorService(),
+        document_repository=FakeDocumentRepository(),
+        asset_service=asset_service,
+        ingest_task_service=task_service,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.delete_batch("batch_1")
+
+    assert exc_info.value.status_code == 409
+    assert "正在入库处理中" in exc_info.value.detail
+    assert asset_service.deleted_document_id is None
+
+
 def test_list_versions_returns_version_group_batches():
     """版本列表需要按当前批次所在 version_group_id 查询。"""
 
@@ -223,3 +373,38 @@ def test_list_chunks_maps_metadata_json():
     assert response.chunks[0].case_part == "case_profile"
     assert response.chunks[0].metadata["source_file"] == "case.docx"
     assert vector_service.listed_metadata == [("batch_id", "batch_1")]
+
+
+def test_upload_training_knowledge_returns_task_without_writing_staging(monkeypatch):
+    """销售资料上传应快速创建任务，不同步写临时向量库。"""
+
+    repository = FakeTrainingRepository()
+    document_repository = FakeDocumentRepository()
+    staging_vector_service = FakeVectorService()
+    task_service = FakeTaskService()
+    service = TrainingKnowledgeService(
+        repository=repository,
+        vector_service=FakeVectorService(),
+        staging_vector_service=staging_vector_service,
+        document_repository=document_repository,
+        ingest_task_service=task_service,
+    )
+    monkeypatch.setattr(
+        "app.application.training.training_knowledge_service.get_file_storage_service",
+        lambda: type("Storage", (), {"save_upload_file": lambda self, **kwargs: FakeStoredFile()})(),
+    )
+
+    response = service.upload_knowledge(
+        file=FakeUploadFile(),
+        source_type="lms_case",
+        created_by="tester",
+        model_mode="fast",
+    )
+
+    assert response.status == "parsing"
+    assert response.task_id == "task_1"
+    assert response.task_status == "queued"
+    assert response.progress == 5
+    assert repository.created_batches[0]["status"] == "parsing"
+    assert staging_vector_service.added_documents == []
+    assert task_service.created[0]["batch_id"] == repository.created_batches[0]["batch_id"]

@@ -101,6 +101,8 @@ def run_startup_warmup() -> None:
     # 先初始化服务对象，因为后续 Qdrant/Embedding 预热都会间接依赖这些单例。
     _run_step("服务对象初始化", _warmup_services, fail_fast=settings.fail_fast)
 
+    _run_step("异步入库任务恢复", _resume_ingest_tasks, fail_fast=False)
+
     # Qdrant 是向量检索的核心外部依赖，预热时只检查连接和 collection，不执行检索。
     if settings.qdrant:
         _run_step("Qdrant连接", _warmup_qdrant, fail_fast=settings.fail_fast)
@@ -156,6 +158,14 @@ def _warmup_services() -> None:
     bootstrap_v2_metadata()
     service = _get_knowledge_answer_service()
     service.rag._get_vector_store()
+
+
+def _resume_ingest_tasks() -> None:
+    """恢复服务重启前未完成的异步入库任务。"""
+
+    from app.application.ingest_task_service import IngestTaskService
+
+    IngestTaskService().resume_pending_tasks()
 
 
 def _warmup_qdrant() -> None:
