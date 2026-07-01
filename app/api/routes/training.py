@@ -100,10 +100,14 @@ def upload_training_knowledge(
 
 
 @router.get("/knowledge/batches", response_model=TrainingKnowledgeBatchListResponse)
-def list_training_batches(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=50)) -> TrainingKnowledgeBatchListResponse:
-    """分页查询训练资料批次。"""
+def list_training_batches(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=50),
+    keyword: str | None = Query(None),
+) -> TrainingKnowledgeBatchListResponse:
+    """分页查询训练资料批次，keyword 用于按文件名模糊检索。"""
 
-    return _materials().list_batches(page=page, page_size=page_size)
+    return _materials().list_batches(page=page, page_size=page_size, keyword=keyword)
 
 
 @router.get("/knowledge/batches/{batch_id}/preview", response_model=TrainingKnowledgePreviewResponse)

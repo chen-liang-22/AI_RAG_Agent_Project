@@ -54,9 +54,13 @@ class DictMixin:
     def get(self, key: str, default: Any = None) -> Any:
         """兼容旧 service 中的 row.get("field") 读取方式。"""
 
+        # 如果当前 ORM 实体没有这个属性，就直接返回调用方传入的默认值。
         if not hasattr(self, key):
+            # 保持和 dict.get(key, default) 一样的缺省字段读取行为。
             return default
+        # 从 ORM 实体上按属性名读取真实字段值。
         value = getattr(self, key)
+        # 把 ORM 字段值转换成旧 service 期望的普通 Python 值后返回。
         return format_orm_value(value)
 
     def items(self):

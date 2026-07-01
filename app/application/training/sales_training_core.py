@@ -219,10 +219,16 @@ class V2SalesTrainingCoreService:
             model_mode=model_mode,
         )
 
-    def list_batches(self, *, page: int = 1, page_size: int = 10) -> TrainingKnowledgeBatchListResponse:
+    def list_batches(
+            self,
+            *,
+            page: int = 1,
+            page_size: int = 10,
+            keyword: str | None = None,
+    ) -> TrainingKnowledgeBatchListResponse:
         """分页查询已经上传过的训练资料。"""
 
-        return self.knowledge_service.list_batches(page=page, page_size=page_size)
+        return self.knowledge_service.list_batches(page=page, page_size=page_size, keyword=keyword)
 
     def preview_batch(self, batch_id: str, *, max_chars: int = 30000) -> TrainingKnowledgePreviewResponse:
         """返回训练资料上传文件的站内预览数据。

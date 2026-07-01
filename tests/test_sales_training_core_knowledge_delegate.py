@@ -25,8 +25,8 @@ class FakeKnowledgeService:
         self.kwargs = kwargs
         self.calls = []
 
-    def list_batches(self, *, page: int, page_size: int):
-        self.calls.append(("list_batches", page, page_size))
+    def list_batches(self, *, page: int, page_size: int, keyword: str | None = None):
+        self.calls.append(("list_batches", page, page_size, keyword))
         return "list-result"
 
     def upload_knowledge(self, *, file, source_type: str, created_by: str | None, model_mode: str | None = None):
@@ -84,7 +84,7 @@ def test_core_delegates_knowledge_management_methods(monkeypatch):
     assert core_service.list_batch_versions("batch_1") == "versions-result"
     assert core_service.list_chunks("batch_1") == "chunks-result"
     assert core_service.knowledge_service.calls == [
-        ("list_batches", 2, 20),
+        ("list_batches", 2, 20, None),
         ("preview_batch", "batch_1", 1000),
         ("delete_batch", "batch_1"),
         ("list_batch_versions", "batch_1"),

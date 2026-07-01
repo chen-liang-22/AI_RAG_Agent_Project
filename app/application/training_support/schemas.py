@@ -272,10 +272,10 @@ class TrainingPlanCreateRequest(BaseModel):
     """创建训练方案请求。"""
 
     plan_name: str = Field(..., min_length=1, max_length=80)  # 训练名称，允许同名，使用 plan_id 区分记录。
-    trainee: TraineeProfileRequest  # 学员画像快照。
-    profile_type: str = "overseas_bd"  # 客户画像类型。
+    trainee: TraineeProfileRequest | None = None  # 学员画像快照，创建名称时可先不填写。
+    profile_type: str = ""  # 客户画像类型，创建名称时为空，后续角色场景步骤再保存。
     selected_fields: dict = Field(default_factory=dict)  # 客户画像字段快照。
-    scenario_description: str = Field(..., min_length=1)  # 训练场景描述。
+    scenario_description: str = ""  # 训练场景描述，生成角色前必须补齐。
     extra_details: str = ""  # 补充细节。
     model_mode: str | None = None  # 默认模型档位。
 

@@ -47,11 +47,17 @@ class TrainingMaterialApplicationService:
         logger.info("[V2销售训练-资料] 上传资料开始 文件名=%s 来源类型=%s 创建人=%s", file.filename, source_type, created_by)
         return self.core_service.upload_knowledge(file=file, source_type=source_type, created_by=created_by, model_mode=model_mode)
 
-    def list_batches(self, *, page: int, page_size: int) -> TrainingKnowledgeBatchListResponse:
+    def list_batches(
+            self,
+            *,
+            page: int,
+            page_size: int,
+            keyword: str | None = None,
+    ) -> TrainingKnowledgeBatchListResponse:
         """分页查询训练资料批次。"""
 
-        logger.info("[V2销售训练-资料] 查询资料批次列表 页码=%s 每页数量=%s", page, page_size)
-        return self.core_service.list_batches(page=page, page_size=page_size)
+        logger.info("[V2销售训练-资料] 查询资料批次列表 页码=%s 每页数量=%s 文件名关键词=%s", page, page_size, keyword or "无")
+        return self.core_service.list_batches(page=page, page_size=page_size, keyword=keyword)
 
     def preview_batch(self, batch_id: str, *, max_chars: int) -> TrainingKnowledgePreviewResponse:
         """预览训练资料原文件。"""

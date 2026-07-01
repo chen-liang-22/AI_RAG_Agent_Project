@@ -133,6 +133,14 @@ class TrainingLlmFallbackSplitter:
     ) -> list[TrainingChunk]:
         """把模型 JSON 转换成 TrainingChunk 列表。"""
 
+        if payload.get("is_training_material") is False:
+            logger.info(
+                "[销售训练][资料切分] LLM判断资料不适合销售训练 文件名=%s 原因=%s",
+                source_file,
+                payload.get("reason") or "未说明",
+            )
+            return []
+
         cases = payload.get("cases")
         if not isinstance(cases, list):
             raise ValueError("模型输出缺少 cases 数组")

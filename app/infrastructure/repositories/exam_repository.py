@@ -123,7 +123,9 @@ class ExamRepository:
     def get_exam_session(self, session_id: str) -> ExamSessionEntity | None:
         """查询考试会话详情。"""
 
+        # 打开 ORM 会话上下文，方法结束后由上下文统一提交或释放连接。
         with orm_session_context() as session:
+            # 按主键 session_id 查询考试会话实体；查不到时 SQLAlchemy 会返回 None。
             return session.get(ExamSessionEntity, session_id)
 
     def get_exam_question(

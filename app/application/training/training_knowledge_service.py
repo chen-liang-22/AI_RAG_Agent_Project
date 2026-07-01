@@ -38,6 +38,7 @@ from app.application.training_support.schemas import (
     TrainingKnowledgeUploadResponse,
     TrainingKnowledgeVersionListResponse,
 )
+from app.application.training_support.suitability import TrainingMaterialSuitabilityEvaluator
 from app.infrastructure.file_storage_service import get_file_storage_service
 from app.infrastructure.id_generator import new_id
 from app.infrastructure.repositories.document_repository import DocumentRepository
@@ -221,12 +222,26 @@ class TrainingKnowledgeService:
             quality_report={},
         )
 
-    def list_batches(self, *, page: int = 1, page_size: int = 10) -> TrainingKnowledgeBatchListResponse:
-        """分页查询已经上传过的训练资料。"""
+    def list_batches(
+            self,
+            *,
+            page: int = 1,
+            page_size: int = 10,
+            keyword: str | None = None,
+    ) -> TrainingKnowledgeBatchListResponse:
+        """分页查询已经上传过的训练资料。
+
+        keyword 来自前端文件名搜索框，只传给仓储做数据库分页过滤。
+        """
 
         safe_page = max(1, page)
         safe_page_size = max(1, min(50, page_size))
-        rows, total = self.repository.list_batches(page=safe_page, page_size=safe_page_size)
+        clean_keyword = (keyword or "").strip() or None
+        rows, total = self.repository.list_batches(
+            page=safe_page,
+            page_size=safe_page_size,
+            keyword=clean_keyword,
+        )
         return TrainingKnowledgeBatchListResponse(
             items=[self.batch_response(row) for row in rows],
             total=total,
@@ -598,9 +613,12 @@ class TrainingKnowledgeService:
                         model_mode=model_mode,
                     )
                 else:
-                    evaluator = TrainingIngestQualityEvaluator()
                     chunks = rule_chunks
-                    quality_report = evaluator.evaluate(chunks).to_dict()
+                    source_text = self.read_training_source_text(file_path)
+                    quality_report = self.evaluate_rule_chunks_with_suitability(
+                        chunks=chunks,
+                        source_text=source_text,
+                    )
                     quality_report["selected_splitter"] = "rule_config"
                     quality_report["llm_fallback_used"] = False
                     quality_report["rule_score"] = quality_report.get("score")
@@ -839,8 +857,12 @@ class TrainingKnowledgeService:
     ) -> tuple[list[Any], dict[str, Any]]:
         """根据质量门禁决定是否调用 LLM 兜底切分。"""
 
+        source_text = self.read_training_source_text(file_path)
         evaluator = TrainingIngestQualityEvaluator()
-        rule_report = evaluator.evaluate(chunks).to_dict()
+        rule_report = self.evaluate_rule_chunks_with_suitability(
+            chunks=chunks,
+            source_text=source_text,
+        )
         rule_report["selected_splitter"] = "rule_config"
         rule_report["llm_fallback_used"] = False
         rule_report["rule_score"] = rule_report.get("score")
@@ -855,7 +877,6 @@ class TrainingKnowledgeService:
             source_file,
             rule_report.get("score"),
         )
-        source_text = self.read_training_source_text(file_path)
         llm_chunks = fallback_splitter.split(
             source_text=source_text,
             batch_id=batch_id,
@@ -870,7 +891,14 @@ class TrainingKnowledgeService:
             rule_report.setdefault("warnings", []).append("已尝试 LLM 兜底切分，但模型未返回可用切片，继续使用规则切分结果。")
             return chunks, rule_report
 
+        suitability_evaluator = TrainingMaterialSuitabilityEvaluator()
+        suitability_report = suitability_evaluator.evaluate(source_text=source_text, chunks=llm_chunks)
         llm_report = evaluator.evaluate(llm_chunks).to_dict()
+        llm_report = TrainingMaterialSuitabilityEvaluator.apply_to_quality_report(
+            llm_report,
+            suitability_report,
+            fail_score_cap=suitability_evaluator.fail_score_cap(),
+        )
         llm_score = int(llm_report.get("score") or 0)
         rule_score = int(rule_report.get("score") or 0)
         if llm_score > rule_score:
@@ -891,6 +919,11 @@ class TrainingKnowledgeService:
         rule_report["llm_fallback_attempted"] = True
         rule_report["llm_fallback_used"] = False
         rule_report["llm_score"] = llm_score
+        if "suitability" in llm_report:
+            rule_report["suitability"] = llm_report["suitability"]
+            rule_report["suitability_score_cap_applied"] = llm_report.get("suitability_score_cap_applied", False)
+        if "original_score_before_suitability" in llm_report:
+            rule_report["original_llm_score_before_suitability"] = llm_report["original_score_before_suitability"]
         rule_report.setdefault("warnings", []).append("LLM 兜底切分未明显优于规则切分，已保留规则切分结果。")
         logger.info(
             "[销售训练][资料切分] LLM兜底未被采用 批次编号=%s 规则质量分=%s LLM质量分=%s",
@@ -913,8 +946,11 @@ class TrainingKnowledgeService:
         """人工触发 LLM 重新切分，并把结果和规则切分质量一起记录。"""
 
         evaluator = TrainingIngestQualityEvaluator()
-        rule_report = evaluator.evaluate(rule_chunks).to_dict()
         source_text = self.read_training_source_text(file_path)
+        rule_report = self.evaluate_rule_chunks_with_suitability(
+            chunks=rule_chunks,
+            source_text=source_text,
+        )
         fallback_splitter = TrainingLlmFallbackSplitter()
         fallback_splitter.config["enabled"] = True
         llm_chunks = fallback_splitter.split(
@@ -933,7 +969,23 @@ class TrainingKnowledgeService:
             rule_report.setdefault("warnings", []).append("人工触发 LLM 重新切分失败，已保留规则切分结果。")
             return rule_chunks, rule_report
 
+        suitability_evaluator = TrainingMaterialSuitabilityEvaluator()
+        suitability_report = suitability_evaluator.evaluate(source_text=source_text, chunks=llm_chunks)
         llm_report = evaluator.evaluate(llm_chunks).to_dict()
+        llm_report = TrainingMaterialSuitabilityEvaluator.apply_to_quality_report(
+            llm_report,
+            suitability_report,
+            fail_score_cap=suitability_evaluator.fail_score_cap(),
+        )
+        if not suitability_report.passed:
+            llm_report["selected_splitter"] = "rule_config"
+            llm_report["llm_fallback_attempted"] = True
+            llm_report["llm_fallback_used"] = False
+            llm_report["manual_reparse"] = True
+            llm_report["rule_score"] = rule_report.get("score")
+            llm_report["llm_score"] = llm_report.get("score")
+            llm_report.setdefault("warnings", []).append("人工触发 LLM 重新切分结果未通过资料适用性门禁，已保留规则切分结果。")
+            return rule_chunks, llm_report
         llm_report["selected_splitter"] = "llm_fallback"
         llm_report["llm_fallback_attempted"] = True
         llm_report["llm_fallback_used"] = True
@@ -941,6 +993,20 @@ class TrainingKnowledgeService:
         llm_report["rule_score"] = rule_report.get("score")
         llm_report["llm_score"] = llm_report.get("score")
         return llm_chunks, llm_report
+
+    @staticmethod
+    def evaluate_rule_chunks_with_suitability(*, chunks: list[Any], source_text: str) -> dict[str, Any]:
+        """评估规则切片质量，并套用销售训练资料适用性门禁。"""
+
+        evaluator = TrainingIngestQualityEvaluator()
+        quality_report = evaluator.evaluate(chunks).to_dict()
+        suitability_evaluator = TrainingMaterialSuitabilityEvaluator()
+        suitability_report = suitability_evaluator.evaluate(source_text=source_text, chunks=chunks)
+        return TrainingMaterialSuitabilityEvaluator.apply_to_quality_report(
+            quality_report,
+            suitability_report,
+            fail_score_cap=suitability_evaluator.fail_score_cap(),
+        )
 
     def batch_file_info(self, row: dict[str, Any]) -> dict[str, Any]:
         """读取训练资料关联的文件基础信息。"""

@@ -192,6 +192,7 @@ training:
   # 输出要求：
   # - 只输出 JSON。
   # - 不补写原文没有的事实。
+  # - 明显不是销售训练资料时，允许返回 is_training_material=false。
   llm_ingest_split:
     system: |
       请只输出 JSON。
@@ -204,10 +205,13 @@ training:
       3. 每个案例最多输出 5 类片段：case_profile、task_requirement、standard_answer、hidden_psychology、scoring_rubric。
       4. case_profile/task_requirement/standard_answer 默认可见；hidden_psychology 默认 hidden；scoring_rubric 默认 scoring_only。
       5. 最多输出 {max_cases} 个案例、{max_chunks} 个切片。
-      6. 只输出 JSON，不要解释。
+      6. 如果原文明显不是销售训练资料，缺少客户案例、训练任务、销售话术或评分标准，请返回 is_training_material=false 和 reason，cases 返回空数组。
+      7. 只输出 JSON，不要解释。
 
       JSON 格式：
       {{
+        "is_training_material": true,
+        "reason": "",
         "cases": [
           {{
             "case_title": "案例标题",

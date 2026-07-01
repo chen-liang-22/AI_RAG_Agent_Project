@@ -366,16 +366,40 @@ class TrainingRepository:
             return None
         return self._enrich_batch_with_document(row[0], row[1])
 
-    def list_batches(self, *, page: int, page_size: int) -> tuple[list[TrainingKnowledgeBatchEntity], int]:
-        """分页查询训练资料上传批次。"""
+    def list_batches(
+            self,
+            *,
+            page: int,
+            page_size: int,
+            keyword: str | None = None,
+    ) -> tuple[list[TrainingKnowledgeBatchEntity], int]:
+        """分页查询训练资料上传批次。
+
+        keyword 只做文件名模糊查询，既兼容历史 source_file 字段，
+        也兼容新文件台账 documents.filename 字段。
+        """
 
         offset = (page - 1) * page_size
-        count_statement = select(func.count()).select_from(TrainingKnowledgeBatchEntity).where(
-            TrainingKnowledgeBatchEntity.status != "deleted"
+        clean_keyword = (keyword or "").strip()
+        conditions = [TrainingKnowledgeBatchEntity.status != "deleted"]
+        if clean_keyword:
+            like_keyword = f"%{clean_keyword}%"
+            conditions.append(or_(
+                TrainingKnowledgeBatchEntity.source_file.like(like_keyword),
+                DocumentEntity.filename.like(like_keyword),
+            ))
+        count_statement = (
+            select(func.count())
+            .select_from(TrainingKnowledgeBatchEntity)
+            .outerjoin(
+                DocumentEntity,
+                DocumentEntity.document_id == TrainingKnowledgeBatchEntity.document_id,
+            )
+            .where(*conditions)
         )
         list_statement = (
             self._batch_select_statement()
-            .where(TrainingKnowledgeBatchEntity.status != "deleted")
+            .where(*conditions)
             .order_by(
                 TrainingKnowledgeBatchEntity.created_at.desc(),
                 TrainingKnowledgeBatchEntity.updated_at.desc(),
@@ -439,12 +463,12 @@ class TrainingRepository:
         plan = TrainingPlanEntity(
             plan_id=plan_id,
             plan_name=values["plan_name"],
-            trainee_id=trainee["trainee_id"],
-            trainee_name=trainee.get("trainee_name") or "销售学员",
-            profile_type=values["profile_type"],
+            trainee_id=trainee.get("trainee_id") or "",
+            trainee_name=trainee.get("trainee_name") or "",
+            profile_type=values.get("profile_type") or "",
             trainee_json=self._json(trainee),
             selected_fields_json=self._json(values.get("selected_fields") or {}),
-            scenario_description=values["scenario_description"],
+            scenario_description=values.get("scenario_description") or "",
             extra_details=values.get("extra_details") or "",
             model_mode=values.get("model_mode"),
             active_profile_id=None,

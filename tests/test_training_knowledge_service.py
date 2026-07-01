@@ -8,6 +8,8 @@ from fastapi import HTTPException
 from langchain_core.documents import Document
 
 from app.application.training.training_knowledge_service import TrainingKnowledgeService
+from app.application.training_support.llm_ingest import TrainingLlmFallbackSplitter
+from app.application.training_support.strategies.knowledge_ingest_strategy import TrainingChunk
 
 
 def _batch(**overrides):
@@ -55,14 +57,16 @@ class FakeTrainingRepository:
         self.deleted_batch_id = None
         self.list_page = None
         self.list_page_size = None
+        self.list_keyword = None
         self.created_batches = []
         self.status_updates = []
 
-    def list_batches(self, *, page: int, page_size: int):
+    def list_batches(self, *, page: int, page_size: int, keyword: str | None = None):
         """记录分页参数并返回固定批次。"""
 
         self.list_page = page
         self.list_page_size = page_size
+        self.list_keyword = keyword
         return [_batch()], 1
 
     def get_batch(self, batch_id: str):
@@ -313,6 +317,18 @@ def test_list_batches_normalizes_page_and_page_size():
     assert response.items[0].created_at == "2026-01-01 10:00:00"
 
 
+def test_list_batches_passes_clean_keyword_to_repository():
+    """按文件名搜索时，service 只把清洗后的关键词传给仓储。"""
+
+    repository = FakeTrainingRepository()
+    response = _service(repository=repository).list_batches(page=2, page_size=6, keyword="  案例  ")
+
+    assert repository.list_page == 2
+    assert repository.list_page_size == 6
+    assert repository.list_keyword == "案例"
+    assert response.page == 2
+
+
 def test_delete_legacy_batch_cleans_both_vector_collections_and_repository():
     """没有 document_id 的历史批次必须清理正式库、临时库和批次记录。"""
 
@@ -421,6 +437,175 @@ def test_list_chunks_maps_metadata_json():
     assert response.chunks[0].case_part == "case_profile"
     assert response.chunks[0].metadata["source_file"] == "case.docx"
     assert vector_service.listed_metadata == [("batch_id", "batch_1")]
+
+
+def test_llm_fallback_result_is_rejected_when_source_is_not_training_material(monkeypatch):
+    """明显不是销售训练资料时，LLM 兜底不能靠硬凑结构拿高分并被采用。"""
+
+    service = _service()
+    rule_chunks = [
+        TrainingChunk(
+            chunk_id="batch_1_001_case_profile",
+            text="今天风很大，树叶被吹到路边，天气预报说傍晚可能下雨。",
+            case_part="case_profile",
+            visibility="visible",
+            metadata={"case_index": 1},
+        )
+    ]
+    llm_chunks = [
+        TrainingChunk(
+            chunk_id="batch_1_001_case_profile",
+            text="客户画像：天气描述中没有客户信息。",
+            case_part="case_profile",
+            visibility="visible",
+            metadata={"case_index": 1},
+        ),
+        TrainingChunk(
+            chunk_id="batch_1_001_task_requirement",
+            text="任务要求：根据天气内容进行沟通。",
+            case_part="task_requirement",
+            visibility="visible",
+            metadata={"case_index": 1},
+        ),
+        TrainingChunk(
+            chunk_id="batch_1_001_standard_answer",
+            text="参考答案：提醒注意大风天气。",
+            case_part="standard_answer",
+            visibility="visible",
+            metadata={"case_index": 1},
+        ),
+        TrainingChunk(
+            chunk_id="batch_1_001_scoring_rubric",
+            text="评分标准：表达清楚即可。",
+            case_part="scoring_rubric",
+            visibility="scoring_only",
+            metadata={"case_index": 1},
+        ),
+    ]
+
+    monkeypatch.setattr(service, "read_training_source_text", lambda file_path: "今天风很大，树叶被吹到路边。")
+    monkeypatch.setattr(
+        "app.application.training.training_knowledge_service.TrainingLlmFallbackSplitter.should_trigger",
+        lambda self, report: True,
+    )
+    monkeypatch.setattr(
+        "app.application.training.training_knowledge_service.TrainingLlmFallbackSplitter.split",
+        lambda self, **kwargs: llm_chunks,
+    )
+
+    selected_chunks, report = service.improve_training_chunks_if_needed(
+        chunks=rule_chunks,
+        file_path="weather.txt",
+        batch_id="batch_1",
+        source_file="weather.txt",
+        source_type="lms_case",
+    )
+
+    assert selected_chunks == rule_chunks
+    assert report["llm_fallback_attempted"] is True
+    assert report["llm_fallback_used"] is False
+    assert report["llm_score"] <= 40
+    assert report["suitability"]["passed"] is False
+    assert report["suitability_score_cap_applied"] is True
+
+
+def test_rule_quality_is_capped_when_source_is_not_training_material():
+    """无关资料只走规则切分时，也要经过适用性门禁，不能保留中等质量分。"""
+
+    service = _service()
+    chunks = [
+        TrainingChunk(
+            chunk_id="batch_1_001_case_profile",
+            text="今天风很大，树叶被吹到路边，天气预报说傍晚可能下雨。",
+            case_part="case_profile",
+            visibility="visible",
+            metadata={"case_index": 1},
+        )
+    ]
+
+    report = service.evaluate_rule_chunks_with_suitability(
+        chunks=chunks,
+        source_text="今天风很大，树叶被吹到路边，天气预报说傍晚可能下雨。",
+    )
+
+    assert report["score"] <= 40
+    assert report["passed"] is False
+    assert report["suitability"]["passed"] is False
+    assert report["suitability_score_cap_applied"] is True
+
+
+def test_llm_fallback_parser_allows_not_training_material_response():
+    """LLM 明确判断不是训练资料时，应返回空切片而不是强制要求 cases 有内容。"""
+
+    chunks = TrainingLlmFallbackSplitter()._chunks_from_payload(
+        {
+            "is_training_material": False,
+            "reason": "原文只是天气描述，没有客户案例、训练任务或销售话术。",
+            "cases": [],
+        },
+        batch_id="batch_1",
+        source_file="weather.txt",
+        source_type="lms_case",
+        visibility_default="visible",
+    )
+
+    assert chunks == []
+
+
+def test_manual_llm_reparse_keeps_rule_chunks_when_suitability_fails(monkeypatch):
+    """人工触发 LLM 重切时，也不能绕过资料适用性门禁。"""
+
+    service = _service()
+    rule_chunks = [
+        TrainingChunk(
+            chunk_id="batch_1_001_case_profile",
+            text="普通天气记录。",
+            case_part="case_profile",
+            visibility="visible",
+            metadata={"case_index": 1},
+        )
+    ]
+    llm_chunks = [
+        TrainingChunk(
+            chunk_id="batch_1_001_case_profile",
+            text="客户画像：天气记录。",
+            case_part="case_profile",
+            visibility="visible",
+            metadata={"case_index": 1},
+        ),
+        TrainingChunk(
+            chunk_id="batch_1_001_task_requirement",
+            text="任务要求：讨论天气。",
+            case_part="task_requirement",
+            visibility="visible",
+            metadata={"case_index": 1},
+        ),
+        TrainingChunk(
+            chunk_id="batch_1_001_standard_answer",
+            text="参考答案：注意天气。",
+            case_part="standard_answer",
+            visibility="visible",
+            metadata={"case_index": 1},
+        ),
+    ]
+    monkeypatch.setattr(service, "read_training_source_text", lambda file_path: "今天风很大，树叶被吹到路边。")
+    monkeypatch.setattr(
+        "app.application.training.training_knowledge_service.TrainingLlmFallbackSplitter.split",
+        lambda self, **kwargs: llm_chunks,
+    )
+
+    selected_chunks, report = service.force_llm_reparse_chunks(
+        rule_chunks=rule_chunks,
+        file_path="weather.txt",
+        batch_id="batch_1",
+        source_file="weather.txt",
+        source_type="lms_case",
+    )
+
+    assert selected_chunks == rule_chunks
+    assert report["llm_fallback_used"] is False
+    assert report["manual_reparse"] is True
+    assert report["suitability"]["passed"] is False
 
 
 def test_upload_training_knowledge_returns_task_without_writing_staging(monkeypatch):

@@ -39,9 +39,10 @@ class TrainingPlanDomainService:
     def create_plan(self, request: TrainingPlanCreateRequest) -> TrainingPlanDetailResponse:
         """创建训练方案。"""
 
+        trainee = request.trainee.model_dump() if request.trainee is not None else {}
         plan = self.repository.create_plan(
             plan_name=request.plan_name.strip(),
-            trainee=request.trainee.model_dump(),
+            trainee=trainee,
             profile_type=request.profile_type,
             selected_fields=request.selected_fields,
             scenario_description=request.scenario_description.strip(),
@@ -121,9 +122,9 @@ class TrainingPlanDomainService:
             updates.update({
                 "active_profile_id": None,
                 "active_setting_id": None,
-                "role_status": "stale",
-                "goal_status": "stale",
-                "score_status": "stale",
+                "role_status": "stale" if plan.get("active_profile_id") else "pending",
+                "goal_status": "stale" if plan.get("active_setting_id") else "pending",
+                "score_status": "stale" if plan.get("active_setting_id") else "pending",
             })
 
         active_profile_id = updates.get("active_profile_id", plan.get("active_profile_id"))

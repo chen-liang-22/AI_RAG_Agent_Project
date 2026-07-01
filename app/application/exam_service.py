@@ -749,66 +749,120 @@ def _generate_question_with_model(
 
 
 def _build_fallback_conversation_question(
+        # 强制后续参数必须使用关键字传入，避免调用方按位置传参导致含义混乱。
         *,
+        # 当前用于命题的原始 QA 数据，包含内容和 metadata 来源信息。
         item: dict[str, Any],
+        # 当前题源范围内的完整候选题池，用于选择题生成干扰项。
         candidates: list[dict[str, Any]],
+        # 期望生成的题型，例如单选、多选、判断、填空或简答。
         question_type: str,
+        # 当前题目专用随机生成器，用于保证兜底生成结果可复现。
         random_generator: random.Random,
+        # 当前题目的最高分。
         max_score: float,
 ) -> dict[str, Any]:
     """模型生成失败时，用规则兜底生成考试题。"""
 
+    # 读取原始 QA 的 metadata，后续用于提取题干、来源和结构化字段。
     metadata = item["metadata"]
+    # 从 metadata 中读取原始问题文本，并去掉首尾空白作为默认题干。
     question = str(metadata.get("question") or "").strip()
+    # 从原始内容中提取参考答案，作为客观题答案依据或简答题参考答案。
     reference_answer = _extract_reference_answer(item["content"], question)
+    # 如果当前期望题型是判断题，则提前确定目标答案，避免判断题答案过于偏向同一侧。
     target_true_false_answer = (
+        # 根据随机生成器选择本次判断题期望答案。
         _target_true_false_answer(random_generator)
+        # 只有判断题才需要目标真假答案。
         if question_type == "true_false"
+        # 非判断题不需要目标真假答案。
         else None
     )
+    # 初始化最终题型，默认沿用期望题型，生成失败时可能降级为简答题。
     final_type = question_type
+    # 初始化题干，默认直接使用原始问题。
     prompt = question
+    # 初始化选项列表，简答题和填空题可能为空。
     options: list[str] = []
+    # 初始化正确答案，默认使用参考答案。
     correct_answer: Any = reference_answer
 
+    # 如果期望生成单选题，则尝试用规则构造一个单选题。
     if question_type == "single_choice":
+        # 根据原始问题、参考答案和候选题池生成单选题题干、选项和正确答案。
         generated = _make_single_choice(question, reference_answer, candidates, random_generator)
+        # 如果单选题生成成功，则使用生成结果覆盖默认题干、选项和答案。
         if generated:
+            # 解包规则生成的题干、选项和正确答案。
             prompt, options, correct_answer = generated
+        # 如果单选题生成失败，说明干扰项不足或规则无法构造。
         else:
+            # 降级为简答题，保证本轮考试仍然可以出题。
             final_type = "short_answer"
+    # 如果期望生成多选题，则尝试用规则构造一个多选题。
     elif question_type == "multiple_choice":
+        # 根据原始问题、参考答案和候选题池生成多选题题干、选项和正确答案。
         generated = _make_multiple_choice(question, reference_answer, candidates, random_generator)
+        # 如果多选题生成成功，则使用生成结果覆盖默认题干、选项和答案。
         if generated:
+            # 解包规则生成的题干、选项和正确答案。
             prompt, options, correct_answer = generated
+        # 如果多选题生成失败，说明可用正确项或干扰项不足。
         else:
+            # 降级为简答题，避免因为客观题构造失败导致整题丢失。
             final_type = "short_answer"
+    # 如果期望生成判断题，则直接按规则生成判断题。
     elif question_type == "true_false":
+        # 根据原始问题、参考答案和目标真假答案生成判断题题干、选项和正确答案。
         prompt, options, correct_answer = _make_true_false(
+            # 传入原始问题作为判断题基础题干。
             question,
+            # 传入参考答案，用于构造正确或错误的判断陈述。
             reference_answer,
+            # 传入当前题目随机生成器，控制判断题陈述扰动。
             random_generator,
+            # 传入目标真假答案，控制本题最终答案为对或错。
             target_answer=target_true_false_answer,
         )
+    # 如果期望生成填空题，则尝试从参考答案中挖空生成。
     elif question_type == "fill_blank":
+        # 根据原始问题和参考答案生成填空题题干、选项和正确答案。
         generated = _make_fill_blank(question, reference_answer)
+        # 如果填空题生成成功，则使用生成结果覆盖默认题干、选项和答案。
         if generated:
+            # 解包规则生成的题干、选项和正确答案。
             prompt, options, correct_answer = generated
+        # 如果填空题生成失败，说明参考答案不适合挖空。
         else:
+            # 降级为简答题，保持题目仍然可答。
             final_type = "short_answer"
 
+    # 对客观题选项和答案做最终展示格式整理，例如答案字母、选项顺序等。
     options, correct_answer = _prepare_objective_question_for_display(final_type, options, correct_answer)
+    # 返回可直接写入考试题目表的结构化题目数据。
     return {
+        # 保存原始问题编号，兼容不同来源的 question_id、qa_id 或 segment_id。
         "source_question_id": _optional_text(metadata.get("question_id") or metadata.get("qa_id") or metadata.get("segment_id")),
+        # 保存原始文档编号，方便追溯题目来自哪个文件。
         "source_document_id": _optional_text(metadata.get("document_id")),
+        # 保存原始文件名，兼容 source_file 和 source 两种 metadata 字段。
         "source_filename": _optional_text(metadata.get("source_file") or metadata.get("source")),
+        # 保存原始页码，兼容 source_page、page_no 和 page 三种 metadata 字段。
         "source_page": _optional_int(metadata.get("source_page") or metadata.get("page_no") or metadata.get("page")),
+        # 保存原始目录路径，方便按章节定位题目来源。
         "section_path": _optional_text(_metadata_section_path(metadata)),
+        # 保存最终题型，可能等于期望题型，也可能因生成失败降级为简答题。
         "question_type": final_type,
+        # 保存最终题干。
         "prompt": prompt,
+        # 保存最终选项列表；主观题通常为空列表。
         "options": options,
+        # 保存最终正确答案，客观题可能是选项标识，主观题通常是文本答案。
         "correct_answer": correct_answer,
+        # 保存参考答案，用于后续阅卷分析和展示解析。
         "reference_answer": reference_answer,
+        # 保存当前题目的最高分。
         "max_score": max_score,
     }
 
@@ -1008,86 +1062,150 @@ def _analysis_to_metadata(analysis: ExamAnswerAnalysis) -> dict[str, Any]:
 
 
 def _build_exam_question_rows(
+        # 强制后续参数只能用关键字传入，避免调用方按位置传参导致含义混乱。
         *,
+        # 当前考试会话编号，所有生成出来的题目都会写到这个会话下。
         session_id: str,
+        # 本场考试已经抽中的原始 QA 列表，每个元素会对应生成一轮考试题。
         selected_items: list[dict[str, Any]],
+        # 当前题源范围内的完整候选题池，用于生成选项、干扰项和上下文参考。
         candidates: list[dict[str, Any]],
+        # 本场考试允许使用的题型列表，例如单选、多选、判断等。
         question_types: list[str],
+        # 命题时使用的模型模式；为空时由下游按默认模型处理。
         model_mode: str | None,
+        # 本场考试随机种子，用于保证题型选择和题目生成过程可复现。
         seed: int | None,
+        # 每一轮题目的最高分，由总分按轮数平均计算得到。
         max_score: float,
+        # 起始生成轮次；小于该轮次的题目会跳过，常用于后台只补后续题。
         start_round: int = 1,
+        # 是否优先使用模型生成题目；为 False 时优先走规则快速生成。
         prefer_model: bool = True,
 ) -> None:
     """按轮次生成并保存考试题目，已存在的轮次会自动跳过。"""
 
+    # 基于考试种子创建题型随机生成器，保证同一场考试的题型序列可复现。
     question_type_random = random.Random(f"{seed}:question_type")
+    # 遍历本场考试抽中的原始 QA，并按轮次逐题生成考试题。
     for round_no, item in enumerate(selected_items, start=1):
+        # 从允许题型中随机选择当前轮题型。
         question_type = question_type_random.choice(question_types)
+        # 如果当前轮次小于起始轮次，或数据库里已存在该轮题目，则直接跳过。
         if round_no < start_round or _store().get_exam_question(session_id=session_id, round_no=round_no):
+            # 跳过已生成或不在本次生成范围内的轮次，避免重复写入。
             continue
+        # 基于考试种子和轮次创建当前题目的随机生成器，保证单题生成结果可复现。
         question_random = random.Random(f"{seed}:question:{round_no}")
+        # 根据原始 QA、候选题池和题型生成当前轮考试题数据。
         question_data = _build_conversation_question(
+            # 传入当前轮对应的原始 QA。
             item=item,
+            # 传入完整候选题池，用于生成干扰项或补充上下文。
             candidates=candidates,
+            # 传入当前轮随机选中的题型。
             question_type=question_type,
+            # 传入当前题目专用随机生成器。
             random_generator=question_random,
+            # 传入当前题目的最高分。
             max_score=max_score,
+            # 传入模型模式，供模型命题或润色使用。
             model_mode=model_mode,
+            # 传入是否优先使用模型生成的开关。
             prefer_model=prefer_model,
         )
+        # 检查当前生成的多选题是否属于“所有选项都正确”的情况，避免连续出现全选题。
         if (
+                # 判断当前题是否是答案覆盖全部选项的多选题。
                 _is_all_select_multiple_choice(
+                    # 传入当前生成题目的题型。
                     question_data["question_type"],
+                    # 传入当前生成题目的选项列表。
                     question_data["options"],
+                    # 传入当前生成题目的正确答案。
                     question_data["correct_answer"],
                 )
+                # 判断本轮之前的多选题是否也已经出现全选情况。
                 and _previous_multiple_choice_questions_all_select(session_id, round_no)
         ):
+            # 记录全选多选题过于集中的告警，方便后续观察题目质量。
             logger.warning(
+                # 日志模板记录会话编号和轮次，便于定位具体考试题。
                 "[考试] 多选题全选过于集中，改用规则重新生成 会话编号=%s 轮次=%s",
+                # 写入当前考试会话编号。
                 session_id,
+                # 写入当前生成轮次。
                 round_no,
             )
+            # 使用规则兜底方式重新生成一道多选题，降低连续全选题的概率。
             question_data = _build_fallback_conversation_question(
+                # 传入当前轮对应的原始 QA。
                 item=item,
+                # 传入完整候选题池，用于兜底生成干扰项。
                 candidates=candidates,
+                # 固定按多选题重新生成，保持当前题型语义一致。
                 question_type="multiple_choice",
+                # 使用独立 fallback 随机种子，避免重新生成结果和首次生成完全一致。
                 random_generator=random.Random(f"{seed}:question:{round_no}:fallback"),
+                # 传入当前题目的最高分。
                 max_score=max_score,
             )
+        # 保存题目时捕获唯一键冲突，兼容接口线程和后台任务并发生成同一轮题的情况。
         try:
+            # 将当前轮题目写入数据库，question_data 会展开为题干、选项、答案、解析等字段。
             _store().add_exam_question(session_id=session_id, round_no=round_no, **question_data)
+        # 如果数据库提示唯一键冲突，说明该题已由其他任务先写入。
         except IntegrityErrorTypes:
+            # 记录重复写入被跳过的日志，不再抛错影响整场考试生成流程。
             logger.info("[考试] 题目已由其他任务生成，跳过重复写入 会话编号=%s 轮次=%s", session_id, round_no)
 
 
 def _rebuild_exam_context_from_session(
+        # 考试会话记录，通常来自数据库实体转 dict 后的结果。
         session: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], int | None, float]:
     """从会话记录重新构造可补题的上下文。"""
 
+    # 从会话元数据 JSON 中解析出字典，主要用于恢复创建考试时保存的随机种子。
     metadata = _parse_json_field(session.get("metadata_json"), {})
+    # 按会话记录中的题源范围重新从 Qdrant 读取候选题。
     candidates = _scroll_candidate_questions(
+        # 使用会话保存的 Collection 名称，保证补题仍然来自原知识库。
         collection_name=session.get("collection_name"),
+        # 使用会话保存的文档编号，保证补题仍然限定在原文件范围内。
         document_id=session.get("document_id"),
+        # 使用会话保存的目录路径，保证补题仍然限定在原章节范围内。
         section_path=session.get("section_path"),
     )
+    # 如果原题源已经没有候选题，说明无法继续补题。
     if not candidates:
+        # 抛出运行时异常，让上层返回考试题源不可用的错误。
         raise RuntimeError("当前考试题源已无可用候选题")
 
+    # 从会话元数据中读取创建考试时保存的随机种子。
     seed = metadata.get("seed")
+    # 尝试把随机种子转换成整数，兼容 JSON 中可能保存成字符串的情况。
     try:
+        # 有种子时转成 int；没有种子时保持 None。
         clean_seed = int(seed) if seed is not None else None
+    # 如果种子类型异常或内容无法转成整数，则忽略该种子。
     except (TypeError, ValueError):
+        # 使用 None 作为兜底种子，避免补题流程因脏数据中断。
         clean_seed = None
 
+    # 使用恢复后的种子创建随机生成器，尽量复现原始抽题顺序。
     shuffle_random_generator = random.Random(clean_seed)
+    # 按同一个随机种子打乱候选题，保证补题时选中的题目顺序与开考时一致。
     shuffle_random_generator.shuffle(candidates)
+    # 按会话轮数截取本场考试实际使用的候选题列表。
     selected_items = candidates[:int(session["round_count"])]
+    # 从会话记录中解析题型列表；解析失败时使用全部支持题型。
     question_types = _parse_json_field(session.get("question_types_json"), ALL_QUESTION_TYPES)
+    # 过滤掉已经不被系统支持的题型；如果过滤后为空，则退回全部支持题型。
     question_types = [item for item in question_types if item in ALL_QUESTION_TYPES] or ALL_QUESTION_TYPES
+    # 重新计算每轮最高分，总分 100 分按会话轮数平均分配并保留 4 位小数。
     max_score = round(100 / int(session["round_count"]), 4)
+    # 返回补题所需的完整候选题、已选题、题型、随机种子和单题最高分。
     return candidates, selected_items, question_types, clean_seed, max_score
 
 
@@ -1192,82 +1310,148 @@ def list_exam_sections(
     return ExamSectionsResponse(collection_name=final_collection_name, document_id=document_id, sections=sections)
 
 
+# 注册开始考试接口，前端调用 POST /sessions 时会进入这个方法。
 @router.post("/sessions", response_model=ExamStartResponse)
-def start_exam_session(request: ExamStartRequest, background_tasks: BackgroundTasks) -> ExamStartResponse:
+def start_exam_session(
+        # 开始考试请求体，包含用户、题源、轮数、题型、随机种子等参数。
+        request: ExamStartRequest,
+        # FastAPI 后台任务对象，用于把后续题目生成放到接口返回之后继续执行。
+        background_tasks: BackgroundTasks,
+) -> ExamStartResponse:
     """开始一场对话式随机考试。"""
 
+    # 记录接口开始时间，用于统计创建考试会话的总耗时。
     start_time = time.perf_counter()
+    # 规范化前端传入的 Qdrant Collection 名称，确保后续题源检索使用有效集合。
     final_collection_name = normalize_qdrant_collection_name(request.collection_name)
+    # 过滤前端传入的题型，只保留系统支持的题型；如果过滤后为空，则使用全部题型。
     question_types = [item for item in request.question_types if item in ALL_QUESTION_TYPES] or ALL_QUESTION_TYPES
+    # 确定本场考试随机种子；用户传了 seed 就复用，否则生成一个系统随机种子。
     exam_seed = request.seed if request.seed is not None else random.SystemRandom().randint(1, 2_147_483_647)
+    # 从 Qdrant 中按 Collection、文件编号和目录范围读取可用于考试的结构化问答候选题。
     candidates = _scroll_candidate_questions(
+        # 指定要读取的 Qdrant Collection。
         collection_name=final_collection_name,
+        # 指定题源文件编号；为空时表示不按文件过滤。
         document_id=request.document_id,
+        # 指定题源目录路径；为空时表示不按目录过滤。
         section_path=request.section_path,
     )
+    # 如果题源范围内没有任何候选题，则直接返回 404 提示前端无法开始考试。
     if not candidates:
+        # 抛出 HTTP 404，说明不是系统异常，而是当前题源确实没有可用结构化问答题。
         raise HTTPException(status_code=404, detail="当前题源范围内没有可用于考试的结构化问答题")
 
+    # 使用本场考试种子创建随机生成器，保证同一个 seed 可以复现同样的抽题顺序。
     shuffle_random_generator = random.Random(exam_seed)
+    # 对候选题进行原地打乱，后续按轮数从前面截取作为本场考试题目。
     shuffle_random_generator.shuffle(candidates)
     # 先随机抽出本场考试需要的原始 QA，再逐题命题并持久化。
+    # 截取本场考试需要的候选题数量，数量由前端传入的 round_count 决定。
     selected_items = candidates[:request.round_count]
+    # 如果候选题数量小于考试轮数，则不能完整生成本场考试。
     if len(selected_items) < request.round_count:
+        # 抛出 HTTP 400，提示前端当前题源题量不足，需要减少轮数或扩大题源范围。
         raise HTTPException(status_code=400, detail=f"当前题源只有 {len(selected_items)} 道题，不足 {request.round_count} 轮")
 
+    # 如果指定了文件编号，则读取文件信息，用于把文件名写入考试会话；否则不绑定文件名。
     document = _store().get_document(request.document_id) if request.document_id else None
+    # 计算每轮题目的最高分，总分 100 分按考试轮数平均分配并保留 4 位小数。
     max_score = round(100 / request.round_count, 4)
+    # 创建考试会话主记录，保存本场考试的用户、题源、轮数、题型和模型配置。
     session = _store().create_exam_session(
+        # 保存考试所属用户编号。
         user_id=request.user_id,
+        # 保存前端传入的考试标题。
         title=request.title,
+        # 保存最终使用的 Qdrant Collection 名称。
         collection_name=final_collection_name,
+        # 保存题源文件编号，方便后续按文件追溯题目来源。
         document_id=request.document_id,
+        # 保存题源文件名；未指定文件时保持为空。
         filename=document.get("filename") if document else None,
+        # 保存题源目录路径，方便后续按目录追溯题目来源。
         section_path=request.section_path,
+        # 保存本场考试总轮数。
         round_count=request.round_count,
+        # 保存本场考试允许生成的题型列表。
         question_types=question_types,
+        # 保存命题和分析使用的模型模式。
         model_mode=request.model_mode,
+        # 保存随机种子元数据，便于复现抽题顺序和区分用户传入种子。
         metadata={"seed": exam_seed, "user_seed": request.seed},
     )
 
     # 第一轮用规则快速生成，接口可以尽快把第一题返回给前端；后续题目仍交给后台模型润色。
+    # 立即生成并持久化第一题，保证开始考试接口能直接返回当前题目。
     _build_exam_question_rows(
+        # 指定题目要写入的考试会话编号。
         session_id=session["session_id"],
+        # 只传入第一道候选题，用于快速生成第一轮题目。
         selected_items=selected_items[:1],
+        # 传入完整候选题池，便于命题时构造干扰项或参考上下文。
         candidates=candidates,
+        # 传入允许题型，控制第一题的题型选择范围。
         question_types=question_types,
+        # 传入模型模式；虽然首题 prefer_model=False，但保持参数完整。
         model_mode=request.model_mode,
+        # 传入考试随机种子，保证题型和选项生成可复现。
         seed=exam_seed,
+        # 传入每轮最高分，用于写入题目分值。
         max_score=max_score,
+        # 指定从第 1 轮开始生成。
         start_round=1,
+        # 首题不优先调用模型，使用规则快速生成以降低接口等待时间。
         prefer_model=False,
     )
     # 第 2 轮之后放到后台继续生成，减少“开始测评”的等待时间。
+    # 注册后台任务，在接口返回后继续生成剩余考试题目。
     background_tasks.add_task(
+        # 后台任务函数，负责生成并保存第 2 轮及之后的题目。
         _build_remaining_exam_questions_background,
+        # 传入考试会话编号，确保后台题目写入同一场考试。
         session_id=session["session_id"],
+        # 传入本场考试已抽中的全部候选题，后台会跳过第一题继续生成。
         selected_items=selected_items,
+        # 传入完整候选题池，便于后台命题时构造干扰项或参考上下文。
         candidates=candidates,
+        # 传入允许题型，控制后续题目的题型选择范围。
         question_types=question_types,
+        # 传入模型模式，控制后台模型润色或命题使用哪个模型配置。
         model_mode=request.model_mode,
+        # 传入考试随机种子，保证后台生成过程和首题使用同一随机基础。
         seed=exam_seed,
+        # 传入每轮最高分，用于后续题目分值写入。
         max_score=max_score,
     )
 
+    # 重新读取考试会话，确认主记录已经成功落库并带上最新状态。
     refreshed_session = _store().get_exam_session(session["session_id"])
+    # 读取第一轮题目，作为开始考试接口需要立即返回给前端的当前题。
     current_question = _store().get_exam_question(session_id=session["session_id"], round_no=1)
+    # 如果会话或首题读取失败，说明创建流程出现异常，需要返回服务端错误。
     if refreshed_session is None or current_question is None:
+        # 抛出 HTTP 500，提示考试会话创建后无法读取，属于服务端持久化异常。
         raise HTTPException(status_code=500, detail="考试会话创建后读取失败")
 
+    # 记录考试开始成功日志，包含题源范围、轮数、首题返回状态和接口耗时。
     logger.info(
+        # 日志模板保留 Collection 字段名，其余状态描述使用中文，便于排查考试创建链路。
         "[考试] 对话式考试开始 会话编号=%s Collection=%s 文件编号=%s 目录=%s 轮数=%s 首题已返回=true 耗时毫秒=%.2f",
+        # 写入本场考试会话编号。
         session["session_id"],
+        # 写入本场考试使用的 Qdrant Collection 名称。
         final_collection_name,
+        # 写入题源文件编号。
         request.document_id,
+        # 写入题源目录路径。
         request.section_path,
+        # 写入本场考试轮数。
         request.round_count,
+        # 写入从接口开始到准备完成的耗时毫秒数。
         _elapsed_ms(start_time),
     )
+    # 返回考试会话摘要和第一轮题目，前端拿到后即可进入答题流程。
     return ExamStartResponse(session=_session_summary(refreshed_session), current_question=_question_from_row(current_question))
 
 
