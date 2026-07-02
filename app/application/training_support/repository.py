@@ -10,7 +10,7 @@
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, inspect, or_, select, text
@@ -30,17 +30,19 @@ from app.infrastructure.id_generator import new_id
 from app.infrastructure.orm_session import orm_session_context
 from core.utils.logger_handler import logger
 
+DATABASE_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")  # 数据库业务时间统一按东八区保存
+
 
 def utc_now_text() -> str:
-    """返回统一格式的 UTC 时间字符串。"""
+    """返回统一格式的东八区数据库时间字符串。"""
 
-    return datetime.utcnow().isoformat(timespec="seconds", sep=" ")
+    return utc_now().isoformat(timespec="seconds", sep=" ")
 
 
 def utc_now() -> datetime:
-    """返回去掉微秒的 UTC 时间，便于写入 MySQL DATETIME 字段。"""
+    """返回去掉微秒和时区信息的东八区时间，便于写入 MySQL DATETIME 字段。"""
 
-    return datetime.utcnow().replace(microsecond=0)
+    return datetime.now(DATABASE_TIMEZONE).replace(tzinfo=None, microsecond=0)
 
 
 def to_datetime(value: Any) -> datetime | None:

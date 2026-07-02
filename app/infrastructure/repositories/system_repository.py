@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, delete, func, or_, select
 
 from app.shared.pagination import escape_like_keyword, normalize_page
 from app.domain.entities import SystemMenuEntity, SystemRoleEntity, SystemRoleMenuEntity, SystemUserEntity
@@ -336,13 +336,17 @@ class SystemRepository:
         if len(menu_ids) != len(relation_ids):
             raise ValueError("菜单 ID 和关系 ID 数量不一致")
         now = utc_now()
+        deduplicated_pairs: list[tuple[int, int]] = []
+        seen_menu_ids: set[int] = set()
+        for menu_id, relation_id in zip(menu_ids, relation_ids):
+            if menu_id in seen_menu_ids:
+                continue
+            seen_menu_ids.add(menu_id)
+            deduplicated_pairs.append((menu_id, relation_id))
         with orm_session_context() as session:
-            existing = session.scalars(
-                select(SystemRoleMenuEntity).where(SystemRoleMenuEntity.role_id == role_id)
-            ).all()
-            for row in existing:
-                session.delete(row)
-            for relation_id, menu_id in zip(relation_ids, menu_ids):
+            session.execute(delete(SystemRoleMenuEntity).where(SystemRoleMenuEntity.role_id == role_id))
+            session.flush()
+            for menu_id, relation_id in deduplicated_pairs:
                 session.add(SystemRoleMenuEntity(
                     role_menu_id=relation_id,
                     role_id=role_id,
